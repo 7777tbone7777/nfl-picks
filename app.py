@@ -1,126 +1,183 @@
 # app.py
 import os
 from datetime import datetime
-from flask import Flask, jsonify, request
-from models import db, Week, Game
+from flask import Flask, jsonify, request, render_template
+from sqlalchemy import func
 
-# Default season used when one isn't provided in the URL
-DEFAULT_SEASON = int(os.getenv("DEFAULT_SEASON", "2025"))
+from models import db, Week, Game, Participant
 
+# Optional Pick model (if present). We won't fail if it isn't.
+try:
+    from models import Pick  # type: ignore
+    HAS_PICK = True
+except Exception:  # ImportError or schema without Pick
+    HAS_PICK = False
 
-def _normalize_database_url(url: str) -> str:
-    # Heroku still sets postgres://; SQLAlchemy expects postgresql://
-    if url and url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql://", 1)
-    return url
+DEFAULT_SEASON = int(os.environ.get("DEFAULT_SEASON", "2025"))
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    # --- Database config ---
-    db_url = _normalize_database_url(os.environ.get("DATABASE_URL", "sqlite:///app.db"))
-    app.config["SQLALCHEMY_DATABASE_URI"] = db_url
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-    db.init_app(app)
+    # Heroku style DATABASE_URL fixup
+    database_url = os.environ.get("DATABASE_URL", "")
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
 
-    # --------- Routes ---------
+    app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["JSON_SORT_KEYS"] = False
+
+    db.init_app(app)
 
     @app.route("/")
     def index():
-        # Keep the same simple landing text you already have
         return "Welcome to the NFL Picks App!"
 
-    @app.route("/healthz")
-    def healthz():
-        return jsonify(ok=True)
+    # ---- Helpers -----------------------------------------------------------
+    def _get_week(season: int, week: int) -> Week | None:
+        return Week.query.filter_by(season_year=season, week_number=week).first()
 
-    @app.route("/admin/status/<int:week_number>")
-    def admin_status(week_number: int):
-        """
-        Returns simple JSON about pick progress for a given week.
-        (Kept to preserve your working endpoint.)
-        """
-        season = request.args.get("season", type=int) or DEFAULT_SEASON
-        w = Week.query.filter_by(season_year=season, week_number=week_number).first()
-        if not w:
-            return jsonify(error=f"Week {week_number} for season {season} not found."), 404
+    def _serialize_game(g: Game) -> dict:
+        return {
+            "id": g.id,
+            "week_id": g.week_id,
+            "home_team": g.home_team,
+            "away_team": g.away_team,
+            "game_time": (g.game_time.isoformat() if isinstance(g.game_time, datetime) else g.game_time),
+            "home_score": g.home_score,
+            "away_score": g.away_score,
+            "status": g.status,
+            "espn_game_id": g.espn_game_id,
+        }
 
-        total_games = Game.query.filter_by(week_id=w.id).count()
+    # ---- JSON: games -------------------------------------------------------
+    # GET /games?season=2025&week=2
+    @app.route("/games")
+    def games_qs():
+        season = int(request.args.get("season", DEFAULT_SEASON))
+        week = request.args.get("week", type=int)
+        if not week:
+            # If no week is given, try the most recent week present for that season.
+            wk = (
+                db.session.query(Week)
+                .filter(Week.season_year == season)
+                .order_by(Week.week_number.desc())
+                .first()
+            )
+            if not wk:
+                return jsonify({"games": [], "season": season, "week": None})
+            week = wk.week_number
 
-        # Try to include participants / picks if those models exist
-        participants_payload = []
-        try:
-            from models import Participant, Pick  # optional; if present we compute real counts
+        wk = _get_week(season, week)
+        if not wk:
+            return jsonify({"games": [], "season": season, "week": week})
 
-            participants = Participant.query.order_by(Participant.name.asc()).all()
-            for p in participants:
-                picks_made = (
-                    Pick.query.join(Game, Game.id == Pick.game_id)
-                    .filter(Pick.participant_id == p.id, Game.week_id == w.id)
-                    .count()
+        games = Game.query.filter_by(week_id=wk.id).order_by(Game.game_time.asc()).all()
+        return jsonify({"season": season, "week": week, "games": [_serialize_game(g) for g in games]})
+
+    # (Optional alternate path) GET /games/<int:week>?season=2025
+    @app.route("/games/<int:week>")
+    def games_param(week: int):
+        season = int(request.args.get("season", DEFAULT_SEASON))
+        wk = _get_week(season, week)
+        if not wk:
+            return jsonify({"games": [], "season": season, "week": week})
+        games = Game.query.filter_by(week_id=wk.id).order_by(Game.game_time.asc()).all()
+        return jsonify({"season": season, "week": week, "games": [_serialize_game(g) for g in games]})
+
+    # ---- JSON: simple admin status ----------------------------------------
+    # GET /admin/status/2?season=2025
+    @app.route("/admin/status/<int:week>")
+    def admin_status(week: int):
+        season = int(request.args.get("season", DEFAULT_SEASON))
+        wk = _get_week(season, week)
+        if not wk:
+            return jsonify({"week_number": week, "season_year": season, "participants": [], "total_games": 0})
+
+        total_games = Game.query.filter_by(week_id=wk.id).count()
+
+        rows = []
+        participants = Participant.query.order_by(Participant.name.asc()).all()
+        for p in participants:
+            picks_made = 0
+            if HAS_PICK:
+                try:
+                    picks_made = db.session.query(Pick).filter_by(participant_id=p.id).join(
+                        Game, Game.id == Pick.game_id
+                    ).filter(Game.week_id == wk.id).count()
+                except Exception:
+                    picks_made = 0
+            rows.append(
+                {"name": p.name, "picks_made": picks_made, "total_games": total_games, "complete": picks_made >= total_games}
+            )
+
+        return jsonify({"week_number": week, "season_year": season, "total_games": total_games, "participants": rows})
+
+    # ---- HTML: picks form (read-only rendering) ---------------------------
+    # You said the template you have is `picks_form.html`. We’ll render that.
+    # Both of these work:
+    #   /picks/2/Tony?season=2025
+    #   /picks/week/2/Tony?season=2025
+    def _render_picks_form(week: int, name: str):
+        season = int(request.args.get("season", DEFAULT_SEASON))
+
+        wk = _get_week(season, week)
+        if not wk:
+            return f"No data for season {season} week {week}.", 404
+
+        # case-insensitive participant lookup
+        participant = (
+            Participant.query.filter(func.lower(Participant.name) == func.lower(name)).first()
+        )
+        if not participant:
+            return f"Participant '{name}' not found.", 404
+
+        games = Game.query.filter_by(week_id=wk.id).order_by(Game.game_time.asc()).all()
+
+        # Pre-fill existing picks if your schema/model has them
+        existing = {}
+        if HAS_PICK:
+            try:
+                picks = (
+                    db.session.query(Pick)
+                    .filter_by(participant_id=participant.id)
+                    .join(Game, Game.id == Pick.game_id)
+                    .filter(Game.week_id == wk.id)
+                    .all()
                 )
-                participants_payload.append(
-                    {
-                        "name": p.name,
-                        "picks_made": picks_made,
-                        "total_games": total_games,
-                        "complete": total_games > 0 and picks_made >= total_games,
-                    }
-                )
-        except Exception:
-            # If Participant/Pick model isn't present, fall back to an empty list
-            participants_payload = []
+                # Try to infer structure: assume attributes game_id and choice ('home'/'away' or team name)
+                for pk in picks:
+                    choice = getattr(pk, "choice", None) or getattr(pk, "team", None)
+                    existing[getattr(pk, "game_id")] = choice
+            except Exception:
+                existing = {}
 
-        return jsonify(
-            {
-                "week_number": week_number,
-                "season_year": season,
-                "total_games": total_games,
-                "participants": participants_payload,
-            }
+        # Render your existing template
+        # (Template variables are generic so they won’t collide with your markup.)
+        return render_template(
+            "picks_form.html",
+            season=season,
+            week=week,
+            participant_name=participant.name,
+            deadline=getattr(wk, "picks_deadline", None),
+            games=games,
+            existing_picks=existing,
         )
 
-    @app.route("/games/<int:week_number>")
-    def games_api(week_number: int):
-        """
-        NEW: read-only JSON of the scheduled games for a given week.
-        Optional query param: ?season=YYYY  (defaults to DEFAULT_SEASON)
-        """
-        season = request.args.get("season", type=int) or DEFAULT_SEASON
-        w = Week.query.filter_by(season_year=season, week_number=week_number).first()
-        if not w:
-            return jsonify(error=f"Week {week_number} for season {season} not found."), 404
+    @app.route("/picks/<int:week>/<string:name>")
+    def picks_short(week: int, name: str):
+        return _render_picks_form(week, name)
 
-        games = (
-            Game.query.filter_by(week_id=w.id)
-            .order_by(Game.game_time.asc())
-            .all()
-        )
-
-        def _iso(dt: datetime | None) -> str | None:
-            if dt is None:
-                return None
-            # Stored as UTC-naive; return RFC3339-like with 'Z'
-            return dt.isoformat() + "Z"
-
-        payload = [
-            {
-                "away_team": g.away_team,
-                "home_team": g.home_team,
-                "game_time": _iso(g.game_time),
-                "status": g.status,
-                "espn_game_id": g.espn_game_id,
-            }
-            for g in games
-        ]
-        return jsonify(payload)
+    @app.route("/picks/week/<int:week>/<string:name>")
+    def picks_long(week: int, name: str):
+        return _render_picks_form(week, name)
 
     return app
 
 
-# Allow `python app.py` locally if you want to test without Gunicorn
+# For local dev: `python app.py`
 if __name__ == "__main__":
     app = create_app()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
