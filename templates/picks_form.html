@@ -6,32 +6,63 @@
   <p>Week {{ week.week_number }}, {{ week.season_year }} — {{ games|length }} games</p>
 
   {% if not participant %}
-    <p><em>Note:</em> This name isn’t in the participants table yet. Page is read-only.</p>
+    <p><em>Note:</em> This name isn’t in the participants table yet. You can still submit; we’ll create it if needed.</p>
   {% endif %}
 
   {% if week.picks_deadline %}
     <p><strong>Deadline (UTC):</strong> {{ week.picks_deadline }}</p>
   {% endif %}
 
-  <table border="1" cellpadding="6" cellspacing="0">
-    <thead>
-      <tr>
-        <th>#</th>
-        <th>Kickoff (UTC)</th>
-        <th>Matchup</th>
-        <th>Status</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for g in games %}
+  {% if save_result %}
+    <div style="padding:8px;border:1px solid #ccc;margin:10px 0;background:#f8fff2">
+      {{ save_result.message }}
+      {% if save_result.preview %}
+        <ul>
+          {% for row in save_result.preview %}
+            <li>{{ row.away }} @ {{ row.home }} — you picked: <strong>{{ row.winner }}</strong></li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  <form method="POST">
+    <table border="1" cellpadding="6" cellspacing="0">
+      <thead>
         <tr>
-          <td>{{ loop.index }}</td>
-          <td>{{ g.game_time }}</td>
-          <td>{{ g.away_team }} @ {{ g.home_team }}</td>
-          <td>{{ g.status }}</td>
+          <th>#</th>
+          <th>Kickoff (UTC)</th>
+          <th>Matchup</th>
+          <th>Your pick</th>
+          <th>Status</th>
         </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+      </thead>
+      <tbody>
+        {% for g in games %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td>{{ g.game_time }}</td>
+            <td>{{ g.away_team }} @ {{ g.home_team }}</td>
+            <td>
+              <label>
+                <input type="radio" name="pick_{{ g.id }}" value="away">
+                {{ g.away_team }}
+              </label>
+              &nbsp;&nbsp;
+              <label>
+                <input type="radio" name="pick_{{ g.id }}" value="home">
+                {{ g.home_team }}
+              </label>
+            </td>
+            <td>{{ g.status }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <div style="margin-top:12px">
+      <button type="submit">Save Picks</button>
+    </div>
+  </form>
 {% endblock %}
 

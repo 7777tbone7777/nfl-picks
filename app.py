@@ -1,172 +1,279 @@
-# app.py
 import os
 from datetime import datetime
-from typing import Optional, List, Dict
 
 from flask import Flask, jsonify, render_template, request
-from jinja2 import TemplateNotFound
+from sqlalchemy import func
 
+# Your model layer
+# (db is the SQLAlchemy() instance created in models.py)
 from models import db, Week, Game, Participant
 
 
-def _coerce_db_url(url: Optional[str]) -> Optional[str]:
-    """Heroku still hands out postgres://; SQLAlchemy expects postgresql://"""
-    if url and url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql://", 1)
-    return url
-
-
+# ----------------------------
+# App factory
+# ----------------------------
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    # ---- Config ----
-    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev")
-    app.config["SQLALCHEMY_DATABASE_URI"] = _coerce_db_url(os.getenv("DATABASE_URL"))
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    # Heroku supplies DATABASE_URL which can be "postgres://"
+    database_url = os.getenv("DATABASE_URL", "sqlite:///local.db")
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
 
-    # ---- DB ----
+    app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret")
+
     db.init_app(app)
 
-    # -------- Helpers --------
-    def _week_or_404(season: int, week_num: int):
-        w = Week.query.filter_by(season_year=season, week_number=week_num).first()
-        if not w:
-            return None, jsonify(error=f"Week {week_num} not found for season {season}"), 404
-        return w, None, None
-
-    def _games_json(games: List[Game]) -> List[Dict]:
-        out: List[Dict] = []
-        for g in games:
-            out.append(
-                {
-                    "id": g.id,
-                    "away_team": g.away_team,
-                    "home_team": g.home_team,
-                    "game_time": g.game_time.isoformat() if isinstance(g.game_time, datetime) else str(g.game_time),
-                    "status": g.status,
-                    "espn_game_id": g.espn_game_id,
-                }
+    # ----------------------------
+    # Helpers
+    # ----------------------------
+    def _find_week(week_number: int, season_year: int | None):
+        """
+        Get Week by (week_number, season_year). If season_year is None,
+        pick the most recent season that has that week.
+        """
+        q = Week.query.filter_by(week_number=week_number)
+        if season_year:
+            q = q.filter_by(season_year=season_year)
+        else:
+            # fallback: latest season that has this week
+            sub = (
+                db.session.query(func.max(Week.season_year))
+                .filter(Week.week_number == week_number)
+                .scalar_subquery()
             )
-        return out
+            q = q.filter(Week.season_year == sub)
+        return q.first_or_404()
 
-    # -------- Routes --------
+    # ----------------------------
+    # Routes
+    # ----------------------------
     @app.route("/")
     def index():
-        # Use your existing template if present; otherwise keep the simple text
+        return render_template("index.html")
+
+    @app.route("/healthz")
+    def healthz():
+        return "ok", 200
+
+    # JSON: quick dashboard of picks activity by participant for a week
+    # Example: /admin/status/2?season=2025
+    @app.route("/admin/status/<int:week_number>")
+    def admin_status(week_number: int):
+        season_year = request.args.get("season", type=int)
+        week = _find_week(week_number, season_year)
+
+        total_games = Game.query.filter_by(week_id=week.id).count()
+        participants = Participant.query.order_by(Participant.name.asc()).all()
+
+        summary = []
+        picks_count_supported = False
+        picks_error = None
+
+        # Try to count real picks if a Pick model exists and we can find a winner column.
         try:
-            return render_template("index.html")
-        except TemplateNotFound:
-            return "Welcome to the NFL Picks App!"
+            from models import Pick  # type: ignore
 
-    # JSON: /games?season=2025&week=2  (week defaults to 2 if not provided)
-    @app.route("/games")
-    def games_query():
-        season = request.args.get("season", default=2025, type=int)
-        week_num = request.args.get("week", default=2, type=int)
-        w, resp, code = _week_or_404(season, week_num)
-        if resp:
-            return resp, code
-        games = Game.query.filter_by(week_id=w.id).order_by(Game.game_time.asc()).all()
-        return jsonify(_games_json(games))
+            pick_cols = {c.name for c in Pick.__table__.columns}
+            # We just need existence; exact winner column isn't necessary for counting rows
+            picks_count_supported = True
 
-    # JSON: /games/<int:week_num>?season=2025
-    @app.route("/games/<int:week_num>")
-    def games_for_week(week_num: int):
-        season = request.args.get("season", default=2025, type=int)
-        w, resp, code = _week_or_404(season, week_num)
-        if resp:
-            return resp, code
-        games = Game.query.filter_by(week_id=w.id).order_by(Game.game_time.asc()).all()
-        return jsonify(_games_json(games))
-
-    # Admin progress summary you already used
-    # /admin/status/<int:week_num>?season=2025
-    @app.route("/admin/status/<int:week_num>")
-    def admin_status(week_num: int):
-        season = request.args.get("season", default=2025, type=int)
-        w, resp, code = _week_or_404(season, week_num)
-        if resp:
-            return resp, code
-
-        games = Game.query.filter_by(week_id=w.id).all()
-        total_games = len(games)
-
-        participants = []
-        for p in Participant.query.order_by(Participant.name.asc()).all():
-            # Try to count picks if a Pick model exists; otherwise report 0
-            picks_made = 0
-            try:
-                from models import Pick  # type: ignore
-                picks_made = (
+            for p in participants:
+                count = (
                     db.session.query(Pick)
                     .join(Game, Game.id == Pick.game_id)
-                    .filter(Pick.participant_id == p.id, Game.week_id == w.id)
+                    .filter(Game.week_id == week.id, Pick.participant_id == p.id)
                     .count()
                 )
-            except Exception:
-                picks_made = 0
+                summary.append(
+                    {
+                        "name": p.name,
+                        "picks_made": count,
+                        "total_games": total_games,
+                        "complete": count >= total_games and total_games > 0,
+                    }
+                )
+        except Exception as e:  # noqa: BLE001
+            picks_error = str(e)
+            # Fallback with zero counts
+            for p in participants:
+                summary.append(
+                    {
+                        "name": p.name,
+                        "picks_made": 0,
+                        "total_games": total_games,
+                        "complete": False,
+                    }
+                )
 
-            participants.append(
-                {
-                    "name": p.name,
-                    "picks_made": picks_made,
-                    "total_games": total_games,
-                    "complete": picks_made >= total_games and total_games > 0,
-                }
-            )
+        payload = {
+            "week_number": week.week_number,
+            "season_year": week.season_year,
+            "total_games": total_games,
+            "participants": summary,
+        }
+        if picks_error:
+            payload["note"] = f"Pick counting disabled: {picks_error}"
 
-        return jsonify(
-            {
-                "season_year": season,
-                "week_number": week_num,
-                "total_games": total_games,
-                "participants": participants,
-            }
-        )
+        return jsonify(payload)
 
-    # HTML picks page (falls back to JSON if template is missing)
-    # /picks/week/<int:week_num>/<participant_name>?season=2025
-    @app.route("/picks/week/<int:week_num>/<participant_name>")
-    def picks_form(week_num: int, participant_name: str):
-        season = request.args.get("season", default=2025, type=int)
-        w, resp, code = _week_or_404(season, week_num)
-        if resp:
-            return resp, code
-
-        p = Participant.query.filter_by(name=participant_name).first()
-        if not p:
-            return jsonify(error=f"Participant '{participant_name}' not found"), 404
+    # JSON: list games for a week (ordered by kickoff)
+    # Example: /games/2?season=2025
+    @app.route("/games/<int:week_number>")
+    def games_json(week_number: int):
+        season_year = request.args.get("season", type=int)
+        week = _find_week(week_number, season_year)
 
         games = (
-            Game.query.filter_by(week_id=w.id)
+            Game.query.filter_by(week_id=week.id)
             .order_by(Game.game_time.asc())
             .all()
         )
 
-        try:
-            return render_template(
-                "picks_form.html",
-                season=season,
-                week=w,
-                participant=p,
-                games=games,
-            )
-        except TemplateNotFound:
-            # Safe fallback so you never get a 500 here
-            return jsonify(
-                {
-                    "season": season,
-                    "week": week_num,
-                    "participant": participant_name,
-                    "deadline_utc": w.picks_deadline,
-                    "games": _games_json(games),
-                }
-            )
+        def _fmt(dt: datetime | None):
+            return dt.isoformat() if dt else None
 
-    # Simple health check
-    @app.route("/health")
-    def health():
-        return jsonify(ok=True)
+        data = [
+            {
+                "away_team": g.away_team,
+                "home_team": g.home_team,
+                "game_time": _fmt(g.game_time),
+                "status": g.status,
+                "espn_game_id": g.espn_game_id,
+            }
+            for g in games
+        ]
+        return jsonify(data)
+
+    # Picks page (GET = view, POST = save if possible)
+    # Example: /picks/week/2/Tony?season=2025
+    @app.route(
+        "/picks/week/<int:week_number>/<string:participant_name>",
+        methods=["GET", "POST"],
+    )
+    def picks_week(week_number: int, participant_name: str):
+        season_year = request.args.get("season", type=int)
+        week = _find_week(week_number, season_year)
+
+        games = (
+            Game.query.filter_by(week_id=week.id)
+            .order_by(Game.game_time.asc())
+            .all()
+        )
+
+        participant = Participant.query.filter_by(name=participant_name).first()
+
+        save_result = None
+        if request.method == "POST":
+            # Create a participant on the fly if not present (handy for quick trials)
+            if participant is None:
+                participant = Participant(name=participant_name)
+                db.session.add(participant)
+                db.session.flush()
+
+            # Collect selections
+            chosen = []
+            for g in games:
+                choice = request.form.get(f"pick_{g.id}")
+                if choice not in ("home", "away"):
+                    continue
+                winner = g.home_team if choice == "home" else g.away_team
+                chosen.append({"game": g, "winner": winner})
+
+            if not chosen:
+                save_result = {"message": "No selections were made.", "preview": []}
+            else:
+                saved_rows = 0
+                preview_rows = []
+                try:
+                    from models import Pick  # type: ignore
+
+                    pick_cols = {c.name for c in Pick.__table__.columns}
+                    # Try to detect a sensible column to hold the winner string
+                    winner_field = None
+                    for candidate in (
+                        "selected_team",
+                        "winner",
+                        "choice_team",
+                        "team_pick",
+                        "team",
+                        "selection",
+                        "pick",
+                    ):
+                        if candidate in pick_cols:
+                            winner_field = candidate
+                            break
+
+                    for item in chosen:
+                        g = item["game"]
+                        wteam = item["winner"]
+
+                        rec = Pick.query.filter_by(
+                            participant_id=participant.id,
+                            game_id=g.id,
+                        ).first()
+
+                        if rec is None:
+                            kwargs = dict(participant_id=participant.id, game_id=g.id)
+                            if winner_field:
+                                kwargs[winner_field] = wteam
+                            rec = Pick(**kwargs)
+                            db.session.add(rec)
+                        else:
+                            if winner_field:
+                                setattr(rec, winner_field, wteam)
+
+                        saved_rows += 1
+                        preview_rows.append(
+                            {
+                                "home": g.home_team,
+                                "away": g.away_team,
+                                "winner": wteam,
+                            }
+                        )
+
+                    db.session.commit()
+                    if winner_field:
+                        save_result = {
+                            "message": f"Saved {saved_rows} picks.",
+                            "preview": preview_rows,
+                        }
+                    else:
+                        save_result = {
+                            "message": f"Recorded {saved_rows} rows, but no winner column was detected in Pick table (showing preview only).",
+                            "preview": preview_rows,
+                        }
+
+                except Exception as e:  # noqa: BLE001
+                    # If Pick model/structure doesn't match, don't blow up; show preview only.
+                    preview_rows = [
+                        {
+                            "home": it["game"].home_team,
+                            "away": it["game"].away_team,
+                            "winner": it["winner"],
+                        }
+                        for it in chosen
+                    ]
+                    save_result = {
+                        "message": f"Could not save to DB (preview only): {e}",
+                        "preview": preview_rows,
+                    }
+
+        return render_template(
+            "picks_form.html",
+            week=week,
+            games=games,
+            participant=participant,
+            save_result=save_result,
+        )
 
     return app
+
+
+# Allow `python app.py` to run a local dev server if you want it.
+if __name__ == "__main__":
+    app = create_app()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
 
