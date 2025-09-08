@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Picks saved{% endblock %}
+{% block content %}
+  <h1>Picks saved</h1>
+  <p>{{ saved_count }} of {{ total }} selections saved for {{ name }}
+     — Week {{ week.week_number }}, {{ week.season_year }}.</p>
+  <p><a href="{{ url_for('picks_week', week=week.week_number, name=name, season=week.season_year) }}">Back to picks</a></p>
+{% endblock %}
+

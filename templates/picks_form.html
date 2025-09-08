@@ -1,37 +1,16 @@
 {% extends "base.html" %}
 {% block title %}Picks – Week {{ week.week_number }} {{ week.season_year }}{% endblock %}
-
 {% block content %}
-  <h1>Picks for {{ participant.name if participant else 'Guest' }}</h1>
+  <h1>Picks for {{ name }}</h1>
   <p>Week {{ week.week_number }}, {{ week.season_year }} — {{ games|length }} games</p>
+  <p><strong>Deadline (PT):</strong> {{ week.picks_deadline|to_pacific }}</p>
 
-  {% if not participant %}
-    <p><em>Note:</em> This name isn’t in the participants table yet. You can still submit; we’ll create it if needed.</p>
-  {% endif %}
-
-  {% if week.picks_deadline %}
-    <p><strong>Deadline (UTC):</strong> {{ week.picks_deadline }}</p>
-  {% endif %}
-
-  {% if save_result %}
-    <div style="padding:8px;border:1px solid #ccc;margin:10px 0;background:#f8fff2">
-      {{ save_result.message }}
-      {% if save_result.preview %}
-        <ul>
-          {% for row in save_result.preview %}
-            <li>{{ row.away }} @ {{ row.home }} — you picked: <strong>{{ row.winner }}</strong></li>
-          {% endfor %}
-        </ul>
-      {% endif %}
-    </div>
-  {% endif %}
-
-  <form method="POST">
+  <form method="post">
     <table border="1" cellpadding="6" cellspacing="0">
       <thead>
         <tr>
           <th>#</th>
-          <th>Kickoff (UTC)</th>
+          <th>Kickoff (PT)</th>
           <th>Matchup</th>
           <th>Your pick</th>
           <th>Status</th>
@@ -39,18 +18,21 @@
       </thead>
       <tbody>
         {% for g in games %}
+          {% set existing = existing_picks.get(g.id) %}
           <tr>
             <td>{{ loop.index }}</td>
-            <td>{{ g.game_time }}</td>
+            <td>{{ g.game_time|to_pacific }}</td>
             <td>{{ g.away_team }} @ {{ g.home_team }}</td>
             <td>
               <label>
-                <input type="radio" name="pick_{{ g.id }}" value="away">
+                <input type="radio" name="pick_{{ g.id }}" value="away"
+                       {% if existing == g.away_team %}checked{% endif %}>
                 {{ g.away_team }}
               </label>
               &nbsp;&nbsp;
               <label>
-                <input type="radio" name="pick_{{ g.id }}" value="home">
+                <input type="radio" name="pick_{{ g.id }}" value="home"
+                       {% if existing == g.home_team %}checked{% endif %}>
                 {{ g.home_team }}
               </label>
             </td>
@@ -60,9 +42,7 @@
       </tbody>
     </table>
 
-    <div style="margin-top:12px">
-      <button type="submit">Save Picks</button>
-    </div>
+    <p><button type="submit">Save Picks</button></p>
   </form>
 {% endblock %}
 
