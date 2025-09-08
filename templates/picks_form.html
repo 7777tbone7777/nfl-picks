@@ -1,4 +1,35 @@
-{% extends "base.html" %}{% block content %}<h1>Picks for {{ participant.name }} - Week {{ week.week_number }}</h1><p>Form goes here.</p>{% endblock %}
-```*   `templates/admin.html`
-```html
-{% extends "base.html" %}{% block content %}<h1>Admin Panel</h1><p>Admin content goes here.</p>{% endblock %}
+{% extends "base.html" %}
+{% block title %}Picks – Week {{ week.week_number }} {{ week.season_year }}{% endblock %}
+{% block content %}
+  <h1>Picks for {{ name }}</h1>
+  <p>Week {{ week.week_number }}, {{ week.season_year }} — {{ games|length }} games</p>
+  {% if participant is none %}
+    <p><em>Note:</em> “{{ name }}” isn’t in the participants table yet. That’s fine for viewing.</p>
+  {% endif %}
+
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Kickoff (UTC)</th>
+        <th>Matchup</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for g in games %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td>{{ g.game_time }}</td>
+          <td>{{ g.away_team }} @ {{ g.home_team }}</td>
+          <td>{{ g.status }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <p style="margin-top:1rem">
+    (Read-only for now. When you’re ready to collect picks, we’ll wire a POST endpoint that saves to a `Pick` table.)
+  </p>
+{% endblock %}
+
