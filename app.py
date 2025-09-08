@@ -1,268 +1,378 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from flask import (
     Flask,
-    jsonify,
     render_template,
     render_template_string,
     request,
-    redirect,
-    url_for,
+    jsonify,
     abort,
+    url_for,
 )
 
-from models import db, Week, Game, Participant
+# Your models (unchanged)
+from models import db, Week, Game, Participant, Pick
 
-# Optional: if Pick exists, we'll import it lazily where needed.
+# ------- Config you can tweak without touching code elsewhere ----------
+DEFAULT_SEASON = 2025
+DISPLAY_TZ = os.getenv("DISPLAY_TZ", "America/Los_Angeles")  # PDT/PST
+# ----------------------------------------------------------------------
 
 
-# -----------------------------
-# App Factory
-# -----------------------------
-def create_app():
-    app = Flask(__name__)
+def _coerce_database_url(url: str | None) -> str | None:
+    """Heroku sometimes provides postgres://; SQLAlchemy wants postgresql://"""
+    if not url:
+        return None
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://") :]
+    return url
 
-    # Config
-    db_url = os.getenv("DATABASE_URL", "")
-    # Heroku sometimes gives old scheme "postgres://"
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-    app.config.update(
-        SQLALCHEMY_DATABASE_URI=db_url or "sqlite:///local.db",
-        SQLALCHEMY_TRACK_MODIFICATIONS=False,
-        SECRET_KEY=os.getenv("SECRET_KEY", "dev"),
-    )
+def _ensure_aware_utc(dt: datetime | None) -> datetime | None:
+    """Treat naive datetimes as UTC; leave aware ones alone."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
+
+def create_app() -> Flask:
+    app = Flask(__name__, template_folder="templates", static_folder="static")
+
+    # --- Basic config ---
+    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret")
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    db_url = _coerce_database_url(os.getenv("DATABASE_URL"))
+    if db_url:
+        app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+
+    # Bind SQLAlchemy
     db.init_app(app)
 
-    # Defaults
-    DEFAULT_SEASON = int(os.getenv("DEFAULT_SEASON", "2025"))
-    DISPLAY_TZ = os.getenv("DISPLAY_TZ", "America/Los_Angeles")
+    # ---------- Jinja filter: localtime (PDT by default) ----------
+    @app.template_filter("localtime")
+    def jinja_localtime(dt: datetime | None, fmt: str = "%a %b %d %I:%M %p %Z"):
+        """Render a datetime in DISPLAY_TZ. Naive is assumed UTC."""
+        if dt is None:
+            return ""
+        aware_utc = _ensure_aware_utc(dt)
+        local = aware_utc.astimezone(ZoneInfo(DISPLAY_TZ))
+        return local.strftime(fmt)
 
-    # -----------------------------
-    # Helpers
-    # -----------------------------
-    def get_season_arg():
+    # ---------- Helpers ----------
+    def _effective_season() -> int:
         try:
             return int(request.args.get("season", DEFAULT_SEASON))
         except Exception:
             return DEFAULT_SEASON
 
-    def get_week_or_404(season_year: int, week_number: int) -> Week:
-        w = Week.query.filter_by(season_year=season_year, week_number=week_number).first()
-        if not w:
-            abort(404, f"Week {week_number} for season {season_year} not found.")
-        return w
-
-    def games_for_week_sorted(week_id: int):
-        return (
-            Game.query.filter_by(week_id=week_id)
-            .order_by(Game.game_time.asc())
-            .all()
-        )
-
-    def to_local(dt_utc, tz_name: str) -> datetime:
+    def _pick_column_name() -> str:
         """
-        DB stores naive UTC. Make it UTC-aware then convert to display tz.
+        Return whichever attribute your Pick model uses to store a team string.
+        We won't guess wrong and break saving.
         """
-        tz_local = ZoneInfo(tz_name)
-        if dt_utc is None:
-            return None
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=ZoneInfo("UTC"))
-        else:
-            dt_utc = dt_utc.astimezone(ZoneInfo("UTC"))
-        return dt_utc.astimezone(tz_local)
+        for attr in ("team", "selection", "choice", "picked_team", "team_picked"):
+            if hasattr(Pick, attr):
+                return attr
+        # Fallback to 'team' if none matched (keeps legacy behavior)
+        return "team"
 
-    # -----------------------------
-    # Routes
-    # -----------------------------
+    # ==================== ROUTES ====================
+
     @app.route("/")
     def index():
-        # If you have templates/index.html this will render it, otherwise a tiny default text.
+        # Use your existing index.html if present, otherwise a tiny fallback.
         try:
             return render_template("index.html")
         except Exception:
             return "Welcome to the NFL Picks App!"
 
-    # ---- JSON: Games for a week ----
-    @app.get("/games/<int:week_num>")
-    def games_json(week_num: int):
-        season = get_season_arg()
-        w = get_week_or_404(season, week_num)
-        games = games_for_week_sorted(w.id)
-
-        def dt_to_iso_z(dt):
-            # Keep the existing style: naive stored as UTC -> append 'Z'
-            if dt is None:
-                return None
-            if dt.tzinfo is None:
-                return dt.isoformat() + "Z"
-            return dt.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
-
+    # ---- Read-only JSON: list games for a given week (default: week_num path) ----
+    @app.route("/games/<int:week_num>")
+    def games_week(week_num: int):
+        season = _effective_season()
+        w = Week.query.filter_by(season_year=season, week_number=week_num).first_or_404()
+        games = (
+            Game.query.filter_by(week_id=w.id)
+            .order_by(Game.game_time.asc())
+            .all()
+        )
         payload = [
             {
-                "espn_game_id": g.espn_game_id,
-                "home_team": g.home_team,
                 "away_team": g.away_team,
+                "home_team": g.home_team,
+                "game_time": _ensure_aware_utc(g.game_time).isoformat(),
                 "status": g.status,
-                "game_time": dt_to_iso_z(g.game_time),
+                "espn_game_id": g.espn_game_id,
             }
             for g in games
         ]
         return jsonify(payload)
 
-    # ---- JSON: Admin status for a week ----
-    @app.get("/admin/status/<int:week_num>")
-    def admin_status(week_num: int):
-        season = get_season_arg()
-        w = get_week_or_404(season, week_num)
-        game_ids = [g.id for g in games_for_week_sorted(w.id)]
-
-        participants = Participant.query.order_by(Participant.name.asc()).all()
-
-        # Count picks per participant for the games in this week (if Pick exists).
-        picks_count_by_pid = {}
+    # ---- Same, but choose week_number via query param (/games?week=2&season=2025) ----
+    @app.route("/games")
+    def games_query():
+        season = _effective_season()
         try:
-            from models import Pick  # type: ignore
-
-            if game_ids:
-                # Count rows of Pick where game_id in this week
-                rows = (
-                    db.session.query(Pick.participant_id, db.func.count(Pick.id))
-                    .filter(Pick.game_id.in_(game_ids))
-                    .group_by(Pick.participant_id)
-                    .all()
-                )
-                picks_count_by_pid = {pid: int(c) for (pid, c) in rows}
+            week_num = int(request.args.get("week", 1))
         except Exception:
-            # If there's no Pick model yet, leave counts at 0
-            picks_count_by_pid = {}
+            week_num = 1
+        w = Week.query.filter_by(season_year=season, week_number=week_num).first_or_404()
+        games = (
+            Game.query.filter_by(week_id=w.id)
+            .order_by(Game.game_time.asc())
+            .all()
+        )
+        payload = [
+            {
+                "away_team": g.away_team,
+                "home_team": g.home_team,
+                "game_time": _ensure_aware_utc(g.game_time).isoformat(),
+                "status": g.status,
+                "espn_game_id": g.espn_game_id,
+            }
+            for g in games
+        ]
+        return jsonify(payload)
 
-        items = []
-        total_games = len(game_ids)
-        for p in participants:
-            made = picks_count_by_pid.get(p.id, 0)
-            items.append(
+    # ---- Admin status for a week (JSON) ----
+    @app.route("/admin/status/<int:week_num>")
+    def admin_status(week_num: int):
+        season = _effective_season()
+        w = Week.query.filter_by(season_year=season, week_number=week_num).first_or_404()
+        total_games = Game.query.filter_by(week_id=w.id).count()
+
+        # Count picks per participant
+        rows = []
+        for p in Participant.query.order_by(Participant.name.asc()).all():
+            picks_made = (
+                db.session.query(Pick)
+                .join(Game, Pick.game_id == Game.id)
+                .filter(Game.week_id == w.id, Pick.participant_id == p.id)
+                .count()
+            )
+            rows.append(
                 {
                     "name": p.name,
-                    "picks_made": made,
+                    "picks_made": picks_made,
                     "total_games": total_games,
-                    "complete": (made >= total_games and total_games > 0),
+                    "complete": picks_made >= total_games and total_games > 0,
                 }
             )
 
         return jsonify(
             {
-                "week_number": week_num,
                 "season_year": season,
-                "participants": items,
+                "week_number": week_num,
                 "total_games": total_games,
+                "participants": rows,
             }
         )
 
-    # ---- Picks entry (GET shows form, POST saves) ----
+    # ---- Picks form (GET) + save (POST) ----
     @app.route("/picks/week/<int:week_num>/<name>", methods=["GET", "POST"])
     def picks_form(week_num: int, name: str):
-        season = get_season_arg()
-        week = get_week_or_404(season, week_num)
-        games = games_for_week_sorted(week.id)
+        season = _effective_season()
+        w = Week.query.filter_by(season_year=season, week_number=week_num).first_or_404()
+        games = (
+            Game.query.filter_by(week_id=w.id)
+            .order_by(Game.game_time.asc())
+            .all()
+        )
 
-        # Participant (we won't fail if they aren't in table, we just show a note)
+        # Fetch participant (create if not found, so links work even before pre-seeding)
         participant = Participant.query.filter_by(name=name).first()
+        if request.method == "GET":
+            return render_template(
+                "picks_form.html",
+                name=name,
+                week=w,
+                games=games,
+                participant=participant,
+                display_tz=DISPLAY_TZ,
+            )
 
-        # Field name detection for Pick.choice column, but only used on POST:
-        def resolve_pick_choice_attr():
-            from models import Pick  # lazy import so app works even if Pick doesn't exist at import time
-            cols = set(Pick.__table__.columns.keys())
-            for cand in ("selected_team", "team", "pick", "choice", "selection"):
-                if cand in cols:
-                    return cand
-            # Fallback: create an attribute name; setattr will still work if model allows it
-            return "selected_team"
+        # POST: Save submitted picks
+        if participant is None:
+            participant = Participant(name=name)
+            db.session.add(participant)
+            db.session.flush()  # get id
 
-        if request.method == "POST":
-            # Hard guard against missing participants
-            if participant is None:
-                participant = Participant(name=name)
-                db.session.add(participant)
-                db.session.flush()
+        pick_attr = _pick_column_name()
+        saved = 0
 
-            choice_attr = None
-            try:
-                from models import Pick  # type: ignore
+        for g in games:
+            # each radio group name = f"pick_{game.id}"
+            picked = request.form.get(f"pick_{g.id}")
+            if not picked:
+                continue
 
-                choice_attr = resolve_pick_choice_attr()
+            existing = Pick.query.filter_by(
+                participant_id=participant.id, game_id=g.id
+            ).first()
 
-                # Deadline guard (display only in PT, but comparison in UTC)
-                now_utc = datetime.utcnow()
-                if week.picks_deadline and now_utc > week.picks_deadline:
-                    return render_template_string(
-                        "<h3>Deadline passed</h3><p>Picks are locked for this week.</p>"
-                        '<p><a href="{{ url }}">Back to picks</a></p>',
-                        url=url_for("picks_form", week_num=week_num, name=name, season=season),
-                    )
+            if existing:
+                setattr(existing, pick_attr, picked)
+            else:
+                newp = Pick(participant_id=participant.id, game_id=g.id)
+                setattr(newp, pick_attr, picked)
+                db.session.add(newp)
+            saved += 1
 
-                for g in games:
-                    val = request.form.get(f"pick_{g.id}")  # "home" or "away"
-                    if not val:
-                        continue
-                    team_name = g.home_team if val == "home" else g.away_team
+        db.session.commit()
 
-                    existing = (
-                        Pick.query.filter_by(participant_id=participant.id, game_id=g.id)
-                        .first()
-                    )
-                    if existing:
-                        setattr(existing, choice_attr, team_name)
-                    else:
-                        obj = Pick(participant_id=participant.id, game_id=g.id)
-                        setattr(obj, choice_attr, team_name)
-                        db.session.add(obj)
-
-                db.session.commit()
-
-                return render_template_string(
-                    "<h1>Picks saved</h1>"
-                    f"<p>{len(games)} of {len(games)} selections saved for {name} — "
-                    f"Week {week.week_number}, {week.season_year}.</p>"
-                    '<p><a href="{{ url }}">Back to picks</a></p>',
-                    url=url_for("picks_form", week_num=week_num, name=name, season=season),
-                )
-            except Exception as e:
-                db.session.rollback()
-                return render_template_string(
-                    "<h1>Internal Server Error</h1>"
-                    "<p>There was a problem saving picks.</p>"
-                    "<pre>{{ err }}</pre>",
-                    err=str(e),
-                )
-
-        # GET: Build display rows with Pacific time (or DISPLAY_TZ)
-        tz_label = ZoneInfo(DISPLAY_TZ)
-        tz_abbrev = datetime.now(tz_label).strftime("%Z")
-        games_view = [{"g": g, "local_time": to_local(g.game_time, DISPLAY_TZ)} for g in games]
-        deadline_local = to_local(week.picks_deadline, DISPLAY_TZ) if week.picks_deadline else None
-
-        # Render your existing template
-        return render_template(
-            "picks_form.html",
-            week=week,
+        # Simple inline confirmation keeps templates untouched
+        html = """
+        <h1>Picks saved</h1>
+        <p>{{saved}} of {{total}} selections saved for {{name}} — Week {{week}}, {{season}}.</p>
+        <p><a href="{{back}}">Back to picks</a></p>
+        """
+        back_url = url_for("picks_form", week_num=week_num, name=name, season=season)
+        return render_template_string(
+            html,
+            saved=saved,
+            total=len(games),
             name=name,
-            participant=participant,
-            games_view=games_view,
-            deadline_local=deadline_local,
-            tz_label=tz_abbrev,
+            week=week_num,
+            season=season,
+            back=back_url,
+        )
+
+    # ---- Invite links helper (optional) ----
+    @app.route("/links/week/<int:week_num>")
+    def links_week(week_num: int):
+        season = _effective_season()
+        participants = Participant.query.order_by(Participant.name.asc()).all()
+        base = request.url_root.rstrip("/")
+        rows = []
+        for p in participants:
+            path = url_for("picks_form", week_num=week_num, name=p.name, season=season)
+            rows.append((p.name, f"{base}{path}"))
+        html = """
+        <h1>Week {{week}} – {{season}} invite links</h1>
+        <table border="1" cellpadding="6">
+          <tr><th>Name</th><th>URL</th></tr>
+          {% for n,u in rows %}
+            <tr><td>{{n}}</td><td><a href="{{u}}">{{u}}</a></td></tr>
+          {% endfor %}
+        </table>
+        """
+        return render_template_string(html, week=week_num, season=season, rows=rows)
+
+    # ---- Results page with winners + per-person tally (optional) ----
+    @app.route("/results/week/<int:week_num>")
+    def results_week(week_num: int):
+        season = _effective_season()
+        w = Week.query.filter_by(season_year=season, week_number=week_num).first_or_404()
+        games = (
+            Game.query.filter_by(week_id=w.id)
+            .order_by(Game.game_time.asc())
+            .all()
+        )
+
+        # Determine winner for a game if it's final
+        def winner_for(g: Game) -> str | None:
+            if g.home_score is None or g.away_score is None:
+                return None
+            status = (g.status or "").strip().lower()
+            if status not in ("final", "completed", "post"):
+                return None
+            return g.home_team if g.home_score > g.away_score else g.away_team
+
+        pick_attr = _pick_column_name()
+
+        participants = Participant.query.order_by(Participant.name.asc()).all()
+        pid_to_name = {p.id: p.name for p in participants}
+        scores = {p.id: 0 for p in participants}
+
+        rows = []
+        from sqlalchemy import and_
+        for g in games:
+            wteam = winner_for(g)
+            picks_for_game = {}
+            for p in participants:
+                pick = (
+                    Pick.query.filter(
+                        and_(Pick.participant_id == p.id, Pick.game_id == g.id)
+                    )
+                    .first()
+                )
+                team = getattr(pick, pick_attr) if pick is not None else None
+                picks_for_game[p.id] = team
+                if wteam and team == wteam:
+                    scores[p.id] += 1
+            rows.append(
+                {
+                    "kick": g.game_time,
+                    "matchup": f"{g.away_team} @ {g.home_team}",
+                    "status": g.status,
+                    "winner": wteam or "pending",
+                    "picks": picks_for_game,
+                }
+            )
+
+        max_score = max(scores.values()) if scores else 0
+        leaders = [pid_to_name[pid] for pid, sc in scores.items() if sc == max_score]
+
+        html = """
+        <h1>Results — Week {{week}} ({{season}})</h1>
+        <p><b>Leaders:</b> {{ leaders|join(", ") }} — {{ max_score }} correct</p>
+
+        <table border="1" cellpadding="6" cellspacing="0">
+          <thead>
+            <tr>
+              <th>Kickoff ({{tz}})</th>
+              <th>Matchup</th>
+              <th>Status</th>
+              <th>Winner</th>
+              {% for p in participants %}
+                <th>{{ p.name }}</th>
+              {% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in rows %}
+              <tr>
+                <td>{{ r.kick|localtime }}</td>
+                <td>{{ r.matchup }}</td>
+                <td>{{ r.status }}</td>
+                <td>{{ r.winner }}</td>
+                {% for p in participants %}
+                  {% set team = r.picks[p.id] %}
+                  <td>{% if team %}{{ team }}{% else %}<em>—</em>{% endif %}</td>
+                {% endfor %}
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+
+        <h3>Totals</h3>
+        <ul>
+          {% for p in participants %}
+            <li>{{ p.name }}: {{ scores[p.id] }}</li>
+          {% endfor %}
+        </ul>
+        """
+        return render_template_string(
+            html,
+            week=week_num,
+            season=season,
+            rows=rows,
+            participants=participants,
+            scores=scores,
+            max_score=max_score,
+            leaders=leaders,
+            tz=ZoneInfo(DISPLAY_TZ).key,
         )
 
     return app
 
 
-# For local running: `python app.py`
+# For local dev: `python app.py`
 if __name__ == "__main__":
-    application = create_app()
-    application.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    app = create_app()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
 
