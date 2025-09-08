@@ -1,86 +1,48 @@
-@app.route("/picks/week/<int:week_num>/<name>", methods=["GET", "POST"])
-def picks_form(week_num: int, name: str):
-    season = _effective_season()
-    w = Week.query.filter_by(season_year=season, week_number=week_num).first_or_404()
-    games = (
-        Game.query.filter_by(week_id=w.id)
-        .order_by(Game.game_time.asc())
-        .all()
-    )
+{% extends "base.html" %}
+{% block title %}Picks — Week {{ week.week_number }} {{ week.season_year }}{% endblock %}
+{% block content %}
+  <h1>Picks for {{ name }}</h1>
+  <p>Week {{ week.week_number }}, {{ week.season_year }} — {{ games_view|length }} games</p>
 
-    # Fetch participant (create if not found, so links work even before pre-seeding)
-    participant = Participant.query.filter_by(name=name).first()
-    
-    if request.method == "GET":
-        # Build games_view with local time conversion for template
-        games_view = []
-        tz = ZoneInfo(DISPLAY_TZ)
-        for g in games:
-            local_time = _ensure_aware_utc(g.game_time).astimezone(tz)
-            games_view.append({
-                'g': g,
-                'local_time': local_time
-            })
-        
-        # Calculate deadline in local time
-        deadline_local = None
-        tz_label = tz.key.split('/')[-1]  # e.g., "Los_Angeles"
-        if w.picks_deadline:
-            deadline_local = _ensure_aware_utc(w.picks_deadline).astimezone(tz)
-        
-        return render_template(
-            "picks_form.html",
-            name=name,
-            week=w,
-            games_view=games_view,
-            deadline_local=deadline_local,
-            tz_label=tz_label,
-            participant=participant,
-            display_tz=DISPLAY_TZ,
-        )
+  {% if deadline_local %}
+    <p><strong>Deadline ({{ tz_label }}):</strong> {{ deadline_local.strftime('%a %b %d %I:%M %p %Z') }}</p>
+  {% endif %}
 
-    # POST: Save submitted picks
-    if participant is None:
-        participant = Participant(name=name)
-        db.session.add(participant)
-        db.session.flush()  # get id
+  <form method="post">
+    <table border="1" cellpadding="6" cellspacing="0">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Kickoff ({{ tz_label }})</th>
+          <th>Matchup</th>
+          <th>Your pick</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in games_view %}
+          {% set g = row.g %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td>{{ row.local_time.strftime('%a %b %d %I:%M %p %Z') }}</td>
+            <td>{{ g.away_team }} @ {{ g.home_team }}</td>
+            <td>
+              <label>
+                <input type="radio" name="pick_{{ g.id }}" value="away"> {{ g.away_team }}
+              </label>
+              &nbsp;&nbsp;
+              <label>
+                <input type="radio" name="pick_{{ g.id }}" value="home"> {{ g.home_team }}
+              </label>
+            </td>
+            <td>{{ g.status }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
 
-    pick_attr = _pick_column_name()
-    saved = 0
-
-    for g in games:
-        # each radio group name = f"pick_{game.id}"
-        picked = request.form.get(f"pick_{g.id}")
-        if not picked:
-            continue
-
-        existing = Pick.query.filter_by(
-            participant_id=participant.id, game_id=g.id
-        ).first()
-
-        if existing:
-            setattr(existing, pick_attr, picked)
-        else:
-            newp = Pick(participant_id=participant.id, game_id=g.id)
-            setattr(newp, pick_attr, picked)
-            db.session.add(newp)
-        saved += 1
-
-    db.session.commit()
-
-    # Simple inline confirmation keeps templates untouched
-    html = """
-    <h1>Picks saved</h1>
-    <p>{{saved}} of {{total}} selections saved for {{name}} â€" Week {{week}}, {{season}}.</p>
-    <p><a href="{{back}}">Back to picks</a></p>
-    """
-    back_url = url_for("picks_form", week_num=week_num, name=name, season=season)
-    return render_template_string(
-        html,
-        saved=saved,
-        total=len(games),
-        name=name,
-        week=week_num,
-        season=season,
-        back=back_url,
-    )
+    <p style="margin-top:12px;">
+      <button type="submit">Save Picks</button>
+    </p>
+  </form>
+{% endblock %}
