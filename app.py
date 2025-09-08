@@ -8,8 +8,16 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
+# --- DEFINITIVE DATABASE URL FIX ---
+# Get the database URL from Heroku's environment variable
+database_url = os.environ.get('DATABASE_URL')
+# Heroku uses 'postgres://', but SQLAlchemy needs 'postgresql://'
+if database_url and database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
 # Configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'postgresql://username:password@localhost/nfl_picks')
+# Use the corrected URL, or fall back to a local one if not on Heroku
+app.config['SQLALCHEMY_DATABASE_URI'] = database_url or 'postgresql://username:password@localhost/nfl_picks'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here')
 
@@ -19,6 +27,8 @@ TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
 
 db = SQLAlchemy(app)
+
+# --- (The rest of your app.py file remains exactly the same) ---
 
 # Models
 class Participant(db.Model):
