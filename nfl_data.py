@@ -1,133 +1,204 @@
-import requests
+# nfl_data.py
+# ---------------------------------------------------------------------
+# Creates Week + Game rows from ESPN's public scoreboard API.
+# Works with Flask app factory and your SQLAlchemy models.
+# ---------------------------------------------------------------------
+
+from __future__ import annotations
+
+import sys
 from datetime import datetime, timezone
+from typing import List, Dict, Optional
 
-def fetch_week_schedule_from_espn(season: int, week: int):
+import requests
+
+from app import create_app
+from models import db, Week, Game
+
+# Change this once per season if you like
+DEFAULT_SEASON = 2025
+
+ESPN_SCOREBOARD = (
+    "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
+    "?seasontype=2&week={week}&year={season}"
+)
+
+
+# ---------------------------- ESPN helpers ----------------------------
+
+def _to_naive_utc(dt_iso: str) -> datetime:
     """
-    Try ESPN 'scoreboard' first (with and without year).
-    If that 404s, fall back to the core events API.
-    Returns a list of dicts: {home, away, date (UTC ISO), espn_id}
+    ESPN returns ISO timestamps with 'Z' (UTC). Convert to naive UTC datetime,
+    matching your DB's naive 'game_time' column.
     """
-    # 1) Scoreboard (with year)
-    urls = [
-        f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?seasontype=2&week={week}&year={season}",
-        # 2) Scoreboard (without year) – sometimes published earlier than the year-scoped one
-        f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?seasontype=2&week={week}",
-    ]
-
-    for url in urls:
-        resp = requests.get(url, timeout=20)
-        if resp.status_code == 200:
-            data = resp.json()
-            sched = _parse_scoreboard_events(data)
-            if sched:
-                return sched
-        elif resp.status_code not in (404, 400):
-            # hard error other than “not found” – bubble it up
-            resp.raise_for_status()
-
-    # 3) Fallback: core API (usually available for future weeks)
-    return _fetch_from_core_api(season, week)
+    dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-def _parse_scoreboard_events(payload: dict):
-    """Extract schedule from scoreboard JSON into our normalized list."""
-    events = payload.get("events") or []
-    out = []
+def fetch_week_schedule_from_espn(season: int, week: int) -> List[Dict]:
+    """
+    Return a list of game dicts: {home, away, game_time, status, espn_id}.
+    Raises for network errors or 4xx/5xx. Returns [] if no events present.
+    """
+    url = ESPN_SCOREBOARD.format(season=season, week=week)
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    events = data.get("events") or []
+    games: List[Dict] = []
+
     for ev in events:
-        espn_id = str(ev.get("id") or "")
-        dt = ev.get("date")
-        # Normalize date to ISO UTC string
-        try:
-            kick_utc = (
-                datetime.fromisoformat(dt.replace("Z", "+00:00"))
-                .astimezone(timezone.utc)
-                .isoformat()
-            ) if dt else None
-        except Exception:
-            kick_utc = dt
-
         comps = (ev.get("competitions") or [{}])[0]
-        teams = comps.get("competitors") or []
-        home, away = None, None
-        for t in teams:
-            name = (
-                (t.get("team") or {}).get("abbreviation")
-                or (t.get("team") or {}).get("displayName")
-            )
-            side = t.get("homeAway")
-            if side == "home":
-                home = name
-            elif side == "away":
-                away = name
-        if home and away and kick_utc:
-            out.append({"home": home, "away": away, "date": kick_utc, "espn_id": espn_id})
-    return out
-
-
-def _fetch_from_core_api(season: int, week: int):
-    """
-    Use ESPN core API as a reliable fallback for future weeks.
-    We fetch the week’s events list, then pull each event to get teams/date.
-    """
-    base = f"https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/{season}/types/2/weeks/{week}/events"
-    r = requests.get(base, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    items = data.get("items") or []
-    out = []
-
-    for it in items:
-        ev_url = it.get("$ref")
-        if not ev_url:
+        competitors = comps.get("competitors") or []
+        if len(competitors) < 2:
             continue
-        er = requests.get(ev_url, timeout=20)
-        if er.status_code != 200:
-            continue
-        ev = er.json()
-        espn_id = str(ev.get("id") or "")
-        dt = ev.get("date")
-        try:
-            kick_utc = (
-                datetime.fromisoformat(dt.replace("Z", "+00:00"))
-                .astimezone(timezone.utc)
-                .isoformat()
-            ) if dt else None
-        except Exception:
-            kick_utc = dt
 
-        comps_url = (ev.get("competitions") or {}).get("$ref")
-        if not comps_url:
-            continue
-        cr = requests.get(comps_url, timeout=20)
-        if cr.status_code != 200:
-            continue
-        comps = (cr.json().get("items") or [])
-        comp = comps[0] if comps else {}
-        comp_ref = comp.get("$ref")
-        if not comp_ref:
-            continue
-        comp_detail = requests.get(comp_ref, timeout=20).json()
-        competitors = (comp_detail.get("competitors") or {}).get("items") or []
-
-        home, away = None, None
+        home_name = away_name = None
         for c in competitors:
-            cref = c.get("$ref")
-            if not cref:
-                continue
-            cd = requests.get(cref, timeout=20).json()
-            side = cd.get("homeAway")
-            team_ref = (cd.get("team") or {}).get("$ref")
-            team_name = None
-            if team_ref:
-                td = requests.get(team_ref, timeout=20).json()
-                team_name = td.get("abbreviation") or td.get("displayName")
-            if side == "home":
-                home = team_name
-            elif side == "away":
-                away = team_name
+            team = (c.get("team") or {}).get("displayName") or (c.get("team") or {}).get("shortDisplayName")
+            if c.get("homeAway") == "home":
+                home_name = team
+            else:
+                away_name = team
 
-        if home and away and kick_utc:
-            out.append({"home": home, "away": away, "date": kick_utc, "espn_id": espn_id})
+        # Skip if either team missing
+        if not home_name or not away_name:
+            continue
 
-    return out
+        dt_iso = comps.get("date") or ev.get("date")
+        if not dt_iso:
+            continue
+
+        game_time = _to_naive_utc(dt_iso)
+
+        status = ((comps.get("status") or {}).get("type") or {}).get("description") or "STATUS_SCHEDULED"
+        espn_id = comps.get("id") or ev.get("id")
+
+        games.append(
+            {
+                "home": home_name,
+                "away": away_name,
+                "game_time": game_time,
+                "status": status,
+                "espn_id": espn_id,
+            }
+        )
+
+    return games
+
+
+# --------------------------- DB write helpers -------------------------
+
+def compute_picks_deadline(games: List[Dict]) -> Optional[datetime]:
+    """Earliest kickoff (UTC) in the week; None if no games."""
+    if not games:
+        return None
+    return min(g["game_time"] for g in games)
+
+
+def upsert_week_and_games(season: int, week: int, games: List[Dict]) -> Week:
+    """
+    Idempotently create Week + its Game rows when missing.
+    If the Week already exists, we leave existing rows intact.
+    """
+    existing = Week.query.filter_by(season_year=season, week_number=week).first()
+    if existing:
+        print(f"[info] Week {week} {season} already exists "
+              f"({Game.query.filter_by(week_id=existing.id).count()} games).")
+        return existing
+
+    deadline = compute_picks_deadline(games)
+    if deadline is None:
+        raise RuntimeError(
+            f"No games returned for Week {week} {season}; refusing to create a Week with NULL picks_deadline."
+        )
+
+    new_week = Week(
+        week_number=week,
+        season_year=season,
+        picks_deadline=deadline,
+        reminder_sent=False,
+        created_at=datetime.utcnow(),
+    )
+    db.session.add(new_week)
+    db.session.flush()  # get new_week.id
+
+    for g in games:
+        db.session.add(
+            Game(
+                week_id=new_week.id,
+                home_team=g["home"],
+                away_team=g["away"],
+                game_time=g["game_time"],
+                home_score=None,
+                away_score=None,
+                status=g["status"],
+                espn_game_id=str(g["espn_id"]) if g.get("espn_id") is not None else None,
+            )
+        )
+
+    db.session.commit()
+    return new_week
+
+
+# ------------------------------ Public API ----------------------------
+
+def fetch_and_create_week(week: int, season: Optional[int] = None) -> Optional[Week]:
+    """
+    Main entry point used by CLI and Heroku run console.
+    - Fetch schedule from ESPN
+    - Create Week + Game rows if they don't exist
+    - Prints friendly diagnostics
+    """
+    season = int(season or DEFAULT_SEASON)
+
+    print(f"Creating Week {week} for season {season}...")
+    try:
+        games = fetch_week_schedule_from_espn(season, week)
+    except requests.HTTPError as e:
+        # Common: ESPN 404s if that week's schedule isn't published yet.
+        print(f"[error] ESPN HTTP {e.response.status_code} for week={week}, season={season}.")
+        print("        The API may not have published that week yet. Try again later.")
+        return None
+    except Exception as e:
+        print(f"[error] Failed to fetch ESPN data: {e}")
+        return None
+
+    if not games:
+        print("[warn] ESPN returned 0 games for that week. No DB writes performed.")
+        return None
+
+    try:
+        wk = upsert_week_and_games(season, week, games)
+    except Exception as e:
+        db.session.rollback()
+        print(f"[error] Database write failed: {e}")
+        return None
+
+    count = Game.query.filter_by(week_id=wk.id).count()
+    print(f"Successfully created Week {wk.week_number} with {count} games.")
+    return wk
+
+
+# ------------------------------- CLI ---------------------------------
+
+if __name__ == "__main__":
+    """
+    Usage:
+      python nfl_data.py <WEEK> [SEASON]
+    Examples:
+      python nfl_data.py 2          # uses DEFAULT_SEASON (2025)
+      python nfl_data.py 3 2025
+    """
+    if len(sys.argv) < 2:
+        print("Usage: python nfl_data.py <WEEK> [SEASON]")
+        sys.exit(1)
+
+    week_arg = int(sys.argv[1])
+    season_arg = int(sys.argv[2]) if len(sys.argv) >= 3 else DEFAULT_SEASON
+
+    app = create_app()
+    with app.app_context():
+        fetch_and_create_week(week_arg, season_arg)
 
