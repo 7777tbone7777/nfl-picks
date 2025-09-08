@@ -2,38 +2,37 @@
 {% block title %}Picks – Week {{ week.week_number }} {{ week.season_year }}{% endblock %}
 {% block content %}
   <h1>Picks for {{ name }}</h1>
-  <p>Week {{ week.week_number }}, {{ week.season_year }} — {{ games|length }} games</p>
-  <p><strong>Deadline (PT):</strong> {{ week.picks_deadline|to_pacific }}</p>
+  <p>Week {{ week.week_number }}, {{ week.season_year }} — {{ games_view|length }} games</p>
+
+  {% if deadline_local %}
+    <p><strong>Deadline ({{ tz_label }}):</strong> {{ deadline_local.strftime('%a %b %d %I:%M %p %Z') }}</p>
+  {% endif %}
 
   <form method="post">
     <table border="1" cellpadding="6" cellspacing="0">
       <thead>
         <tr>
           <th>#</th>
-          <th>Kickoff (PT)</th>
+          <th>Kickoff ({{ tz_label }})</th>
           <th>Matchup</th>
           <th>Your pick</th>
           <th>Status</th>
         </tr>
       </thead>
       <tbody>
-        {% for g in games %}
-          {% set existing = existing_picks.get(g.id) %}
+        {% for row in games_view %}
+          {% set g = row.g %}
           <tr>
             <td>{{ loop.index }}</td>
-            <td>{{ g.game_time|to_pacific }}</td>
+            <td>{{ row.local_time.strftime('%a %b %d %I:%M %p %Z') }}</td>
             <td>{{ g.away_team }} @ {{ g.home_team }}</td>
             <td>
               <label>
-                <input type="radio" name="pick_{{ g.id }}" value="away"
-                       {% if existing == g.away_team %}checked{% endif %}>
-                {{ g.away_team }}
+                <input type="radio" name="pick_{{ g.id }}" value="away"> {{ g.away_team }}
               </label>
               &nbsp;&nbsp;
               <label>
-                <input type="radio" name="pick_{{ g.id }}" value="home"
-                       {% if existing == g.home_team %}checked{% endif %}>
-                {{ g.home_team }}
+                <input type="radio" name="pick_{{ g.id }}" value="home"> {{ g.home_team }}
               </label>
             </td>
             <td>{{ g.status }}</td>
@@ -42,7 +41,9 @@
       </tbody>
     </table>
 
-    <p><button type="submit">Save Picks</button></p>
+    <p style="margin-top:12px;">
+      <button type="submit">Save Picks</button>
+    </p>
   </form>
 {% endblock %}
 
