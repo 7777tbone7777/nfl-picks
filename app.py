@@ -185,12 +185,31 @@ def create_app() -> Flask:
 
         # Fetch participant (create if not found, so links work even before pre-seeding)
         participant = Participant.query.filter_by(name=name).first()
+        
         if request.method == "GET":
+            # Build games_view with local time conversion for template
+            games_view = []
+            tz = ZoneInfo(DISPLAY_TZ)
+            for g in games:
+                local_time = _ensure_aware_utc(g.game_time).astimezone(tz)
+                games_view.append({
+                    'g': g,
+                    'local_time': local_time
+                })
+            
+            # Calculate deadline in local time
+            deadline_local = None
+            tz_label = tz.key.split('/')[-1]  # e.g., "Los_Angeles"
+            if w.picks_deadline:
+                deadline_local = _ensure_aware_utc(w.picks_deadline).astimezone(tz)
+            
             return render_template(
                 "picks_form.html",
                 name=name,
                 week=w,
-                games=games,
+                games_view=games_view,
+                deadline_local=deadline_local,
+                tz_label=tz_label,
                 participant=participant,
                 display_tz=DISPLAY_TZ,
             )
@@ -227,7 +246,7 @@ def create_app() -> Flask:
         # Simple inline confirmation keeps templates untouched
         html = """
         <h1>Picks saved</h1>
-        <p>{{saved}} of {{total}} selections saved for {{name}} — Week {{week}}, {{season}}.</p>
+        <p>{{saved}} of {{total}} selections saved for {{name}} â€" Week {{week}}, {{season}}.</p>
         <p><a href="{{back}}">Back to picks</a></p>
         """
         back_url = url_for("picks_form", week_num=week_num, name=name, season=season)
@@ -252,7 +271,7 @@ def create_app() -> Flask:
             path = url_for("picks_form", week_num=week_num, name=p.name, season=season)
             rows.append((p.name, f"{base}{path}"))
         html = """
-        <h1>Week {{week}} – {{season}} invite links</h1>
+        <h1>Week {{week}} â€" {{season}} invite links</h1>
         <table border="1" cellpadding="6">
           <tr><th>Name</th><th>URL</th></tr>
           {% for n,u in rows %}
@@ -318,8 +337,8 @@ def create_app() -> Flask:
         leaders = [pid_to_name[pid] for pid, sc in scores.items() if sc == max_score]
 
         html = """
-        <h1>Results — Week {{week}} ({{season}})</h1>
-        <p><b>Leaders:</b> {{ leaders|join(", ") }} — {{ max_score }} correct</p>
+        <h1>Results â€" Week {{week}} ({{season}})</h1>
+        <p><b>Leaders:</b> {{ leaders|join(", ") }} â€" {{ max_score }} correct</p>
 
         <table border="1" cellpadding="6" cellspacing="0">
           <thead>
@@ -342,7 +361,7 @@ def create_app() -> Flask:
                 <td>{{ r.winner }}</td>
                 {% for p in participants %}
                   {% set team = r.picks[p.id] %}
-                  <td>{% if team %}{{ team }}{% else %}<em>—</em>{% endif %}</td>
+                  <td>{% if team %}{{ team }}{% else %}<em>â€"</em>{% endif %}</td>
                 {% endfor %}
               </tr>
             {% endfor %}
@@ -375,4 +394,3 @@ def create_app() -> Flask:
 if __name__ == "__main__":
     app = create_app()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
-
