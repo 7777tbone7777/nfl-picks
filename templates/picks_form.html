@@ -1,10 +1,16 @@
 {% extends "base.html" %}
 {% block title %}Picks – Week {{ week.week_number }} {{ week.season_year }}{% endblock %}
+
 {% block content %}
-  <h1>Picks for {{ name }}</h1>
+  <h1>Picks for {{ participant.name if participant else 'Guest' }}</h1>
   <p>Week {{ week.week_number }}, {{ week.season_year }} — {{ games|length }} games</p>
-  {% if participant is none %}
-    <p><em>Note:</em> “{{ name }}” isn’t in the participants table yet. That’s fine for viewing.</p>
+
+  {% if not participant %}
+    <p><em>Note:</em> This name isn’t in the participants table yet. Page is read-only.</p>
+  {% endif %}
+
+  {% if week.picks_deadline %}
+    <p><strong>Deadline (UTC):</strong> {{ week.picks_deadline }}</p>
   {% endif %}
 
   <table border="1" cellpadding="6" cellspacing="0">
@@ -27,9 +33,5 @@
       {% endfor %}
     </tbody>
   </table>
-
-  <p style="margin-top:1rem">
-    (Read-only for now. When you’re ready to collect picks, we’ll wire a POST endpoint that saves to a `Pick` table.)
-  </p>
 {% endblock %}
 
