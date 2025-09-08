@@ -1,8 +1,11 @@
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 
+# Initialize the SQLAlchemy object.
+# The app itself will be connected to this object in app.py.
 db = SQLAlchemy()
 
+# Define all your database models here.
 class Participant(db.Model):
     __tablename__ = 'participants'
     id = db.Column(db.Integer, primary_key=True)

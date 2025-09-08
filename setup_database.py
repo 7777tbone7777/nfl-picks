@@ -4,6 +4,7 @@ from models import db, Participant
 def setup_initial_data():
     app = create_app()
     with app.app_context():
+        print("Creating database tables...")
         db.create_all()
         
         participants_to_add = [
@@ -13,8 +14,7 @@ def setup_initial_data():
         ]
         
         for p_data in participants_to_add:
-            existing = Participant.query.filter_by(name=p_data['name']).first()
-            if not existing:
+            if not Participant.query.filter_by(name=p_data['name']).first():
                 db.session.add(Participant(name=p_data['name'], phone=p_data['phone']))
                 print(f"Added participant: {p_data['name']}")
         
