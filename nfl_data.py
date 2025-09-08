@@ -1,12 +1,13 @@
 # nfl_data.py
-# Create a Week and its Games from ESPN's public NFL scoreboard.
-# - Defaults to season 2025
-# - Stores kickoff in Game.game_time (UTC, naive)
-# - Sets Week.picks_deadline (if column exists) to earliest kickoff
+# Minimal, surgical update:
+# - Default season=2025
+# - Compute picks_deadline from earliest kickoff BEFORE inserting week
+# - If week exists, update its deadline and replace games
+# - Uses Flask app-factory (create_app)
 
 import sys
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import requests
 
@@ -14,132 +15,180 @@ from app import create_app
 from models import db, Week, Game
 
 
-ESPN_SCOREBOARD = "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
+# --------------- Utilities ---------------
 
-
-def _to_utc_naive(iso: str) -> datetime:
+def _parse_espn_datetime(dt_str: Optional[str]) -> Optional[datetime]:
     """
-    Convert ESPN ISO date (usually with 'Z') to naive UTC datetime.
+    Parse ESPN ISO datetime strings to a naive UTC datetime (Postgres 'timestamp' compatible).
+    Examples ESPN emits: '2025-09-12T00:15Z' or with offset.
     """
-    # ESPN dates are like "2025-09-12T00:15:00Z"
-    if iso.endswith("Z"):
-        iso = iso.replace("Z", "+00:00")
-    dt = datetime.fromisoformat(iso)
-    if dt.tzinfo is None:
-        # Assume UTC if no tzinfo
+    if not dt_str:
+        return None
+    s = dt_str.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+        # Normalize to UTC & drop tzinfo (store as naive UTC)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
         return dt
-    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
 
 
-def fetch_espn_week(season_year: int, week_number: int) -> List[Dict]:
+def _compute_deadline_from_kickoffs(kickoffs: List[Optional[datetime]]) -> datetime:
     """
-    Pull a week's schedule from ESPN and return a list of dicts:
-      {home_team, away_team, kickoff (UTC naive), espn_game_id}
+    Returns the earliest valid kickoff. If none are valid, returns a conservative fallback:
+    now (UTC) + 24h, rounded to the next hour.
     """
-    params = {"week": week_number, "year": season_year, "seasontype": 2}
-    r = requests.get(ESPN_SCOREBOARD, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    valid = [k for k in kickoffs if isinstance(k, datetime)]
+    if valid:
+        return min(valid)
 
-    games: List[Dict] = []
-    for ev in data.get("events", []):
-        comps = ev.get("competitions", [])
+    # Fallback: 24h from now, on the hour
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    fallback = now_utc.replace(minute=0, second=0, microsecond=0)
+    return fallback
+
+
+# --------------- ESPN Fetch ---------------
+
+def fetch_week_schedule_from_espn(season: int, week: int) -> List[Dict]:
+    """
+    Fetch weekly schedule from ESPN's public scoreboard.
+    Returns list of dicts with: away, home, start (UTC naive datetime), espn_id, status
+    """
+    url = "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
+    params = {
+        "seasontype": 2,  # regular season
+        "week": week,
+        "year": season,
+    }
+    resp = requests.get(url, params=params, timeout=25)
+    resp.raise_for_status()
+    data = resp.json()
+
+    events = data.get("events", []) or []
+    out: List[Dict] = []
+    for ev in events:
+        comps = (ev.get("competitions") or [])
         if not comps:
             continue
         comp = comps[0]
 
-        # kickoff
-        date_iso = comp.get("date") or ev.get("date")
-        if not date_iso:
-            continue
-        kickoff = _to_utc_naive(date_iso)
-
-        # competitors
-        home_name = away_name = None
-        espn_game_id = ev.get("id")
-
+        # Teams
+        away_team = None
+        home_team = None
         for c in comp.get("competitors", []):
-            team_obj = c.get("team", {}) or {}
-            name = team_obj.get("displayName") or team_obj.get("name") or team_obj.get("shortDisplayName")
-            if not name:
-                continue
-            if c.get("homeAway") == "home":
-                home_name = name
-            elif c.get("homeAway") == "away":
-                away_name = name
+            side = (c.get("homeAway") or "").lower()
+            name = (c.get("team") or {}).get("displayName") or (c.get("team") or {}).get("shortDisplayName")
+            if side == "home":
+                home_team = name
+            elif side == "away":
+                away_team = name
 
-        if home_name and away_name:
-            games.append(
-                {
-                    "home_team": home_name,
-                    "away_team": away_name,
-                    "kickoff": kickoff,
-                    "espn_game_id": espn_game_id,
-                }
-            )
+        # Kickoff
+        start_raw = comp.get("date") or ev.get("date")
+        start_dt = _parse_espn_datetime(start_raw)
 
-    return games
+        # Status / ESPN id
+        status = ((comp.get("status") or {}).get("type") or {}).get("name") or "SCHEDULED"
+        espn_id = ev.get("id")
+
+        if home_team and away_team:
+            out.append({
+                "home": home_team,
+                "away": away_team,
+                "start": start_dt,
+                "espn_id": espn_id,
+                "status": status,
+            })
+
+    return out
 
 
-def fetch_and_create_week(week_number: int, season_year: int = 2025) -> None:
+# --------------- Upsert Week + Games ---------------
+
+def fetch_and_create_week(week: int, season: int = 2025) -> None:
     """
-    Create or replace the given week (season_year, week_number) and its games.
-    - If the Week exists, its Games are deleted and re-inserted.
-    - Week.picks_deadline (if present) is set to the earliest kickoff.
+    Create/replace a week's games and ensure weeks.picks_deadline is set.
+    Deadline = earliest kickoff of that week (UTC). Safe fallback if none parsed.
     """
-    print(f"Creating Week {week_number} for season {season_year}...")
-
     app = create_app()
     with app.app_context():
-        # Get or create the Week row
-        week = (
-            Week.query.filter_by(season_year=season_year, week_number=week_number)
-            .first()
-        )
-        if not week:
-            week = Week(season_year=season_year, week_number=week_number)
-            db.session.add(week)
-            db.session.flush()  # ensure week.id is available
+        print(f"Creating Week {week} for season {season}...")
 
-        # Fetch schedule
-        games = fetch_espn_week(season_year, week_number)
+        schedule = fetch_week_schedule_from_espn(season, week)
+        kickoffs = [g["start"] for g in schedule]
+        deadline = _compute_deadline_from_kickoffs(kickoffs)
 
-        # Set picks_deadline to earliest kickoff if the column exists
-        if games:
-            earliest = min(g["kickoff"] for g in games)
-            if hasattr(week, "picks_deadline"):
-                week.picks_deadline = earliest
-
-        # Replace games
-        Game.query.filter_by(week_id=week.id).delete(synchronize_session=False)
-        for g in games:
-            db.session.add(
-                Game(
-                    week_id=week.id,
-                    home_team=g["home_team"],
-                    away_team=g["away_team"],
-                    game_time=g["kickoff"],  # UTC naive
-                    status="scheduled",
-                    espn_game_id=g["espn_game_id"],
-                )
+        # Find or create week
+        wk = Week.query.filter_by(season_year=season, week_number=week).first()
+        if wk is None:
+            wk = Week(
+                week_number=week,
+                season_year=season,
+                picks_deadline=deadline,   # ensure NOT NULL
+                reminder_sent=False,
             )
+            db.session.add(wk)
+            db.session.commit()
+        else:
+            # Update deadline (if changed) and replace games
+            wk.picks_deadline = deadline
+            db.session.commit()
+            Game.query.filter_by(week_id=wk.id).delete(synchronize_session=False)
+            db.session.commit()
 
+        # Insert games
+        to_add = []
+        for g in schedule:
+            to_add.append(Game(
+                week_id=wk.id,
+                home_team=g["home"],
+                away_team=g["away"],
+                game_time=g["start"],      # stored as naive UTC timestamp
+                home_score=None,
+                away_score=None,
+                status=g["status"],
+                espn_game_id=g["espn_id"],
+            ))
+        if to_add:
+            db.session.bulk_save_objects(to_add)
         db.session.commit()
-        print(f"Successfully created Week {week_number} with {len(games)} games.")
+
+        print(f"Successfully created Week {week} with {len(schedule)} games.")
+        print(f"picks_deadline (UTC): {wk.picks_deadline}")
+
+
+# --------------- CLI ---------------
+
+def _usage() -> None:
+    print("Usage:")
+    print("  python nfl_data.py <week> [season]")
+    print("Examples:")
+    print("  python nfl_data.py 3           # week 3, default season 2025")
+    print("  python nfl_data.py 10 2025     # week 10, season 2025")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python nfl_data.py <week_number> [season_year]")
+        _usage()
         sys.exit(1)
 
-    week = int(sys.argv[1])
+    try:
+        week_arg = int(sys.argv[1])
+    except ValueError:
+        _usage()
+        sys.exit(1)
 
-    # Default season is 2025 unless explicitly provided
     if len(sys.argv) >= 3:
-        season = int(sys.argv[2])
+        try:
+            season_arg = int(sys.argv[2])
+        except ValueError:
+            _usage()
+            sys.exit(1)
     else:
-        season = 2025
+        season_arg = 2025  # default
 
-    fetch_and_create_week(week, season)
+    fetch_and_create_week(week_arg, season_arg)
 
