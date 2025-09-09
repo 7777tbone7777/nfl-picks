@@ -8,9 +8,9 @@ def setup_initial_data():
         db.create_all()
         
         participants_to_add = [
-            {'name': 'Will', 'phone': '+15555555551'},
-            {'name': 'Kevin', 'phone': '+15555555552'}, 
-            {'name': 'Tony', 'phone': '+15555555553'}
+            {'name': 'Will', 'phone': '+18185316200'},
+            {'name': 'Kevin', 'phone': '+18185316200'}, 
+            {'name': 'Tony', 'phone': '+18185316200'}
         ]
         
         for p_data in participants_to_add:
