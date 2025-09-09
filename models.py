@@ -10,7 +10,7 @@ class Participant(db.Model):
     __tablename__ = 'participants'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(50), nullable=False, unique=True)
-    phone = db.Column(db.String(15), nullable=False, unique=True)
+    phone = db.Column(db.String(15), nullable=False, unique=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Week(db.Model):
