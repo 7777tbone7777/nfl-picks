@@ -7,22 +7,30 @@ from models import db, Participant, Week, Game, Pick, Reminder
 from sqlalchemy import and_
 
 def send_sms(to_phone, message):
-    # --- THIS CODE WAS MISSING ---
     TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
     TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
     TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
         print(f"Twilio not configured. Would send to {to_phone}: {message}")
         return True
+    
+    # --- THIS IS THE FINAL FIX ---
+    # Ensure the phone number is in E.164 format with no spaces
+    formatted_to_phone = to_phone.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        client.messages.create(body=message, from_=TWILIO_PHONE_NUMBER, to=to_phone)
+        client.messages.create(
+            body=message,
+            from_=TWILIO_PHONE_NUMBER,
+            to=formatted_to_phone # Use the cleaned-up number
+        )
         return True
     except Exception as e:
         print(f"SMS Error: {e}")
         return False
-    # --- END MISSING CODE ---
 
+# (The rest of the file remains exactly the same)
 def send_week_launch_sms(week_number, app):
     with app.app_context():
         participants = Participant.query.all()
@@ -73,13 +81,11 @@ def calculate_and_send_results(app):
         week_to_score = latest_week.week_number
         season_to_score = latest_week.season_year
         
-        # update_scores_for_week is not defined in this file, so we call it carefully
         try:
             from nfl_data import update_scores_for_week
             update_scores_for_week(week_to_score, season_to_score)
         except ImportError:
             print("Warning: update_scores_for_week function not found. Skipping score updates.")
-
 
         games = Game.query.filter_by(week_id=latest_week.id, status='final').all()
         for game in games:
