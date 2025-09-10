@@ -1,181 +1,251 @@
-from flask import Flask, render_template, request, jsonify, url_for
-from datetime import datetime
 import os
-from models import db, Participant, Week, Game, Pick
-from jobs import send_week_launch_sms, check_and_send_reminders
-import os, requests
-from flask import request, abort
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-def register_telegram_routes(app):
-    TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+import requests
+from flask import Flask, render_template, request, redirect, url_for, abort, jsonify
+
+from models import db, Participant, Week, Game, Pick  # Reminder model optional; not required here
+
+
+# ---------------------------
+# Helpers / Jinja filters
+# ---------------------------
+
+def _tz_pst(dt: datetime) -> datetime:
+    """Convert aware/naive UTC datetime to America/Los_Angeles for display."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo("America/Los_Angeles"))
+
+def jinja_fmt_pst(dt: datetime, fmt: str = "%a %b %d, %I:%M %p %Z") -> str:
+    d = _tz_pst(dt)
+    return d.strftime(fmt) if d else ""
+
+
+# ---------------------------
+# Telegram routes
+# ---------------------------
+
+def register_telegram_routes(app: Flask) -> None:
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "devsecret")
-    BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "")
+
+    def tg_send(chat_id: str | int, text: str) -> None:
+        if not TOKEN:
+            app.logger.warning("TELEGRAM_BOT_TOKEN missing; cannot send message")
+            return
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": text},
+                timeout=10,
+            )
+        except Exception as e:
+            app.logger.exception("Telegram send failed: %s", e)
 
     @app.post(f"/telegram/webhook/{SECRET}")
     def telegram_webhook():
         data = request.get_json(silent=True) or {}
-        msg = data.get("message") or data.get("edited_message")
-        if not msg:
-            return {"ok": True}
-
-        chat = msg.get("chat") or {}
-        chat_id = chat.get("id")
+        msg = (data.get("message") or {})  # standard message update
         text = (msg.get("text") or "").strip()
+        chat = (msg.get("chat") or {})
+        chat_id = chat.get("id")
+        first_name = chat.get("first_name", "")
 
-        # Handle /start payload (deep link like t.me/<bot>?start=Tony+Ryan)
-        payload = None
+        if not chat_id:
+            return jsonify({"ok": True, "ignored": "no chat id"}), 200
+
+        # Handle /start <Name>
         if text.startswith("/start"):
-            parts = text.split(" ", 1)
-            payload = parts[1].strip() if len(parts) == 2 else None
+            args = text.split(maxsplit=1)
+            who = args[1].strip() if len(args) > 1 else first_name or ""
+            if not who:
+                tg_send(chat_id, "Please resend as: /start YourName")
+                return jsonify({"ok": True}), 200
 
-        if payload:
-            # Map payload to Participant by name (case-insensitive)
-            from models import db, Participant
-            name = payload.replace("+", " ").strip()
-            p = Participant.query.filter(Participant.name.ilike(name)).first()
-            if p:
+            with app.app_context():
+                # case-insensitive lookup by name
+                p = Participant.query.filter(Participant.name.ilike(who)).first()
+                if not p:
+                    # auto-create participant if not found (optional — keeps flow smooth)
+                    p = Participant(name=who)
+                    db.session.add(p)
+
                 p.telegram_chat_id = str(chat_id)
                 db.session.commit()
-                reply = f"✅ Linked to participant '{p.name}'. You'll get NFL pick reminders here."
-            else:
-                reply = (
-                    "I couldn't find your name in the participants list.\n"
-                    "Ask the admin to add you exactly as it appears, then tap the link again."
-                )
-        else:
-            reply = "Hi! You’re connected. I’ll send your NFL pick reminders here."
 
-        if TELEGRAM_TOKEN and chat_id:
-            try:
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    json={"chat_id": chat_id, "text": reply},
-                    timeout=10,
-                )
-            except Exception:
-                pass
+            tg_send(chat_id, f"Hi {who}! You’re linked. I’ll DM you when picks are open.")
+            return jsonify({"ok": True}), 200
 
-        return {"ok": True}
+        # Basic help
+        if text.lower() in ("/help", "help"):
+            tg_send(chat_id, "Use /start YourName to link your Telegram to your picks profile.")
+            return jsonify({"ok": True}), 200
 
-    # Simple invite list (no template needed)
+        # Ignore other noise
+        return jsonify({"ok": True}), 200
+
     @app.get("/admin/invites")
     def admin_invites():
-        from models import Participant
-        names = [p.name for p in Participant.query.order_by(Participant.name).all()]
-        if not BOT_USERNAME:
-            return "Set TELEGRAM_BOT_USERNAME config var first.", 500
-        rows = []
-        for n in names:
-            payload = n.replace(" ", "+")
-            link = f"https://t.me/{BOT_USERNAME}?start={payload}"
-            rows.append(f"<li>{n}: <a href='{link}' target='_blank'>{link}</a></li>")
-        html = "<h1>Telegram Invite Links</h1><ul>" + "\n".join(rows) + "</ul>"
-        return html
+        bot_username = os.getenv("TELEGRAM_BOT_USERNAME")  # e.g., MyBotName (no @)
+        secret_hint = os.getenv("TELEGRAM_WEBHOOK_SECRET", "devsecret")
+        if not bot_username:
+            return (
+                "<h1>Telegram Invite Links</h1>"
+                "<p><b>TELEGRAM_BOT_USERNAME</b> is not set in Config Vars.</p>",
+                200,
+            )
+        with app.app_context():
+            people = Participant.query.order_by(Participant.name.asc()).all()
+        links = [
+            f"https://t.me/{bot_username}?start={p.name.replace(' ', '%20')}"
+            for p in people
+        ]
+        html = [
+            "<h1>Telegram Invite Links</h1>",
+            f"<p>Webhook path secret: <code>{secret_hint}</code></p>",
+            "<ul>",
+        ]
+        for p, link in zip(people, links):
+            html.append(f"<li>{p.name}: <a href='{link}' target='_blank'>{link}</a></li>")
+        html.append("</ul>")
+        return "\n".join(html), 200
 
-    return app
-And call it inside your create_app():
 
-python
-Copy code
-def create_app():
+# ---------------------------
+# Core routes
+# ---------------------------
+
+def register_core_routes(app: Flask) -> None:
+    @app.get("/")
+    def index():
+        # Show latest season/week we have, and quick links to participants
+        latest = (
+            db.session.query(Week)
+            .order_by(Week.season_year.desc(), Week.week_number.desc())
+            .first()
+        )
+        participants = Participant.query.order_by(Participant.name.asc()).all()
+        return render_template("index.html", latest=latest, participants=participants)
+
+    @app.get("/picks/<int:week>/<name>")
+    def picks_form(week: int, name: str):
+        # Use most recent season for that week
+        w = (
+            Week.query.filter_by(week_number=week)
+            .order_by(Week.season_year.desc())
+            .first()
+        )
+        if not w:
+            abort(404, f"Week {week} not found.")
+
+        games = Game.query.filter_by(week_id=w.id).order_by(Game.game_time.asc()).all()
+        participant = Participant.query.filter(Participant.name.ilike(name)).first()
+        # current picks map
+        picks_map = {}
+        if participant:
+            existing = Pick.query.filter_by(participant_id=participant.id).all()
+            for p in existing:
+                picks_map[p.game_id] = p.pick  # "home" / "away"
+
+        return render_template(
+            "picks_form.html",
+            week=w,
+            games=games,
+            name=name,
+            participant=participant,
+            picks_map=picks_map,
+        )
+
+    @app.post("/picks/<int:week>/<name>")
+    def save_picks(week: int, name: str):
+        w = (
+            Week.query.filter_by(week_number=week)
+            .order_by(Week.season_year.desc())
+            .first()
+        )
+        if not w:
+            abort(404, f"Week {week} not found.")
+
+        participant = Participant.query.filter(Participant.name.ilike(name)).first()
+        if not participant:
+            # create on the fly to keep flow easy
+            participant = Participant(name=name)
+            db.session.add(participant)
+            db.session.commit()
+
+        games = Game.query.filter_by(week_id=w.id).all()
+        for g in games:
+            choice = request.form.get(f"pick_{g.id}")  # "home", "away" or None
+            if choice not in ("home", "away"):
+                # skip if no selection
+                continue
+            # upsert Pick
+            pk = Pick.query.filter_by(participant_id=participant.id, game_id=g.id).first()
+            if not pk:
+                pk = Pick(participant_id=participant.id, game_id=g.id, pick=choice)
+                db.session.add(pk)
+            else:
+                pk.pick = choice
+        db.session.commit()
+        return redirect(url_for("picks_form", week=week, name=name))
+
+    @app.get("/results/<int:week>")
+    def results(week: int):
+        w = (
+            Week.query.filter_by(week_number=week)
+            .order_by(Week.season_year.desc())
+            .first()
+        )
+        if not w:
+            abort(404, f"Week {week} not found.")
+
+        games = Game.query.filter_by(week_id=w.id).order_by(Game.game_time.asc()).all()
+        # very simple results view; template can iterate and compute scoring client-side or
+        # you can add server-side scoring later.
+        return render_template("results.html", week=w, games=games)
+
+    @app.get("/healthz")
+    def healthz():
+        return jsonify(ok=True, time=datetime.now(timezone.utc).isoformat())
+
+
+# ---------------------------
+# App factory
+# ---------------------------
+
+def create_app() -> Flask:
     app = Flask(__name__)
-    # ... your existing config & init code ...
-    from models import db
+
+    # Database config (Heroku sets DATABASE_URL)
+    db_url = os.getenv("DATABASE_URL", "")
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+
+    app.config.update(
+        SQLALCHEMY_DATABASE_URI=db_url,
+        SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        SECRET_KEY=os.getenv("SECRET_KEY", "dev"),
+    )
+
+    # Init DB
     db.init_app(app)
+    with app.app_context():
+        db.create_all()
 
-    # keep all your existing routes here
+    # Jinja filter for PST display
+    app.add_template_filter(jinja_fmt_pst, name="fmt_pst")
 
-    # add this line at the end before returning app:
+    # Register routes
+    register_core_routes(app)
     register_telegram_routes(app)
 
     return app
-def create_app():
-    app = Flask(__name__, template_folder="templates")
-    
-    database_url = os.environ.get('DATABASE_URL', 'postgresql://username:password@localhost/nfl_picks')
-    if database_url.startswith("postgres://"):
-        database_url = database_url.replace("postgres://", "postgresql://", 1)
-    app.config['SQLALCHEMY_DATABASE_URI'] = database_url
-    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-    app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret')
-    
-    db.init_app(app)
 
-    # --- Routes ---
-    @app.route('/')
-    def index():
-        return render_template('index.html')
 
-    @app.route('/picks/week<int:week_number>/<participant_name>')
-    def picks_form(week_number, participant_name):
-        current_year = datetime.now().year
-        participant = Participant.query.filter_by(name=participant_name.title()).first()
-        if not participant: return f"Participant {participant_name} not found", 404
-        week = Week.query.filter_by(week_number=week_number, season_year=current_year).first()
-        if not week: return f"Week {week_number} not found", 404
-        if datetime.utcnow() > week.picks_deadline: return render_template('deadline_passed.html', week=week)
-        games = Game.query.filter_by(week_id=week.id).order_by(Game.game_time).all()
-        existing_picks = {p.game_id: p.picked_team for p in Pick.query.filter_by(participant_id=participant.id).join(Game).filter(Game.week_id==week.id).all()}
-        return render_template('picks_form.html', participant=participant, week=week, games=games, existing_picks=existing_picks)
-
-    @app.route('/picks/week<int:week_number>/<participant_name>/urgent')
-    def urgent_picks(week_number, participant_name):
-        current_year = datetime.now().year
-        participant = Participant.query.filter_by(name=participant_name.title()).first()
-        if not participant: return f"Participant {participant_name} not found", 404
-        week = Week.query.filter_by(week_number=week_number, season_year=current_year).first()
-        if not week: return f"Week {week_number} not found", 404
-        all_games = Game.query.filter_by(week_id=week.id).all()
-        picked_game_ids = {p.game_id for p in Pick.query.filter_by(participant_id=participant.id).join(Game).filter(Game.week_id==week.id).all()}
-        unpicked_games = [g for g in all_games if g.id not in picked_game_ids]
-        return render_template('urgent_picks.html', participant=participant, week=week, games=unpicked_games)
-
-    @app.route('/submit_picks', methods=['POST'])
-    def submit_picks():
-        data = request.json
-        participant_id = data['participant_id']
-        picks = data.get('picks', {})
-        for game_id, picked_team in picks.items():
-            existing_pick = Pick.query.filter_by(participant_id=participant_id, game_id=game_id).first()
-            if existing_pick:
-                existing_pick.picked_team = picked_team
-            else:
-                db.session.add(Pick(participant_id=participant_id, game_id=game_id, picked_team=picked_team))
-        db.session.commit()
-        return jsonify({'status': 'success'})
-
-    @app.route('/admin')
-    def admin():
-        current_year = datetime.now().year
-        weeks = Week.query.filter_by(season_year=current_year).order_by(Week.week_number).all()
-        participants = Participant.query.all()
-        return render_template('admin.html', weeks=weeks, participants=participants)
-
-    @app.route('/admin/send_launch_sms', methods=['POST'])
-    def send_launch_sms_route():
-        data = request.json
-        week_number = data['week_number']
-        send_week_launch_sms(week_number, app)
-        return jsonify({'status': 'success'})
-
-    @app.route('/admin/status/<int:week_number>')
-    def week_status(week_number):
-        current_year = datetime.now().year
-        week = Week.query.filter_by(week_number=week_number, season_year=current_year).first()
-        if not week: return jsonify({'error': 'Week not found'}), 404
-        participants = Participant.query.all()
-        games_count = Game.query.filter_by(week_id=week.id).count()
-        status_data = [{'name': p.name, 'picks_made': Pick.query.filter_by(participant_id=p.id).join(Game).filter(Game.week_id==week.id).count(), 'total_games': games_count, 'complete': Pick.query.filter_by(participant_id=p.id).join(Game).filter(Game.week_id==week.id).count() == games_count} for p in participants]
-        return jsonify({'week_number': week_number, 'participants': status_data})
-
-    return app
-
+# For gunicorn: `web: gunicorn 'app:create_app()'`
 app = create_app()
 
-if __name__ == '__main__':
-    from apscheduler.schedulers.background import BackgroundScheduler
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(func=lambda: check_and_send_reminders(app), trigger="cron", day_of_week="tue", hour=20)
-    scheduler.add_job(func=lambda: check_and_send_reminders(app), trigger="cron", day_of_week="thu", hour=18)
-    scheduler.start()
-    app.run(debug=True)
