@@ -1,6 +1,8 @@
 import os
+import sys
 import logging
 import httpx
+import argparse
 from flask_app import create_app
 from models import db, Participant, Week, Game
 
@@ -48,14 +50,18 @@ def send_week_games(week_number: int, season_year: int = 2025):
             logger.error(f"❌ No week found for {season_year} W{week_number}")
             return
 
-        games = Game.query.filter_by(week_id=week.id).order_by(Game.start_time).all()
+        games = Game.query.filter_by(week_id=week.id).all()
         if not games:
             logger.error(f"❌ No games found for {season_year} W{week_number}")
             return
 
         text = f"📅 NFL Picks – Week {week_number}, {season_year}\n\n"
         for idx, g in enumerate(games, start=1):
-            text += f"{idx}. {g.away_team} @ {g.home_team} – {g.start_time.strftime('%a %b %d %I:%M %p')}\n"
+            if hasattr(g, "game_time") and g.game_time:
+                kickoff = g.game_time.strftime("%a %b %d %I:%M %p")
+                text += f"{idx}. {g.away_team} @ {g.home_team} – {kickoff}\n"
+            else:
+                text += f"{idx}. {g.away_team} @ {g.home_team}\n"
 
         participants = Participant.query.all()
         for p in participants:
@@ -72,4 +78,25 @@ def send_week_launch_sms(week: Week):
 def calculate_and_send_results():
     """Stub for weekly results calculation."""
     logger.info("📊 Would calculate and send results here.")
+
+
+# --- CLI entrypoint ---
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run jobs for NFL Picks app")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Send weekly games
+    send_games_parser = subparsers.add_parser("send_week_games", help="Send out weekly games")
+    send_games_parser.add_argument("week_number", type=int, help="Week number")
+    send_games_parser.add_argument(
+        "--season_year", type=int, default=2025, help="Season year (default: 2025)"
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "send_week_games":
+        send_week_games(args.week_number, args.season_year)
+    else:
+        parser.print_help()
+        sys.exit(1)
 
