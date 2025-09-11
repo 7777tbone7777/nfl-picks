@@ -87,6 +87,20 @@ def send_week_games(week_number: int, season_year: int = 2025):
                 except Exception as e:
                     logger.exception(f"💥 Error sending game to {p.name}: {e}")
 
+def run_telegram_listener():
+    from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Register command handlers
+    application.add_handler(CommandHandler("sendweek", handle_send_week))
+    application.add_handler(CommandHandler("mypicks", handle_my_picks))
+
+    # Register callback for button clicks
+    application.add_handler(CallbackQueryHandler(handle_pick))
+
+    print("🤖 Telegram bot listener started...")
+    application.run_polling()
 
 # --- Reset picks for a participant ---
 def reset_picks_for_participant(name: str):
