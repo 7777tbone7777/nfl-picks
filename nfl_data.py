@@ -1,94 +1,154 @@
 # nfl_data.py
 import requests
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from flask_app import create_app
 from models import db, Week, Game
+import sys
 
-ESPN_API = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+# ------------------------
+# Helpers
+# ------------------------
 
-def _parse_kickoff(date_str):
-    """Return kickoff as aware UTC datetime."""
-    return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+def current_season_year():
+    """
+    NFL seasons start in September and run through the Super Bowl in February.
+    - If today is Jan–Aug, the season year is the *previous* year.
+    - If today is Sep–Dec, the season year is the current year.
+    """
+    now = datetime.utcnow()
+    if now.month < 9:  # Jan–Aug → previous season
+        return now.year - 1
+    return now.year
 
-def fetch_and_create_week(week_number: int, season_year: int):
+
+def _parse_kickoff(date_str: str) -> datetime:
+    # ESPN provides ISO8601 with timezone offsets
+    dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    return dt.replace(tzinfo=None)  # store naive UTC
+
+
+# ------------------------
+# Main functions
+# ------------------------
+
+def fetch_and_create_week(week_number: int, season_year: int = None):
+    """Fetch schedule for a given week/year from ESPN and insert into DB."""
+    if season_year is None:
+        season_year = current_season_year()
+
+    url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week={week_number}&year={season_year}"
+    resp = requests.get(url)
+    resp.raise_for_status()
+    data = resp.json()
+
     app = create_app()
     with app.app_context():
-        url = f"{ESPN_API}?week={week_number}&year={season_year}"
-        resp = requests.get(url).json()
-
-        thursday_kick_et = None
-        week_obj = Week.query.filter_by(week_number=week_number, season_year=season_year).first()
-        if not week_obj:
-            # Find Thursday game kickoff
-            for event in resp.get("events", []):
-                comp = event.get("competitions", [])[0]
-                start = _parse_kickoff(event.get("date"))
-                if start.astimezone(ZoneInfo("America/New_York")).weekday() == 3:  # Thursday
-                    thursday_kick_et = start
-                    break
-
-            if not thursday_kick_et and resp.get("events"):
-                thursday_kick_et = _parse_kickoff(resp["events"][0]["date"])
-
-            deadline_utc = thursday_kick_et.astimezone(ZoneInfo("UTC"))
-            deadline_naive = deadline_utc.replace(tzinfo=None)
-
-            week_obj = Week(
-                week_number=week_number,
-                season_year=season_year,
-                picks_deadline=deadline_naive,
-            )
-            db.session.add(week_obj)
+        # Create or get week
+        week = Week.query.filter_by(week_number=week_number, season_year=season_year).first()
+        if not week:
+            # Picks deadline = earliest kickoff, usually Thursday night
+            first_event = min(data["events"], key=lambda e: e["date"])
+            deadline = _parse_kickoff(first_event["date"])
+            week = Week(week_number=week_number, season_year=season_year, picks_deadline=deadline)
+            db.session.add(week)
             db.session.commit()
+            print(f"Created Week {week_number}, {season_year}")
 
-        for event in resp.get("events", []):
-            comp = event.get("competitions", [])[0]
-            start = _parse_kickoff(event.get("date"))
-            game_time_naive = start.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        # Insert games
+        for event in data.get("events", []):
+            game_id = event["id"]
+            comp = event["competitions"][0]
+            home_team = comp["competitors"][0]["team"]["displayName"]
+            away_team = comp["competitors"][1]["team"]["displayName"]
+            kickoff = _parse_kickoff(event["date"])
 
-            home = comp["competitors"][0]
-            away = comp["competitors"][1]
-
-            g = Game.query.filter_by(espn_game_id=comp["id"]).first()
-            if not g:
-                g = Game(
-                    week_id=week_obj.id,
-                    espn_game_id=comp["id"],
-                    home_team=home["team"]["displayName"],
-                    away_team=away["team"]["displayName"],
-                    game_time=game_time_naive,
+            game = Game.query.filter_by(espn_game_id=game_id).first()
+            if not game:
+                game = Game(
+                    week_id=week.id,
+                    espn_game_id=game_id,
+                    home_team=home_team,
+                    away_team=away_team,
+                    game_time=kickoff,
                     status="scheduled",
                 )
-                db.session.add(g)
+                db.session.add(game)
 
         db.session.commit()
-        print(f"✅ Week {week_number} created/updated")
+        print(f"Inserted/updated games for Week {week_number}, {season_year}")
 
 
-def update_scores_for_week(week_number: int, season_year: int):
+def update_scores_for_week(week_number: int, season_year: int = None):
+    """Update final scores and winners for a given week/year."""
+    if season_year is None:
+        season_year = current_season_year()
+
+    url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week={week_number}&year={season_year}"
+    resp = requests.get(url)
+    resp.raise_for_status()
+    data = resp.json()
+
     app = create_app()
     with app.app_context():
-        url = f"{ESPN_API}?week={week_number}&year={season_year}"
-        resp = requests.get(url).json()
+        week = Week.query.filter_by(week_number=week_number, season_year=season_year).first()
+        if not week:
+            print(f"No week {week_number}, {season_year} found in DB")
+            return
 
-        for event in resp.get("events", []):
-            comp = event.get("competitions", [])[0]
-            g = Game.query.filter_by(espn_game_id=comp["id"]).first()
-            if not g:
+        for event in data.get("events", []):
+            game_id = event["id"]
+            comp = event["competitions"][0]
+            competitors = comp["competitors"]
+
+            home = [c for c in competitors if c["homeAway"] == "home"][0]
+            away = [c for c in competitors if c["homeAway"] == "away"][0]
+
+            home_team = home["team"]["displayName"]
+            away_team = away["team"]["displayName"]
+            home_score = int(home.get("score", 0))
+            away_score = int(away.get("score", 0))
+            status = comp["status"]["type"]["name"].lower()
+
+            game = Game.query.filter_by(espn_game_id=game_id).first()
+            if not game:
                 continue
 
-            if comp.get("status", {}).get("type", {}).get("completed"):
-                g.status = "final"
-                g.home_score = int(comp["competitors"][0]["score"])
-                g.away_score = int(comp["competitors"][1]["score"])
+            game.home_score = home_score
+            game.away_score = away_score
+            game.status = status
 
-                # set winner
-                if g.home_score > g.away_score:
-                    g.winner = g.home_team
-                elif g.away_score > g.home_score:
-                    g.winner = g.away_team
+            if status == "status_final":
+                if home_score > away_score:
+                    game.winner = home_team
+                elif away_score > home_score:
+                    game.winner = away_team
+                else:
+                    game.winner = None  # tie
 
         db.session.commit()
-        print(f"✅ Week {week_number} scores updated")
+        print(f"Updated scores for Week {week_number}, {season_year}")
+
+
+# ------------------------
+# CLI entrypoint
+# ------------------------
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python nfl_data.py fetch_and_create_week <week_number> [season_year]")
+        print("  python nfl_data.py update_scores_for_week <week_number> [season_year]")
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    if command == "fetch_and_create_week":
+        week = int(sys.argv[2])
+        season = int(sys.argv[3]) if len(sys.argv) > 3 else current_season_year()
+        fetch_and_create_week(week, season)
+
+    elif command == "update_scores_for_week":
+        week = int(sys.argv[2])
+        season = int(sys.argv[3]) if len(sys.argv) > 3 else current_season_year()
+        update_scores_for_week(week, season)
 
