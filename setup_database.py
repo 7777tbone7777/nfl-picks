@@ -1,30 +1,21 @@
 # setup_database.py
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from models import Base, Participant
-import os
+from app import create_app
+from models import db, Participant
 
-# Get DB URL from environment (Heroku sets DATABASE_URL)
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///nfl_picks.db")
+# Create the Flask app using your factory
+app = create_app()
 
-# Create engine
-engine = create_engine(DATABASE_URL)
+with app.app_context():
+    # Create all tables
+    db.create_all()
 
-# Create all tables
-Base.metadata.create_all(engine)
-
-# Optional: seed participants (Kevin, Will, Tony) if not already present
-SessionLocal = sessionmaker(bind=engine)
-session = SessionLocal()
-
-participants = ["Kevin", "Will", "Tony"]
-for name in participants:
-    exists = session.query(Participant).filter_by(name=name).first()
-    if not exists:
-        session.add(Participant(name=name))
-
-session.commit()
-session.close()
+    # Seed participants if they don’t exist
+    for name in ["Kevin", "Will", "Tony"]:
+        exists = Participant.query.filter_by(name=name).first()
+        if not exists:
+            db.session.add(Participant(name=name))
+    
+    db.session.commit()
 
 print("✅ Database setup complete. Participants seeded.")
 
