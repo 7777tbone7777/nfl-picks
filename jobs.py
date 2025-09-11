@@ -173,7 +173,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.command == "send_week_games":
-        sendweek(args.week_number, args.season_year)
+        # Run inside app context
+        app = create_app()
+        with app.app_context():
+            games = Game.query.filter_by(week_id=args.week_number).order_by(Game.game_time).all()
+            for g in games:
+                print(f"{g.away_team} @ {g.home_team} – {g.game_time}")
     else:
         parser.print_help()
         sys.exit(1)
