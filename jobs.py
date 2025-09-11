@@ -4,14 +4,7 @@ import logging
 import httpx
 import argparse
 from flask_app import create_app
-from models import db, Participant, Week, Game, Pick
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+from models import db, Participant, Week, Game
 
 # --- Logging setup ---
 logging.basicConfig(level=logging.INFO)
@@ -47,7 +40,7 @@ def send_telegram_message(participant: Participant, text: str) -> bool:
         return False
 
 
-# --- Send weekly games list with inline buttons ---
+# --- Send weekly games list ---
 def send_week_games(week_number: int, season_year: int = 2025):
     """Send out the list of games for a given week to all participants."""
     app = create_app()
@@ -73,12 +66,16 @@ def send_week_games(week_number: int, season_year: int = 2025):
                 ).astimezone(__import__("zoneinfo").ZoneInfo("America/Los_Angeles"))
 
                 text = f"{g.away_team} @ {g.home_team}\n{local_time.strftime('%a %b %d %I:%M %p PT')}"
-                keyboard = [
-                    [
-                        InlineKeyboardButton(g.home_team, callback_data=f"{p.id}:{g.id}:{g.home_team}"),
-                        InlineKeyboardButton(g.away_team, callback_data=f"{p.id}:{g.id}:{g.away_team}"),
+
+                # ✅ FIX: use raw JSON for inline keyboard
+                reply_markup = {
+                    "inline_keyboard": [
+                        [
+                            {"text": g.away_team, "callback_data": f"pick:{g.id}:{g.away_team}"},
+                            {"text": g.home_team, "callback_data": f"pick:{g.id}:{g.home_team}"}
+                        ]
                     ]
-                ]
+                }
 
                 try:
                     resp = httpx.post(
@@ -86,7 +83,8 @@ def send_week_games(week_number: int, season_year: int = 2025):
                         json={
                             "chat_id": p.telegram_chat_id,
                             "text": text,
-                            "reply_markup": {"inline_keyboard": keyboard},
+                            "reply_markup": reply_markup,
+                            "parse_mode": "HTML",
                         },
                         timeout=10,
                     )
@@ -98,52 +96,46 @@ def send_week_games(week_number: int, season_year: int = 2025):
                     logger.exception(f"💥 Error sending game to {p.name}: {e}")
 
 
-# --- Handle button presses ---
-async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button presses and save pick to DB."""
-    query = update.callback_query
-    await query.answer()
-
-    try:
-        participant_id, game_id, team = query.data.split(":")
-        participant_id, game_id = int(participant_id), int(game_id)
-
-        app = create_app()
-        with app.app_context():
-            existing_pick = Pick.query.filter_by(
-                participant_id=participant_id, game_id=game_id
-            ).first()
-
-            if existing_pick:
-                existing_pick.selected_team = team
-            else:
-                new_pick = Pick(
-                    participant_id=participant_id, game_id=game_id, selected_team=team
-                )
-                db.session.add(new_pick)
-
-            db.session.commit()
-
-        await query.edit_message_text(f"✅ Pick saved: {team}")
-        logger.info(f"✅ Pick saved for participant {participant_id}, game {game_id}: {team}")
-
-    except Exception as e:
-        logger.exception(f"💥 Error handling pick: {e}")
-        await query.edit_message_text("❌ Error saving your pick. Please try again.")
+# --- Placeholder: Future functions ---
+def send_week_launch_sms(week: Week):
+    """Stub for SMS sending (if needed later)."""
+    logger.info(f"📱 Would send SMS launch message for Week {week.week_number}")
 
 
-# --- Run Telegram listener (polling mode) ---
+def calculate_and_send_results():
+    """Stub for weekly results calculation."""
+    logger.info("📊 Would calculate and send results here.")
+
+
 def run_telegram_listener():
-    """Run the Telegram bot to listen for button presses."""
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("❌ TELEGRAM_BOT_TOKEN not set in environment.")
-        sys.exit(1)
+    """Start polling Telegram for button presses (/ callback queries)."""
+    from telegram.ext import Application, CallbackQueryHandler
+
+    async def handle_pick(update, context):
+        query = update.callback_query
+        await query.answer()
+
+        data = query.data  # looks like "pick:123:TeamName"
+        _, game_id, team = data.split(":")
+
+        await query.edit_message_text(f"✅ You picked {team}")
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CallbackQueryHandler(handle_pick))
-
-    logger.info("🤖 Telegram bot listener started. Waiting for button presses...")
     application.run_polling()
+
+
+def reset_picks_for_participant(participant_name: str):
+    """Delete all picks for a participant by name."""
+    app = create_app()
+    with app.app_context():
+        p = Participant.query.filter_by(name=participant_name).first()
+        if not p:
+            logger.error(f"❌ Participant not found: {participant_name}")
+            return
+        deleted = db.session.query("picks").filter_by(participant_id=p.id).delete()
+        db.session.commit()
+        logger.info(f"✅ Picks reset for {participant_name} ({deleted} deleted)")
 
 
 # --- CLI entrypoint ---
@@ -151,18 +143,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run jobs for NFL Picks app")
     subparsers = parser.add_subparsers(dest="command")
 
+    # Send weekly games
     send_games_parser = subparsers.add_parser("send_week_games", help="Send out weekly games")
     send_games_parser.add_argument("week_number", type=int, help="Week number")
     send_games_parser.add_argument("--season_year", type=int, default=2025, help="Season year (default: 2025)")
-
-    listen_parser = subparsers.add_parser("listen", help="Run Telegram listener for picks")
 
     args = parser.parse_args()
 
     if args.command == "send_week_games":
         send_week_games(args.week_number, args.season_year)
-    elif args.command == "listen":
-        run_telegram_listener()
     else:
         parser.print_help()
         sys.exit(1)
