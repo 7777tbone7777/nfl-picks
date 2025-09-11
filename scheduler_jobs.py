@@ -1,6 +1,5 @@
 import sys
 from datetime import datetime
-from app import create_app, send_week_launch_sms
 from models import db, Week
 from nfl_data import fetch_and_create_week
 from flask_app import create_app

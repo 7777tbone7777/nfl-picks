@@ -1,6 +1,5 @@
 # dashboard.py
 import streamlit as st
-from app import create_app
 from models import db, Participant, Game, Pick
 from flask_app import create_app
 
