@@ -1,21 +1,20 @@
-# setup_database.py
-from app import create_app
+from flask_app import create_app
 from models import db, Participant
 
-# Create the Flask app using your factory
-app = create_app()
+def setup_initial_data():
+    app = create_app()
+    with app.app_context():
+        print("Creating database tables...")
+        db.create_all()
 
-with app.app_context():
-    # Create all tables
-    db.create_all()
+        for name, phone in [("Will","+18185316200"), ("Kevin","+18185316200"), ("Tony","+18185316200")]:
+            if not Participant.query.filter_by(name=name).first():
+                db.session.add(Participant(name=name, phone=phone))
+                print(f"Added participant: {name}")
 
-    # Seed participants if they don’t exist
-    for name in ["Kevin", "Will", "Tony"]:
-        exists = Participant.query.filter_by(name=name).first()
-        if not exists:
-            db.session.add(Participant(name=name))
-    
-    db.session.commit()
+        db.session.commit()
+        print("Database setup complete!")
 
-print("✅ Database setup complete. Participants seeded.")
+if __name__ == "__main__":
+    setup_initial_data()
 
