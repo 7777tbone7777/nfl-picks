@@ -77,7 +77,7 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pick = Pick.query.filter_by(participant_id=participant.id, game_id=game_id).first()
         if not pick:
-            pick = Pick(participant_id=participant.id, game_id=game_id, pick=team)
+            pick = Pick(participant_id=participant.id, game_id=game_id, selected_team=team)
             db.session.add(pick)
         else:
             pick.pick = team
