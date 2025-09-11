@@ -1,6 +1,8 @@
-from jobs import calculate_and_send_results
 from flask_app import create_app
+from jobs import calculate_and_send_results
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = create_app()
-    calculate_and_send_results(app)
+    with app.app_context():
+        calculate_and_send_results()
+        print("✅ Results job finished.")
