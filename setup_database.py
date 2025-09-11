@@ -1,25 +1,30 @@
-from app import create_app
-from models import db, Participant
+# setup_database.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from models import Base, Participant
+import os
 
-def setup_initial_data():
-    app = create_app()
-    with app.app_context():
-        print("Creating database tables...")
-        db.create_all()
-        
-        participants_to_add = [
-            {'name': 'Will', 'phone': '+18185316200'},
-            {'name': 'Kevin', 'phone': '+18185316200'}, 
-            {'name': 'Tony', 'phone': '+18185316200'}
-        ]
-        
-        for p_data in participants_to_add:
-            if not Participant.query.filter_by(name=p_data['name']).first():
-                db.session.add(Participant(name=p_data['name'], phone=p_data['phone']))
-                print(f"Added participant: {p_data['name']}")
-        
-        db.session.commit()
-        print("Database setup complete!")
+# Get DB URL from environment (Heroku sets DATABASE_URL)
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///nfl_picks.db")
 
-if __name__ == '__main__':
-    setup_initial_data()
+# Create engine
+engine = create_engine(DATABASE_URL)
+
+# Create all tables
+Base.metadata.create_all(engine)
+
+# Optional: seed participants (Kevin, Will, Tony) if not already present
+SessionLocal = sessionmaker(bind=engine)
+session = SessionLocal()
+
+participants = ["Kevin", "Will", "Tony"]
+for name in participants:
+    exists = session.query(Participant).filter_by(name=name).first()
+    if not exists:
+        session.add(Participant(name=name))
+
+session.commit()
+session.close()
+
+print("✅ Database setup complete. Participants seeded.")
+
