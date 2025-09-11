@@ -111,7 +111,7 @@ def send_week_games(week_number: int, season_year: int = 2025):
                 continue
 
             for g in games:
-                text = f"{g.away_team} @ {g.home_team}\n{g.game_time.strftime('%a %b %d %I:%M %p')}"
+                text = f"{g.away_team} @ {g.home_team}\n{g.game_time.replace(tzinfo=__import__("zoneinfo").ZoneInfo("UTC")).astimezone(__import__("zoneinfo").ZoneInfo("America/Los_Angeles")).strftime('%a %b %d %I:%M %p')}"
                 try:
                     resp = httpx.post(
                         f"{TELEGRAM_API_URL}/sendMessage",
