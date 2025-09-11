@@ -107,6 +107,41 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"✅ You picked {team}")
 
 
+# --- /mypicks command ---
+async def mypicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the participant’s picks for a given week."""
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /mypicks <week_number> [season_year]")
+        return
+    week_number = int(context.args[0])
+    season_year = int(context.args[1]) if len(context.args) > 1 else 2025
+
+    user_id = str(update.effective_user.id)
+
+    app = create_app()
+    with app.app_context():
+        participant = Participant.query.filter_by(telegram_chat_id=user_id).first()
+        if not participant:
+            await update.message.reply_text("⚠️ You’re not registered in the system.")
+            return
+
+        week = Week.query.filter_by(week_number=week_number, season_year=season_year).first()
+        if not week:
+            await update.message.reply_text(f"❌ No week found for {season_year} W{week_number}")
+            return
+
+        games = Game.query.filter_by(week_id=week.id).order_by(Game.game_time).all()
+        picks = Pick.query.filter_by(participant_id=participant.id).all()
+        pick_map = {p.game_id: p.team for p in picks}
+
+        text = f"📋 Your Picks – Week {week_number}, {season_year}\n\n"
+        for g in games:
+            chosen = pick_map.get(g.id, "❌ No pick")
+            text += f"{g.away_team} @ {g.home_team} – You picked: {chosen}\n"
+
+        await update.message.reply_text(text)
+
+
 # --- Telegram bot listener ---
 def run_telegram_listener():
     """Start the Telegram bot listener for commands and picks."""
@@ -118,6 +153,7 @@ def run_telegram_listener():
 
     # Commands
     app.add_handler(CommandHandler("sendweek", sendweek_command))
+    app.add_handler(CommandHandler("mypicks", mypicks_command))
     app.add_handler(CallbackQueryHandler(handle_pick))
 
     logger.info("🤖 Telegram bot listener started...")
