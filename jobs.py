@@ -1,79 +1,51 @@
 import os
-import sys
 import logging
+from datetime import datetime
 import httpx
-import argparse
 from flask_app import create_app
-from models import db, Participant, Week, Game, Pick
+from models import db, Week, Game, Participant, Pick
 
-# --- Logging setup ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Telegram setup ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_TOKEN')}"
 
-
-# --- Send a message to a participant ---
-def send_telegram_message(participant: Participant, text: str) -> bool:
-    """Send a Telegram message to a participant if they have a chat_id."""
-    if not participant.telegram_chat_id:
-        logger.warning(f"⚠️ No telegram_chat_id for {participant.name}")
-        return False
-
-    try:
-        resp = httpx.post(
-            f"{TELEGRAM_API_URL}/sendMessage",
-            json={"chat_id": participant.telegram_chat_id, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            logger.info(f"✅ Sent Telegram message to {participant.name}")
-            return True
-        else:
-            logger.error(f"❌ Failed to send Telegram message to {participant.name}: {resp.text}")
-            return False
-    except Exception as e:
-        logger.exception(f"💥 Error sending message to {participant.name}: {e}")
-        return False
-
-
-# --- Send weekly games list ---
-def send_week_games(week_number: int, season_year: int = 2025):
-    """Send out the list of games for a given week to all participants with inline pick buttons."""
+def send_week_games(week_number, season_year):
     app = create_app()
     with app.app_context():
-        week = Week.query.filter_by(week_number=week_number, season_year=season_year).first()
+        week = Week.query.filter_by(number=week_number, season_year=season_year).first()
         if not week:
-            logger.error(f"❌ No week found for {season_year} W{week_number}")
+            logger.error(f"Week {week_number} {season_year} not found")
             return
 
         games = Game.query.filter_by(week_id=week.id).order_by(Game.game_time).all()
-        if not games:
-            logger.error(f"❌ No games found for {season_year} W{week_number}")
-            return
+        participants = Participant.query.all()
 
-        for g in games:
-            local_time = g.game_time.replace(
-                tzinfo=__import__("zoneinfo").ZoneInfo("UTC")
-            ).astimezone(__import__("zoneinfo").ZoneInfo("America/Los_Angeles"))
+        for p in participants:
+            if not p.telegram_chat_id:
+                continue
 
-            text = f"{g.away_team} @ {g.home_team}\n{local_time.strftime('%a %b %d %I:%M %p PT')}"
+            for g in games:
+                # Convert UTC → PT
+                local_time = g.game_time.replace(
+                    tzinfo=__import__("zoneinfo").ZoneInfo("UTC")
+                ).astimezone(
+                    __import__("zoneinfo").ZoneInfo("America/Los_Angeles")
+                )
 
-            keyboard = {
-                "inline_keyboard": [
-                    [
-                        {"text": g.away_team, "callback_data": f"pick:{g.id}:{g.away_team}"},
-                        {"text": g.home_team, "callback_data": f"pick:{g.id}:{g.home_team}"},
+                # Game text
+                text = f"{g.away_team} @ {g.home_team}\n{local_time.strftime('%a %b %d %I:%M %p PT')}"
+
+                # Inline keyboard for picks
+                keyboard = {
+                    "inline_keyboard": [
+                        [
+                            {"text": g.away_team, "callback_data": f"{g.id}:{g.away_team}"},
+                            {"text": g.home_team, "callback_data": f"{g.id}:{g.home_team}"},
+                        ]
                     ]
-                ]
-            }
+                }
 
-            participants = Participant.query.all()
-            for p in participants:
-                if not p.telegram_chat_id:
-                    continue
                 try:
                     resp = httpx.post(
                         f"{TELEGRAM_API_URL}/sendMessage",
@@ -82,42 +54,46 @@ def send_week_games(week_number: int, season_year: int = 2025):
                             "text": text,
                             "reply_markup": keyboard,
                         },
-                        timeout=10,
                     )
-                    if resp.status_code == 200:
-                        logger.info(f"✅ Sent game to {p.name}: {text}")
-                    else:
-                        logger.error(f"❌ Telegram error for {p.name}: {resp.text}")
+                    resp.raise_for_status()
+                    logger.info(f"✅ Sent game to {p.name}: {text}")
                 except Exception as e:
-                    logger.exception(f"💥 Error sending game to {p.name}: {e}")
+                    logger.error(f"❌ Error sending game to {p.name}: {e}")
 
 
-# --- Placeholder: Future functions ---
-def send_week_launch_sms(week: Week):
-    """Stub for SMS sending (if needed later)."""
-    logger.info(f"📱 Would send SMS launch message for Week {week.week_number}")
+def handle_pick(update, context):
+    """Handles pick callback from inline keyboard."""
+    data = update.callback_query.data
+    try:
+        game_id, team = data.split(":", 1)
 
+        app = create_app()
+        with app.app_context():
+            participant = Participant.query.filter_by(
+                telegram_chat_id=update.effective_user.id
+            ).first()
 
-def calculate_and_send_results():
-    """Stub for weekly results calculation."""
-    logger.info("📊 Would calculate and send results here.")
+            if not participant:
+                update.callback_query.answer("You are not registered.")
+                return
 
+            pick = Pick.query.filter_by(
+                participant_id=participant.id, game_id=game_id
+            ).first()
 
-# --- CLI entrypoint ---
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run jobs for NFL Picks app")
-    subparsers = parser.add_subparsers(dest="command")
+            if pick:
+                pick.selected_team = team
+            else:
+                pick = Pick(
+                    participant_id=participant.id,
+                    game_id=game_id,
+                    selected_team=team,
+                )
+                db.session.add(pick)
 
-    # Send weekly games
-    send_games_parser = subparsers.add_parser("send_week_games", help="Send out weekly games")
-    send_games_parser.add_argument("week_number", type=int, help="Week number")
-    send_games_parser.add_argument("--season_year", type=int, default=2025, help="Season year (default: 2025)")
-
-    args = parser.parse_args()
-
-    if args.command == "send_week_games":
-        send_week_games(args.week_number, args.season_year)
-    else:
-        parser.print_help()
-        sys.exit(1)
+            db.session.commit()
+            update.callback_query.answer(f"You picked {team}")
+    except Exception as e:
+        logger.error(f"❌ Error handling pick: {e}")
+        update.callback_query.answer("Something went wrong saving your pick.")
 
