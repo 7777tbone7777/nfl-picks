@@ -68,7 +68,7 @@ async def testgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        text = f"🏈 {g.away_team} @ {g.home_team}\n📅 {g.start_time.strftime('%a %b %d %I:%M %p')}"
+        text = f"🏈 {g.away_team} @ {g.home_team}\n📅 {g.game_time.strftime('%a %b %d %I:%M %p')}"
         await update.message.reply_text(text, reply_markup=reply_markup)
 
 
@@ -124,7 +124,7 @@ async def sendweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ No data for Week {week_number}, {season_year}")
             return
 
-        games = Game.query.filter_by(week_id=week.id).order_by(Game.start_time).all()
+        games = Game.query.filter_by(week_id=week.id).order_by(Game.game_time).all()
         if not games:
             await update.message.reply_text(f"❌ No games found for Week {week_number}, {season_year}")
             return
@@ -138,7 +138,7 @@ async def sendweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            text = f"🏈 {g.away_team} @ {g.home_team}\n📅 {g.start_time.strftime('%a %b %d %I:%M %p')}"
+            text = f"🏈 {g.away_team} @ {g.home_team}\n📅 {g.game_time.strftime('%a %b %d %I:%M %p')}"
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=text,
