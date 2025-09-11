@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_TOKEN')}"
 
 def send_week_games(week_number, season_year):
+    """Send all games for a given week/season to registered participants."""
     app = create_app()
     with app.app_context():
         week = Week.query.filter_by(number=week_number, season_year=season_year).first()
@@ -33,10 +34,10 @@ def send_week_games(week_number, season_year):
                     __import__("zoneinfo").ZoneInfo("America/Los_Angeles")
                 )
 
-                # Game text
+                # Build game message
                 text = f"{g.away_team} @ {g.home_team}\n{local_time.strftime('%a %b %d %I:%M %p PT')}"
 
-                # Inline keyboard for picks
+                # Add inline keyboard for picks
                 keyboard = {
                     "inline_keyboard": [
                         [
@@ -62,7 +63,7 @@ def send_week_games(week_number, season_year):
 
 
 def handle_pick(update, context):
-    """Handles pick callback from inline keyboard."""
+    """Handles Telegram inline button picks and saves them in DB."""
     data = update.callback_query.data
     try:
         game_id, team = data.split(":", 1)
@@ -96,4 +97,32 @@ def handle_pick(update, context):
     except Exception as e:
         logger.error(f"❌ Error handling pick: {e}")
         update.callback_query.answer("Something went wrong saving your pick.")
+
+
+def reset_picks_for_participant(participant_name):
+    """Delete all picks for a participant (for testing)."""
+    app = create_app()
+    with app.app_context():
+        participant = Participant.query.filter_by(name=participant_name).first()
+        if not participant:
+            logger.error(f"Participant {participant_name} not found")
+            return
+
+        Pick.query.filter_by(participant_id=participant.id).delete()
+        db.session.commit()
+        logger.info(f"✅ Picks reset for {participant_name}")
+
+
+def run_telegram_listener():
+    """Start the Telegram listener (used in worker dyno)."""
+    from telegram.ext import Updater, CallbackQueryHandler
+
+    updater = Updater(os.environ.get("TELEGRAM_BOT_TOKEN"))
+    dp = updater.dispatcher
+
+    dp.add_handler(CallbackQueryHandler(handle_pick))
+
+    logger.info("🤖 Telegram bot listener started...")
+    updater.start_polling()
+    updater.idle()
 
