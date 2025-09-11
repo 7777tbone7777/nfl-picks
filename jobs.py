@@ -14,7 +14,8 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_T
 def send_week_games(week_number, season_year):
     app = create_app()
     with app.app_context():
-        week = Week.query.filter_by(number=week_number, season_year=season_year).first()
+	week = Week.query.filter_by(week_number=week_number, season_year=season_year).first()
+
         if not week:
             logger.error(f"❌ No week found for {season_year} week {week_number}")
             return
