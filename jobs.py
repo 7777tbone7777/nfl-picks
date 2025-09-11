@@ -6,12 +6,7 @@ import argparse
 from flask_app import create_app
 from models import db, Participant, Week, Game, Pick
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # --- Logging setup ---
 logging.basicConfig(level=logging.INFO)
@@ -47,70 +42,30 @@ def send_telegram_message(participant: Participant, text: str) -> bool:
         return False
 
 
-# --- Telegram handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome to NFL Picks! Use /sendweek <week> <year> to get started.")
-
-
-async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()  # ✅ Always answer to avoid button freeze
-
-    data = query.data  # e.g., "pick_123_home"
-    try:
-        _, game_id, team = data.split("_")
-        game_id = int(game_id)
-
-        with create_app().app_context():
-            game = Game.query.get(game_id)
-            participant = Participant.query.filter_by(telegram_chat_id=str(query.from_user.id)).first()
-
-            if not game or not participant:
-                await query.edit_message_text("❌ Could not record your pick. Try again.")
-                return
-
-            # Save or update pick
-            pick = Pick.query.filter_by(participant_id=participant.id, game_id=game.id).first()
-            if not pick:
-                pick = Pick(participant_id=participant.id, game_id=game.id, selected_team=team)
-                db.session.add(pick)
-            else:
-                pick.selected_team = team
-            db.session.commit()
-
-            await query.edit_message_text(f"✅ You picked {team} in {game.away_team} @ {game.home_team}")
-            logger.info(f"{participant.name} picked {team} for game {game.id}")
-
-    except Exception as e:
-        logger.exception(f"💥 Error handling pick: {e}")
-        await query.edit_message_text("⚠️ Something went wrong saving your pick.")
-
-
-async def send_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send out games for the requested week."""
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /sendweek <week_number> [season_year]")
-        return
-
-    week_number = int(context.args[0])
-    season_year = int(context.args[1]) if len(context.args) > 1 else 2025
-
-    with create_app().app_context():
+# --- Send weekly games list ---
+async def send_week_games(update: Update, context: ContextTypes.DEFAULT_TYPE, week_number: int, season_year: int = 2025):
+    """Send out the list of games for a given week to the requesting user."""
+    app = create_app()
+    with app.app_context():
         week = Week.query.filter_by(week_number=week_number, season_year=season_year).first()
         if not week:
-            await update.message.reply_text(f"❌ No week {week_number} found for {season_year}")
+            await update.message.reply_text(f"❌ No week found for {season_year} W{week_number}")
             return
 
         games = Game.query.filter_by(week_id=week.id).order_by(Game.game_time).all()
         if not games:
-            await update.message.reply_text(f"❌ No games scheduled for week {week_number}")
+            await update.message.reply_text(f"❌ No games found for {season_year} W{week_number}")
             return
 
         for g in games:
             keyboard = [
                 [
-                    InlineKeyboardButton(g.away_team, callback_data=f"pick_{g.id}_{g.away_team}"),
-                    InlineKeyboardButton(g.home_team, callback_data=f"pick_{g.id}_{g.home_team}"),
+                    InlineKeyboardButton(
+                        g.away_team, callback_data=f"pick_{g.id}_{g.away_team}"
+                    ),
+                    InlineKeyboardButton(
+                        g.home_team, callback_data=f"pick_{g.id}_{g.home_team}"
+                    ),
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -118,19 +73,65 @@ async def send_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text, reply_markup=reply_markup)
 
 
-# --- Run Telegram listener ---
+# --- Handle pick button presses ---
+async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle when a participant picks a team."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    try:
+        _, game_id, team = data.split("_", 2)  # safe split for team names with spaces
+    except ValueError:
+        logger.error(f"⚠️ Bad callback data: {data}")
+        await query.edit_message_text("⚠️ Something went wrong saving your pick.")
+        return
+
+    user_id = str(query.from_user.id)
+
+    app = create_app()
+    with app.app_context():
+        participant = Participant.query.filter_by(telegram_chat_id=user_id).first()
+        if not participant:
+            await query.edit_message_text("⚠️ You’re not registered in the system.")
+            return
+
+        pick = Pick.query.filter_by(participant_id=participant.id, game_id=game_id).first()
+        if pick:
+            pick.team = team
+        else:
+            pick = Pick(participant_id=participant.id, game_id=game_id, team=team)
+            db.session.add(pick)
+        db.session.commit()
+
+        await query.edit_message_text(f"✅ You picked {team}")
+
+
+# --- Telegram bot listener ---
 def run_telegram_listener():
+    """Start the Telegram bot listener for commands and picks."""
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("❌ TELEGRAM_BOT_TOKEN is not set in environment variables.")
+        logger.error("❌ TELEGRAM_BOT_TOKEN not set in environment.")
+        sys.exit(1)
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("sendweek", send_week))
+    # Commands
+    app.add_handler(CommandHandler("sendweek", sendweek_command))
     app.add_handler(CallbackQueryHandler(handle_pick))
 
     logger.info("🤖 Telegram bot listener started...")
     app.run_polling()
+
+
+# --- Command handler wrapper for /sendweek ---
+async def sendweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /sendweek <week_number> [season_year]")
+        return
+    week_number = int(context.args[0])
+    season_year = int(context.args[1]) if len(context.args) > 1 else 2025
+    await send_week_games(update, context, week_number, season_year)
 
 
 # --- CLI entrypoint ---
@@ -138,12 +139,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run jobs for NFL Picks app")
     subparsers = parser.add_subparsers(dest="command")
 
-    # Run Telegram bot
-    subparsers.add_parser("runbot", help="Run the Telegram bot listener")
+    # Run Telegram listener
+    subparsers.add_parser("listen", help="Run Telegram listener for picks")
 
     args = parser.parse_args()
 
-    if args.command == "runbot":
+    if args.command == "listen":
         run_telegram_listener()
     else:
         parser.print_help()
