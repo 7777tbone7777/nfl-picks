@@ -2,6 +2,9 @@ import os
 import logging
 from zoneinfo import ZoneInfo
 import httpx
+import os, asyncio, logging
+from telegram.ext import CommandHandler
+from sqlalchemy import text
 
 from flask_app import create_app
 from models import db, Participant, Week, Game, Pick
@@ -12,6 +15,8 @@ logger = logging.getLogger("jobs")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS","").replace(" ","").split(",") if x.isdigit()}
+
 
 def _pt(dt_utc):
     """Format a UTC datetime in a friendly way (US/Eastern as example)."""
@@ -111,6 +116,7 @@ def run_telegram_listener():
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_pick))
+    application.add_handler(CommandHandler("sendweek", sendweek_command))
     application.run_polling()
 
 def _send_message(chat_id: str, text: str, reply_markup: dict | None = None):
@@ -154,4 +160,51 @@ def send_week_games(week_number: int, season_year: int):
                     logger.info(f"✅ Sent game to {part.name}: {g.away_team} @ {g.home_team}")
                 except Exception as e:
                     logger.exception("❌ Failed to send game message: %s", e)
+# --- /sendweek admin command (additive only) ---
+async def sendweek_command(update, context):
+    """
+    Usage: /sendweek <week_number>
+    Sends inline-pick buttons for the given week to ALL registered participants.
+    Admin-only (IDs in ADMIN_USER_IDS).
+    """
+    import asyncio  # local import to avoid touching global imports
+
+    user = update.effective_user
+    if ADMIN_IDS and (not user or user.id not in ADMIN_IDS):
+        if update.message:
+            await update.message.reply_text("Sorry, admin only.")
+        return
+
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        if update.message:
+            await update.message.reply_text("Usage: /sendweek <week_number>  e.g., /sendweek 2")
+        return
+
+    week_number = int(args[0])
+
+    async def _do_send():
+        # Work inside a Flask app context
+        app = create_app()
+        with app.app_context():
+            # Use the latest season that has this week; if missing, try to create it
+            wk = Week.query.filter_by(week_number=week_number)\
+                           .order_by(Week.season_year.desc()).first()
+            if not wk:
+                # best-effort create (assume current UTC year)
+                import datetime as dt
+                from nfl_data import fetch_and_create_week
+                season_year = dt.datetime.utcnow().year
+                fetch_and_create_week(week_number, season_year)
+                wk = Week.query.filter_by(week_number=week_number)\
+                               .order_by(Week.season_year.desc()).first()
+            season_year = wk.season_year
+            # Reuse existing broadcaster
+            send_week_games(week_number=week_number, season_year=season_year)
+
+    if update.message:
+        await update.message.reply_text(f"Sending Week {week_number} to all registered participants…")
+    await asyncio.to_thread(_do_send)
+    if update.message:
+        await update.message.reply_text("✅ Done.")
 
