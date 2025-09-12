@@ -6,10 +6,9 @@ import os, asyncio, logging
 import json
 from telegram.ext import CommandHandler
 from sqlalchemy import text
+
 from flask_app import create_app
 from models import db, Participant, Week, Game, Pick
-from telegram import Update
-from telegram.ext import ContextTypes
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -107,90 +106,6 @@ async def handle_pick(update: "Update", context: "ContextTypes.DEFAULT_TYPE"):
 
     await query.edit_message_text(f"✅ You picked {team}")
 
-async def deletepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message
-    chat_id = str(update.effective_chat.id)
-    args = context.args
-
-    # Usage guard
-    if len(args) < 2:
-        return await m.reply_text(
-            'Usage: /deletepicks "<participant name>" <week_number>\n'
-            'Example: /deletepicks "Kevin" 2'
-        )
-
-    # Parse: last arg = week, everything before = name (allow spaces/quotes)
-    try:
-        week = int(args[-1])
-    except ValueError:
-        return await m.reply_text('Week must be an integer. Example: /deletepicks "Kevin" 2')
-
-    name = " ".join(args[:-1]).strip().strip('"').strip("'")
-    if not name:
-        return await m.reply_text('Provide a participant name. Example: /deletepicks "Kevin" 2')
-
-    # Work inside app context
-    from sqlalchemy import text as _text
-    from flask_app import create_app, db as _db
-    app = create_app()
-    with app.app_context():
-        # Simple admin check: only allow Tony's Telegram to run this
-        is_admin = _db.session.execute(_text("""
-            SELECT 1
-            FROM participants
-            WHERE lower(name)='tony' AND telegram_chat_id = :c
-        """), {"c": chat_id}).scalar() is not None
-        if not is_admin:
-            return await m.reply_text("Sorry, this command is restricted.")
-
-        # Find participant by name (case-insensitive)
-        pid = _db.session.execute(_text(
-            "SELECT id FROM participants WHERE lower(name)=lower(:n)"
-        ), {"n": name}).scalar()
-        if not pid:
-            return await m.reply_text(f'No participant named "{name}" found.')
-
-        # Resolve season for the requested week (latest season containing that week)
-        season = _db.session.execute(_text("""
-            SELECT season_year
-            FROM weeks
-            WHERE week_number = :w
-            ORDER BY season_year DESC
-            LIMIT 1
-        """), {"w": week}).scalar()
-        if not season:
-            return await m.reply_text(f"Week {week} not found in table weeks.")
-
-        # Count existing picks first (for report)
-        existing = _db.session.execute(_text("""
-            SELECT COUNT(*)
-            FROM picks p
-            JOIN games g ON g.id = p.game_id
-            JOIN weeks w ON w.id = g.week_id
-            WHERE p.participant_id = :pid
-              AND w.week_number   = :w
-              AND w.season_year   = :y
-        """), {"pid": pid, "w": week, "y": season}).scalar()
-
-        # Delete picks and report how many were removed
-        res = _db.session.execute(_text("""
-            DELETE FROM picks p
-            USING games g, weeks w
-            WHERE p.game_id = g.id
-              AND g.week_id = w.id
-              AND p.participant_id = :pid
-              AND w.week_number    = :w
-              AND w.season_year    = :y
-            RETURNING p.id
-        """), {"pid": pid, "w": week, "y": season})
-        deleted = len(res.fetchall())
-        _db.session.commit()
-
-    await m.reply_text(
-        f'🧹 Deleted {deleted} pick(s) for "{name}" in Week {week} ({season}). '
-        f'Previously existed: {existing}.'
-    )
-
 def run_telegram_listener():
     """Run polling listener so /start and button taps are processed."""
     if not TELEGRAM_BOT_TOKEN:
@@ -203,7 +118,6 @@ def run_telegram_listener():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_pick))
     application.add_handler(CommandHandler("sendweek", sendweek_command))
-    application.add_handler(CommandHandler("deletepicks", deletepicks_command))
     application.run_polling()
 def _send_message(chat_id: str, text: str, reply_markup: dict | None = None):
     """Low-level helper to send a message via Telegram HTTP API (sync call)."""
