@@ -3,6 +3,7 @@ import logging
 from zoneinfo import ZoneInfo
 import httpx
 import os, asyncio, logging
+import json
 from telegram.ext import CommandHandler
 from sqlalchemy import text
 
@@ -123,9 +124,12 @@ def _send_message(chat_id: str, text: str, reply_markup: dict | None = None):
     """Low-level helper to send a message via Telegram HTTP API (sync call)."""
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-    data = {"chat_id": chat_id, "text": text}
-    if reply_markup:
-        data["reply_markup"] = reply_markup
+# inside _send_message(...)
+data = {"chat_id": chat_id, "text": text}
+if reply_markup is not None:
+    data["reply_markup"] = (
+        reply_markup if isinstance(reply_markup, str) else json.dumps(reply_markup)
+    )
     with httpx.Client(timeout=20) as client:
         resp = client.post(f"{TELEGRAM_API_URL}/sendMessage", data=data)
         resp.raise_for_status()
@@ -160,14 +164,18 @@ def send_week_games(week_number: int, season_year: int):
                     logger.info(f"✅ Sent game to {part.name}: {g.away_team} @ {g.home_team}")
                 except Exception as e:
                     logger.exception("❌ Failed to send game message: %s", e)
-# --- /sendweek admin command (additive only) ---
+
+# --- /sendweek admin command (additive, with DRY and ME) ---
 async def sendweek_command(update, context):
     """
-    Usage: /sendweek <week_number>
-    Sends inline-pick buttons for the given week to ALL registered participants.
-    Admin-only (IDs in ADMIN_USER_IDS).
+    Usage:
+      /sendweek <week>            -> send to ALL (existing behavior)
+      /sendweek <week> dry        -> DRY-RUN (no sends; report counts)
+      /sendweek <week> me         -> send ONLY to the caller (admin)
+      /sendweek <week> <name...>  -> send ONLY to that participant by name
     """
-    import asyncio  # local import to avoid touching global imports
+    import asyncio
+    from sqlalchemy import text
 
     user = update.effective_user
     if ADMIN_IDS and (not user or user.id not in ADMIN_IDS):
@@ -178,33 +186,121 @@ async def sendweek_command(update, context):
     args = context.args or []
     if not args or not args[0].isdigit():
         if update.message:
-            await update.message.reply_text("Usage: /sendweek <week_number>  e.g., /sendweek 2")
+            await update.message.reply_text("Usage: /sendweek <week_number> [dry|me|<participant name>]")
         return
-
     week_number = int(args[0])
+    target = "all" if len(args) == 1 else " ".join(args[1:]).strip()
 
-    async def _do_send():
-        # Work inside a Flask app context
+    # Helper: send to a single participant id/chat, only unpicked for that week
+    def _send_to_one(participant_id: int, chat_id: str, season_year: int):
+        # get only unpicked games for this participant
+        rows = db.session.execute(text("""
+            select g.id, g.away_team, g.home_team
+            from games g
+            join weeks w on w.id=g.week_id
+            left join picks p on p.game_id=g.id and p.participant_id=:pid
+            where w.season_year=:y and w.week_number=:w
+              and (p.id is null or p.selected_team is null)
+            order by g.game_time nulls last, g.id
+        """), {"pid": participant_id, "y": season_year, "w": week_number}).mappings().all()
+
+        sent = 0
+        for g in rows:
+            kb = {
+                "inline_keyboard": [
+                    [{"text": g["away_team"], "callback_data": f"pick:{g['id']}:{g['away_team']}"}],
+                    [{"text": g["home_team"], "callback_data": f"pick:{g['id']}:{g['home_team']}"}],
+                ]
+            }
+            _send_message(str(chat_id), f"{g['away_team']} @ {g['home_team']}", reply_markup=kb)
+            sent += 1
+        return sent
+
+    # Targeted modes (dry/me/name) should NOT auto-create weeks; only use existing week.
+    def _find_existing_week():
+        return Week.query.filter_by(week_number=week_number).order_by(Week.season_year.desc()).first()
+
+    # Handle targeted modes inline; keep broadcast in a background thread
+    if target.lower() in ("dry", "me") or target.lower() not in ("all",):
         app = create_app()
         with app.app_context():
-            # Use the latest season that has this week; if missing, try to create it
-            wk = Week.query.filter_by(week_number=week_number)\
-                           .order_by(Week.season_year.desc()).first()
+            wk = _find_existing_week()
             if not wk:
-                # best-effort create (assume current UTC year)
+                if update.message:
+                    await update.message.reply_text(f"Week {week_number} not found yet. (Dry/me/name modes do not auto-create.)")
+                return
+            season_year = wk.season_year
+
+            if target.lower() == "dry":
+                # Count how many messages would be sent to all registered participants
+                people = db.session.execute(text("""
+                    select id, name, telegram_chat_id
+                    from participants
+                    where telegram_chat_id is not null
+                """)).mappings().all()
+                total_msgs = 0
+                for u in people:
+                    cnt = db.session.execute(text("""
+                        select count(*)
+                        from games g
+                        join weeks w on w.id=g.week_id
+                        left join picks p on p.game_id=g.id and p.participant_id=:pid
+                        where w.season_year=:y and w.week_number=:w
+                          and (p.id is null or p.selected_team is null)
+                    """), {"pid": u["id"], "y": season_year, "w": week_number}).scalar()
+                    total_msgs += int(cnt or 0)
+                await update.message.reply_text(
+                    f"DRY RUN: would send {total_msgs} button message(s) to {len(people)} participant(s) for Week {week_number} ({season_year})."
+                )
+                return
+
+            if target.lower() == "me":
+                me_chat = str(update.effective_chat.id)
+                person = db.session.execute(text("""
+                    select id, telegram_chat_id from participants
+                    where telegram_chat_id = :c
+                """), {"c": me_chat}).mappings().first()
+                if not person:
+                    await update.message.reply_text("You're not linked yet. Send /start first.")
+                    return
+                sent = _send_to_one(person["id"], person["telegram_chat_id"], season_year)
+                await update.message.reply_text(f"✅ Sent {sent} unpicked game(s) for Week {week_number} to you.")
+                return
+
+            # Otherwise: treat target as a participant name
+            name = target
+            person = db.session.execute(text("""
+                select id, name, telegram_chat_id from participants
+                where lower(name)=lower(:n)
+            """), {"n": name}).mappings().first()
+            if not person:
+                await update.message.reply_text(f"Participant '{name}' not found.")
+                return
+            if not person["telegram_chat_id"]:
+                await update.message.reply_text(f"Participant '{name}' has no Telegram chat linked. Ask them to /start.")
+                return
+            sent = _send_to_one(person["id"], person["telegram_chat_id"], season_year)
+            await update.message.reply_text(f"✅ Sent {sent} unpicked game(s) for Week {week_number} to {person['name']}.")
+            return
+
+    # Default: broadcast to ALL (unchanged behavior; may create the week if missing)
+    async def _do_broadcast():
+        app = create_app()
+        with app.app_context():
+            wk = Week.query.filter_by(week_number=week_number).order_by(Week.season_year.desc()).first()
+            if not wk:
+                # best-effort create if missing
                 import datetime as dt
                 from nfl_data import fetch_and_create_week
                 season_year = dt.datetime.utcnow().year
                 fetch_and_create_week(week_number, season_year)
-                wk = Week.query.filter_by(week_number=week_number)\
-                               .order_by(Week.season_year.desc()).first()
+                wk = Week.query.filter_by(week_number=week_number).order_by(Week.season_year.desc()).first()
             season_year = wk.season_year
-            # Reuse existing broadcaster
             send_week_games(week_number=week_number, season_year=season_year)
 
     if update.message:
         await update.message.reply_text(f"Sending Week {week_number} to all registered participants…")
-    await asyncio.to_thread(_do_send)
+    await asyncio.to_thread(_do_broadcast)
     if update.message:
         await update.message.reply_text("✅ Done.")
 
