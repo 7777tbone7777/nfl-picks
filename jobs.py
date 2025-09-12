@@ -119,17 +119,16 @@ def run_telegram_listener():
     application.add_handler(CallbackQueryHandler(handle_pick))
     application.add_handler(CommandHandler("sendweek", sendweek_command))
     application.run_polling()
-
 def _send_message(chat_id: str, text: str, reply_markup: dict | None = None):
     """Low-level helper to send a message via Telegram HTTP API (sync call)."""
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-# inside _send_message(...)
-data = {"chat_id": chat_id, "text": text}
-if reply_markup is not None:
-    data["reply_markup"] = (
-        reply_markup if isinstance(reply_markup, str) else json.dumps(reply_markup)
-    )
+    data = {"chat_id": chat_id, "text": text}
+    if reply_markup is not None:
+        # Accept either a dict (encode) or a pre-encoded JSON string
+        data["reply_markup"] = (
+            reply_markup if isinstance(reply_markup, str) else json.dumps(reply_markup)
+        )
     with httpx.Client(timeout=20) as client:
         resp = client.post(f"{TELEGRAM_API_URL}/sendMessage", data=data)
         resp.raise_for_status()
