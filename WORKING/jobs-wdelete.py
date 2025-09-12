@@ -5,12 +5,11 @@ import httpx
 import os, asyncio, logging
 import json
 from telegram.ext import CommandHandler
-from sqlalchemy import text as _text
+from sqlalchemy import text
 from flask_app import create_app
 from models import db, Participant, Week, Game, Pick
 from telegram import Update
 from telegram.ext import ContextTypes
-from datetime import datetime, timezone
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -20,9 +19,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS","").replace(" ","").split(",") if x.isdigit()}
 
-def _now_utc_naive():
-    """UTC 'now' as naive datetime to match 'timestamp without time zone' columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 def _pt(dt_utc):
     """Format a UTC datetime in a friendly way (US/Eastern as example)."""
@@ -194,166 +190,6 @@ async def deletepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         f'🧹 Deleted {deleted} pick(s) for "{name}" in Week {week} ({season}). '
         f'Previously existed: {existing}.'
     )
-async def whoisleft_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message
-    chat_id = str(update.effective_chat.id)
-
-    # Parse args
-    if not context.args:
-        return await m.reply_text("Usage: /whoisleft <week_number>   (e.g., /whoisleft 2)")
-    try:
-        week = int(context.args[0])
-    except ValueError:
-        return await m.reply_text("Week must be an integer, e.g. /whoisleft 2")
-
-    # DB work
-    from flask_app import create_app, db as _db
-    app = create_app()
-    with app.app_context():
-        # Admin guard: only Tony’s Telegram
-        is_admin = _db.session.execute(_text("""
-            SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
-        """), {"c": chat_id}).scalar() is not None
-        if not is_admin:
-            return await m.reply_text("Sorry, this command is restricted.")
-
-        # Resolve season for that week (latest available)
-        season = _db.session.execute(_text("""
-            SELECT season_year FROM weeks WHERE week_number=:w ORDER BY season_year DESC LIMIT 1
-        """), {"w": week}).scalar()
-        if not season:
-            return await m.reply_text(f"Week {week} not found in table weeks.")
-
-        # Total games in that week
-        total_games = _db.session.execute(_text("""
-            SELECT COUNT(*) FROM games g JOIN weeks w ON w.id=g.week_id
-            WHERE w.season_year=:y AND w.week_number=:w
-        """), {"y": season, "w": week}).scalar()
-
-        # Per-user picked count
-        rows = _db.session.execute(_text("""
-            WITH wg AS (
-              SELECT g.id
-              FROM games g JOIN weeks w ON w.id=g.week_id
-              WHERE w.season_year=:y AND w.week_number=:w
-            )
-            SELECT u.id, u.name, u.telegram_chat_id,
-                   COALESCE(COUNT(p.selected_team),0) AS picked
-            FROM participants u
-            LEFT JOIN picks p
-              ON p.participant_id=u.id AND p.game_id IN (SELECT id FROM wg) AND p.selected_team IS NOT NULL
-            GROUP BY u.id, u.name, u.telegram_chat_id
-            ORDER BY u.id
-        """), {"y": season, "w": week}).mappings().all()
-
-    # Build summary
-    lines = [f"Week {week} ({season}) — total games: {total_games}"]
-    for r in rows:
-        remaining = (total_games or 0) - int(r["picked"] or 0)
-        lines.append(f"• {r['name']}: picked {int(r['picked'] or 0)}/{total_games} — remaining {remaining}")
-    await m.reply_text("\n".join(lines))
-# /remindweek <week> [participant name...]
-# If no name is supplied, nudges everyone with remaining picks.
-# Only sends games with g.game_time > now (future), and where no pick exists.
-async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message
-    chat_id = str(update.effective_chat.id)
-
-    if not context.args:
-        return await m.reply_text('Usage: /remindweek <week_number> [participant name]\n'
-                                  'Examples:\n'
-                                  '  /remindweek 2\n'
-                                  '  /remindweek 2 Kevin\n'
-                                  '  /remindweek 2 "Wil Eddie Cano"')
-
-    try:
-        week = int(context.args[0])
-    except ValueError:
-        return await m.reply_text("Week must be an integer, e.g. /remindweek 2")
-
-    name = " ".join(context.args[1:]).strip().strip('"').strip("'") if len(context.args) > 1 else None
-
-    from flask_app import create_app, db as _db
-    app = create_app()
-    now_cutoff = _now_utc_naive()
-
-    with app.app_context():
-        # Admin guard
-        is_admin = _db.session.execute(_text("""
-            SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
-        """), {"c": chat_id}).scalar() is not None
-        if not is_admin:
-            return await m.reply_text("Sorry, this command is restricted.")
-
-        # Resolve season
-        season = _db.session.execute(_text("""
-            SELECT season_year FROM weeks WHERE week_number=:w ORDER BY season_year DESC LIMIT 1
-        """), {"w": week}).scalar()
-        if not season:
-            return await m.reply_text(f"Week {week} not found in table weeks.")
-
-        # Decide target participants
-        if name:
-            targets = _db.session.execute(_text("""
-                SELECT id, name, telegram_chat_id
-                FROM participants
-                WHERE lower(name)=lower(:n)
-            """), {"n": name}).mappings().all()
-            if not targets:
-                return await m.reply_text(f'No participant named "{name}" found.')
-        else:
-            # Everyone with remaining unpicked games
-            targets = _db.session.execute(_text("""
-              WITH wg AS (
-                SELECT g.id
-                FROM games g JOIN weeks w ON w.id=g.week_id
-                WHERE w.season_year=:y AND w.week_number=:w
-              )
-              SELECT u.id, u.name, u.telegram_chat_id,
-                     ((SELECT COUNT(*) FROM wg)
-                      - COALESCE(COUNT(p.selected_team),0)) AS remaining
-              FROM participants u
-              LEFT JOIN picks p
-                ON p.participant_id=u.id AND p.game_id IN (SELECT id FROM wg) AND p.selected_team IS NOT NULL
-              GROUP BY u.id, u.name, u.telegram_chat_id
-              HAVING ((SELECT COUNT(*) FROM wg) - COALESCE(COUNT(p.selected_team),0)) > 0
-              ORDER BY u.id
-            """), {"y": season, "w": week}).mappings().all()
-
-        sent_total = 0
-        for u in targets:
-            if not u["telegram_chat_id"]:
-                continue  # cannot DM
-
-            # Unpicked, future games only
-            rows = _db.session.execute(_text("""
-                SELECT g.id AS game_id, g.away_team, g.home_team, g.game_time
-                FROM games g
-                JOIN weeks w ON w.id=g.week_id
-                LEFT JOIN picks p ON p.game_id=g.id AND p.participant_id=:pid
-                WHERE w.season_year=:y AND w.week_number=:w
-                  AND (p.id IS NULL OR p.selected_team IS NULL)
-                  AND (g.game_time IS NULL OR g.game_time > :now)  -- future only
-                ORDER BY g.game_time NULLS LAST, g.id
-            """), {"pid": u["id"], "y": season, "w": week, "now": now_cutoff}).mappings().all()
-
-            if not rows:
-                # Optionally let them know they’re all set / or only past games remain
-                _send_message(u["telegram_chat_id"], f"✅ {u['name']}: you’re all set for Week {week} ({season}).")
-                continue
-
-            # Send one message per game with two buttons
-            for r in rows:
-                kb = {
-                    "inline_keyboard": [
-                        [{"text": r["away_team"], "callback_data": f"pick:{r['game_id']}:{r['away_team']}"}],
-                        [{"text": r["home_team"], "callback_data": f"pick:{r['game_id']}:{r['home_team']}"}],
-                    ]
-                }
-                _send_message(u["telegram_chat_id"], f"{r['away_team']} @ {r['home_team']}", reply_markup=kb)
-                sent_total += 1
-
-    await m.reply_text(f"📨 Reminders sent: {sent_total} game messages.")
 
 def run_telegram_listener():
     """Run polling listener so /start and button taps are processed."""
@@ -368,8 +204,6 @@ def run_telegram_listener():
     application.add_handler(CallbackQueryHandler(handle_pick))
     application.add_handler(CommandHandler("sendweek", sendweek_command))
     application.add_handler(CommandHandler("deletepicks", deletepicks_command))
-    application.add_handler(CommandHandler("whoisleft", whoisleft_command))
-    application.add_handler(CommandHandler("remindweek", remindweek_command))
     application.run_polling()
 def _send_message(chat_id: str, text: str, reply_markup: dict | None = None):
     """Low-level helper to send a message via Telegram HTTP API (sync call)."""
