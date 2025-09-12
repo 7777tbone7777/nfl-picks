@@ -1,105 +1,136 @@
-impor     os
-impor     logging
-impor     h        px
-from flask_app impor     crea    e_app
-from models impor     db, Week, Game, Par    icipan    , Pick
-from     elegram impor     Upda    e, InlineKeyboardBu        on, InlineKeyboardMarkup
-from     elegram.ex     impor     Applica    ion, CommandHandler, CallbackQueryHandler, Con    ex    Types
+import os
+import logging
+from zoneinfo import ZoneInfo
+import httpx
 
+from flask_app import create_app
+from models import db, Participant, Week, Game, Pick
+
+# Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.ge    Logger("jobs")
+logger = logging.getLogger("jobs")
 
-TELEGRAM_API_URL = f"h        ps://api.    elegram.org/bo    {os.environ.ge    ('TELEGRAM_BOT_TOKEN')}"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-def send_week_games(week_number, season_year):
-    app = crea    e_app()
-    wi    h app.app_con    ex    ():
-	week = Week.query.fil    er_by(week_number=week_number, season_year=season_year).firs    ()
+def _pt(dt_utc):
+    """Convert naive UTC datetime to America/Los_Angeles for display."""
+    return dt_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/Los_Angeles"))
 
-        if no     week:
-            logger.error(f"❌ No week found for {season_year} week {week_number}")
-            re    urn
+def send_week_games(week_number: int, season_year: int = 2025):
+    """Send Week games with inline buttons to all participants who have telegram_chat_id."""
+    app = create_app()
+    with app.app_context():
+        week = Week.query.filter_by(week_number=week_number, season_year=season_year).first()
+        if not week:
+            logger.error(f"❌ No week found for {season_year} W{week_number}")
+            return
 
-        par    icipan    s = Par    icipan    .query.all()
-        games = Game.query.fil    er_by(week_id=week.id).order_by(Game.game_    ime).all()
+        games = Game.query.filter_by(week_id=week.id).order_by(Game.game_time).all()
+        if not games:
+            logger.error(f"❌ No games found for {season_year} W{week_number}")
+            return
 
-        for p in par    icipan    s:
-            if no     p.    elegram_cha    _id:
-                con    inue
+        participants = Participant.query.all()
+        for p in participants:
+            if not p.telegram_chat_id:
+                continue
 
             for g in games:
-                local_    ime = g.game_    ime.replace(
-                        zinfo=__impor    __("zoneinfo").ZoneInfo("UTC")
-                ).as    imezone(__impor    __("zoneinfo").ZoneInfo("America/Los_Angeles"))
-                    ex     = f"{g.away_    eam} @ {g.home_    eam}\n{local_    ime.s    rf    ime('%a %b %d %I:%M %p PT')}"
-
-                keyboard = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardBu        on(g.away_    eam, callback_da    a=f"pick:{p.id}:{g.id}:{g.away_    eam}"),
-                        InlineKeyboardBu        on(g.home_    eam, callback_da    a=f"pick:{p.id}:{g.id}:{g.home_    eam}"),
-                    ]
-                ])
-
-                    ry:
-                    resp = h        px.pos    (
+                local_time = _pt(g.game_time)
+                text = f"{g.away_team} @ {g.home_team}\n{local_time.strftime('%a %b %d %I:%M %p PT')}"
+                # Use raw JSON for the inline keyboard (no python-telegram-bot classes here)
+                reply_markup = {
+                    "inline_keyboard": [[
+                        {"text": g.away_team, "callback_data": f"pick:{g.id}:{g.away_team}"},
+                        {"text": g.home_team, "callback_data": f"pick:{g.id}:{g.home_team}"},
+                    ]]
+                }
+                try:
+                    resp = httpx.post(
                         f"{TELEGRAM_API_URL}/sendMessage",
                         json={
-                            "cha    _id": p.    elegram_cha    _id,
-                            "    ex    ":     ex    ,
-                            "reply_markup": keyboard.    o_dic    ()
-                        }
+                            "chat_id": str(p.telegram_chat_id),
+                            "text": text,
+                            "reply_markup": reply_markup,
+                            "parse_mode": "HTML",
+                        },
+                        timeout=15,
                     )
-                    resp.raise_for_s    a    us()
-                    logger.info(f"✅ Sen     game     o {p.name}: {g.away_    eam} @ {g.home_    eam}")
-                excep     Excep    ion as e:
-                    logger.error(f"💥 Error sending game     o {p.name}: {e}")
+                    resp.raise_for_status()
+                    logger.info(f"✅ Sent game to {p.name}: {g.away_team} @ {g.home_team}")
+                except Exception as e:
+                    logger.exception(f"💥 Error sending game to {p.name}: {e}")
 
-async def handle_pick(upda    e: Upda    e, con    ex    : Con    ex    Types.DEFAULT_TYPE):
-    query = upda    e.callback_query
-    if no     query:
-        re    urn
+# --- Telegram listener (polling) ---
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Update
 
-    awai     query.answer()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    username = user.username or user.first_name or "unknown"
+    logger.info(f"📩 /start from {username} (chat_id={chat_id})")
 
-        ry:
-        _, par    icipan    _id, game_id,     eam = query.da    a.spli    (":")
-    excep     ValueError:
-        re    urn
+    # Try linking by existing participant with empty chat_id and same name as your group (Tony/Kevin/Will)
+    link_candidates = [username, user.first_name, user.full_name]
+    link_candidates = [c for c in link_candidates if c]
 
-    app = crea    e_app()
-    wi    h app.app_con    ex    ():
-        pick = Pick.query.fil    er_by(par    icipan    _id=par    icipan    _id, game_id=game_id).firs    ()
-        if no     pick:
-            pick = Pick(par    icipan    _id=par    icipan    _id, game_id=game_id,     eam=    eam)
+    app = create_app()
+    linked = False
+    with app.app_context():
+        # Prefer exact match on Tony/Kevin/Will
+        for candidate in link_candidates:
+            p = Participant.query.filter_by(name=candidate).first()
+            if p:
+                p.telegram_chat_id = str(chat_id)
+                db.session.commit()
+                logger.info(f"🔗 Linked participant '{p.name}' to chat_id {chat_id}")
+                linked = True
+                break
+
+    msg = "👋 Welcome! You’re registered to receive NFL picks." if linked else \
+          f"👋 Welcome! Your chat_id is {chat_id}. Tell Tony to link this to your name."
+    await update.message.reply_text(msg)
+
+async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    try:
+        _, game_id_str, team = query.data.split(":", 2)
+        game_id = int(game_id_str)
+    except Exception:
+        await query.edit_message_text("⚠️ Invalid selection payload.")
+        return
+
+    chat_id = str(update.effective_chat.id)
+
+    app = create_app()
+    with app.app_context():
+        participant = Participant.query.filter_by(telegram_chat_id=chat_id).first()
+        if not participant:
+            await query.edit_message_text("⚠️ Not linked yet. Send /start first.")
+            return
+
+        pick = Pick.query.filter_by(participant_id=participant.id, game_id=game_id).first()
+        if not pick:
+            pick = Pick(participant_id=participant.id, game_id=game_id, selected_team=team)
             db.session.add(pick)
         else:
-            pick.    eam =     eam
-        db.session.commi    ()
+            pick.selected_team = team
+        db.session.commit()
 
-    awai     query.edi    _message_    ex    (f"✅ You picked {    eam}")
+    await query.edit_message_text(f"✅ You picked {team}")
 
-# ✅ NEW START HANDLER
-async def s    ar    (upda    e: Upda    e, con    ex    : Con    ex    Types.DEFAULT_TYPE):
-    user = upda    e.effec    ive_user
-    cha    _id = upda    e.effec    ive_cha    .id
-    logger.info(f"📩 /s    ar     received from {user.username} (id={cha    _id})")
+def run_telegram_listener():
+    """Run polling listener so /start and button taps are processed."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
-    # Op    ionally: s    ore cha    _id if     his user exis    s in DB
-    app = crea    e_app()
-    wi    h app.app_con    ex    ():
-        par    icipan     = Par    icipan    .query.fil    er_by(name=user.username).firs    ()
-        if par    icipan    :
-            par    icipan    .    elegram_cha    _id = s    r(cha    _id)
-            db.session.commi    ()
-            logger.info(f"🔗 Linked {user.username}     o cha    _id {cha    _id}")
-
-    awai     upda    e.message.reply_    ex    ("👋 Welcome! You are now regis    ered     o receive NFL picks.")
-
-def run_    elegram_lis    ener():
-    applica    ion = Applica    ion.builder().    oken(os.environ.ge    ("TELEGRAM_BOT_TOKEN")).build()
-
-    applica    ion.add_handler(CommandHandler("s    ar    ", s    ar    ))  # 👈 new handler
-    applica    ion.add_handler(CallbackQueryHandler(handle_pick))
-
-    applica    ion.run_polling()
-
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_pick))
+    application.run_polling()
