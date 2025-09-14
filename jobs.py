@@ -20,6 +20,76 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS","").replace(" ","").split(",") if x.isdigit()}
 
+# --- ESPN NFL scoreboard (read-only fetch) ---
+# Regular season = seasontype=2. Preseason(1), Postseason(3).
+ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
+
+def fetch_espn_scoreboard(week: int, season_year: int):
+    """
+    Returns a list of dicts like:
+      {
+        "away_team": "Washington Commanders",
+        "home_team": "Green Bay Packers",
+        "away_score": 18 (or None),
+        "home_score": 27 (or None),
+        "state": "post" | "in" | "pre",
+        "winner": "Green Bay Packers" | None
+      }
+    Does not touch the database.
+    """
+    import httpx
+    with httpx.Client(timeout=15.0) as client:
+        # Primary: week/year
+        url = f"{ESPN_SCOREBOARD_URL}?week={week}&year={season_year}&seasontype=2"
+        r = client.get(url)
+        r.raise_for_status()
+        data = r.json()
+
+    out = []
+    for ev in data.get("events", []):
+        try:
+            comp = ev["competitions"][0]
+            status = comp.get("status", {}).get("type", {})
+            state = (status.get("state") or "").lower()  # "pre" | "in" | "post"
+
+            home = next(t for t in comp["competitors"] if t.get("homeAway") == "home")
+            away = next(t for t in comp["competitors"] if t.get("homeAway") == "away")
+
+            home_name = home["team"]["displayName"]
+            away_name = away["team"]["displayName"]
+
+            # Scores may be "", None, or a string number.
+            def _to_int(x):
+                try:
+                    return int(x)
+                except Exception:
+                    return None
+
+            hs = _to_int(home.get("score"))
+            as_ = _to_int(away.get("score"))
+
+            # Winner from ESPN if flagged, else derive from scores if final/non-tie
+            winner = None
+            if home.get("winner") is True:
+                winner = home_name
+            elif away.get("winner") is True:
+                winner = away_name
+            elif hs is not None and as_ is not None and hs != as_ and state == "post":
+                winner = home_name if hs > as_ else away_name
+
+            out.append({
+                "away_team": away_name,
+                "home_team": home_name,
+                "away_score": as_,
+                "home_score": hs,
+                "state": state,      # "pre", "in", "post"
+                "winner": winner,    # may be None if not final yet or tie
+            })
+        except Exception:
+            # Be resilient to any weird ESPN edge cases
+            continue
+    return out
+
 def _now_utc_naive():
     """UTC 'now' as naive datetime to match 'timestamp without time zone' columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
