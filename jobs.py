@@ -355,6 +355,133 @@ async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await m.reply_text(f"📨 Reminders sent: {sent_total} game messages.")
 
+async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /seepicks <week_number> all
+      /seepicks <week_number> <participant_name>
+
+    - If 'all', compiles a grid of everyone's picks for that week and broadcasts
+      the grid to each participant (DM) and replies in the invoking chat.
+    - If a participant name is provided, shows only that person's picks for the week
+      (replies in chat and DM to that participant if linked).
+    """
+    m = update.effective_message
+    chat_id = str(update.effective_chat.id)
+    args = context.args or []
+
+    # Validate args
+    if len(args) < 2:
+        return await m.reply_text("Usage: /seepicks <week_number> <participant|all>\nExample: /seepicks 3 all")
+
+    # Parse week
+    try:
+        week = int(args[0])
+    except ValueError:
+        return await m.reply_text("Week must be an integer, e.g. /seepicks 3 all")
+
+    target = " ".join(args[1:]).strip().strip('"').strip("'")  # allow spaces/quotes in names
+    is_all = target.lower() == "all"
+
+    from flask_app import create_app, db as _db
+    app = create_app()
+    with app.app_context():
+        # Admin guard (only Tony's Telegram can run this)
+        is_admin = _db.session.execute(_text("""
+            SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
+        """), {"c": chat_id}).scalar() is not None
+        if not is_admin:
+            return await m.reply_text("Sorry, this command is restricted.")
+
+        # Latest season that has this week
+        season = _db.session.execute(_text("""
+            SELECT season_year FROM weeks WHERE week_number=:w ORDER BY season_year DESC LIMIT 1
+        """), {"w": week}).scalar()
+        if not season:
+            return await m.reply_text(f"Week {week} not found in table weeks.")
+
+        # Games in the week
+        games = _db.session.execute(_text("""
+            SELECT g.id, g.away_team, g.home_team
+            FROM games g
+            JOIN weeks w ON w.id = g.week_id
+            WHERE w.season_year=:y AND w.week_number=:w
+            ORDER BY g.game_time NULLS LAST, g.id
+        """), {"y": season, "w": week}).mappings().all()
+        if not games:
+            return await m.reply_text(f"No games found for Week {week} ({season}).")
+
+        # Participants scope
+        if is_all:
+            participants = _db.session.execute(_text("""
+                SELECT id, name, telegram_chat_id
+                FROM participants
+                ORDER BY name
+            """)).mappings().all()
+        else:
+            row = _db.session.execute(_text("""
+                SELECT id, name, telegram_chat_id
+                FROM participants
+                WHERE lower(name)=lower(:name)
+                LIMIT 1
+            """), {"name": target}).mappings().first()
+            if not row:
+                return await m.reply_text(f'Participant "{target}" not found.')
+            participants = [row]
+
+        if not participants:
+            return await m.reply_text("No participants found.")
+
+        # Picks map (participant_id, game_id) -> selected_team
+        picks = _db.session.execute(_text("""
+            SELECT p.participant_id, p.game_id, p.selected_team
+            FROM picks p
+            WHERE p.game_id IN (
+                SELECT g.id
+                FROM games g JOIN weeks w ON w.id=g.week_id
+                WHERE w.season_year=:y AND w.week_number=:w
+            )
+        """), {"y": season, "w": week}).mappings().all()
+
+        pick_map = {}
+        for r in picks:
+            if r["selected_team"]:
+                pick_map[(r["participant_id"], r["game_id"])] = r["selected_team"]
+
+        # Build output
+        header = f"📊 Picks — Week {week} ({season})"
+        lines_out = [header, ""]
+        for g in games:
+            parts = []
+            for p in participants:
+                team = pick_map.get((p["id"], g["id"]), "—")
+                parts.append(f"{p['name']}: {team}")
+            lines_out.append(f"{g['away_team']} @ {g['home_team']} — " + ", ".join(parts))
+        body = "\n".join(lines_out)
+
+        # Always reply in invoking chat
+        await m.reply_text(body)
+
+        # Broadcast in 'all' mode: DM each participant with the full grid
+        if is_all:
+            sent = 0
+            for p in participants:
+                if p["telegram_chat_id"]:
+                    try:
+                        _send_message(p["telegram_chat_id"], body)
+                        sent += 1
+                    except Exception:
+                        logger.exception("Failed sending /seepicks to %s", p["name"])
+            await m.reply_text(f"✅ Sent to {sent} participant(s).")
+        else:
+            # Name mode: DM that person too if linked
+            p = participants[0]
+            if p["telegram_chat_id"]:
+                try:
+                    _send_message(p["telegram_chat_id"], body)
+                except Exception:
+                    logger.exception("Failed sending /seepicks to %s", p["name"])
+
 def run_telegram_listener():
     """Run polling listener so /start and button taps are processed."""
     if not TELEGRAM_BOT_TOKEN:
@@ -369,6 +496,7 @@ def run_telegram_listener():
     application.add_handler(CommandHandler("sendweek", sendweek_command))
     application.add_handler(CommandHandler("deletepicks", deletepicks_command))
     application.add_handler(CommandHandler("whoisleft", whoisleft_command))
+    application.add_handler(CommandHandler("seepicks", seepicks_command))
     application.add_handler(CommandHandler("remindweek", remindweek_command))
     application.run_polling()
 def _send_message(chat_id: str, text: str, reply_markup: dict | None = None):
