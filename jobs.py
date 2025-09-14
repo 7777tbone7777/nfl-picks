@@ -40,24 +40,24 @@ def fetch_espn_scoreboard(week: int, season_year: int):
     import httpx
     with httpx.Client(timeout=15.0, headers={"User-Agent": "nfl-picks-bot/1.0"}) as client:
     # Try both parameter styles ESPN uses. First that succeeds wins.
-    urls = [
+        urls = [
         f"{ESPN_SCOREBOARD_URL}?week={week}&year={season_year}&seasontype=2",
         f"{ESPN_SCOREBOARD_URL}?week={week}&dates={season_year}&seasontype=2",
-    ]
-    resp = None
-    for u in urls:
-        r = client.get(u)
-        if r.status_code < 400:
-            resp = r
-            break
-    if resp is None:
+        ]
+        resp = None
+        for u in urls:
+            r = client.get(u)
+            if r.status_code < 400:
+                resp = r
+                break
+        if resp is None:
         # propagate the last error for visibility
-        r.raise_for_status()
-    data = resp.json()
-    try:
-        logger.info("ESPN scoreboard URL used: %s", str(resp.request.url))
-    except Exception:
-        pass
+            r.raise_for_status()
+        data = resp.json()
+        try:
+            logger.info("ESPN scoreboard URL used: %s", str(resp.request.url))
+        except Exception:
+            pass
 
     out = []
     for ev in data.get("events", []):
