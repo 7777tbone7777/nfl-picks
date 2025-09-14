@@ -231,58 +231,86 @@ def cron_syncscores() -> dict:
     using BOTH DB signals and ESPN state, then sync from ESPN.
     """
     from sqlalchemy import text as _text
+
     app = create_app()
     with app.app_context():
-        # Prefer ESPN-reported current season/week when available
+        # 1) Ask ESPN for the current season/week (best signal)
         espn_year = espn_type = espn_week = None
         try:
             espn_year, espn_type, espn_week = detect_current_context()
             logger.info(f"ESPN context -> year={espn_year} type={espn_type} week={espn_week}")
         except Exception:
             logger.exception("detect_current_context failed")
-        # Choose season: use ESPN's season if present in DB; else fall back to MAX(season_year)
+
+        # 2) Choose the season: prefer ESPN's season if our DB has it; else MAX(season_year)
         season = None
         if espn_year is not None:
             has_espn_season = db.session.execute(
-                _text("SELECT 1 FROM weeks WHERE season_year=:y LIMIT 1"), {"y": espn_year}
+                _text("SELECT 1 FROM weeks WHERE season_year=:y LIMIT 1"),
+                {"y": espn_year},
             ).scalar()
-          if has_espn_season is not None:
-              season = espn_year
+            if has_espn_season is not None:
+                season = espn_year
+
         if season is None:
-           season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+            season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+
         if not season:
-           logger.warning("cron_syncscores: no season_year in weeks")
-           return {"error": "no season_year in weeks"}
+            logger.warning("cron_syncscores: no season_year in weeks")
+            return {"error": "no season_year in weeks"}
+
+        # 3) Get the list of week numbers for this season (DESC so newest first)
+        weeks_rows = db.session.execute(
+            _text("SELECT week_number FROM weeks WHERE season_year=:y ORDER BY week_number DESC"),
+            {"y": season},
+        ).all()
+        weeks = [r[0] for r in weeks_rows]
+        if not weeks:
+            logger.warning("cron_syncscores: no weeks found for season %s", season)
+            return {"error": f"no weeks found for season {season}"}
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-        # If ESPN current week exists in DB, take it; otherwise keep None and evaluate below
+        # If ESPN's "current week" exists in our DB, try that first
         chosen = espn_week if (espn_week is not None and espn_week in weeks) else None
-        for w in weeks:
-            # DB signals: any final/in_progress or scored, OR kickoff has passed
-            stats = db.session.execute(_text("""
-                SELECT
-                  SUM(CASE WHEN g.status IN ('final','in_progress')
-                            OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL)
-                           THEN 1 ELSE 0 END) AS progressed,
-                  MIN(g.game_time) AS first_kick
-                FROM games g
-                JOIN weeks wk ON wk.id = g.week_id
-                WHERE wk.season_year=:y AND wk.week_number=:w
-            """), {"y": season, "w": w}).mappings().first()
 
-            db_active = (int(stats["progressed"] or 0) > 0) or (
-                stats["first_kick"] is not None and stats["first_kick"] <= now
-            )
+        # 4) Walk weeks newest->oldest and see which one is "active" by DB or ESPN
+        for w in weeks:
+            # DB signals: any final/in_progress or any scored game, OR kickoff has passed
+            stats = db.session.execute(
+                _text(
+                    """
+                    SELECT
+                      SUM(
+                        CASE
+                          WHEN g.status IN ('final','in_progress')
+                               OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL)
+                          THEN 1 ELSE 0
+                        END
+                      ) AS progressed,
+                      MIN(g.game_time) AS first_kick
+                    FROM games g
+                    JOIN weeks wk ON wk.id = g.week_id
+                    WHERE wk.season_year=:y AND wk.week_number=:w
+                    """
+                ),
+                {"y": season, "w": w},
+            ).mappings().first()
+
+            db_active = False
+            if stats:
+                progressed = int(stats["progressed"] or 0)
+                first_kick = stats["first_kick"]
+                db_active = (progressed > 0) or (first_kick is not None and first_kick <= now)
 
             # ESPN signals: any event state in ('in','post') or any non-null scores
             espn_active = False
             try:
-                evs = fetch_espn_scoreboard(w, season)
+                events = fetch_espn_scoreboard(w, season)
                 espn_active = any(
-                    (e.get("state") in ("in", "post")) or
-                    (e.get("home_score") is not None and e.get("away_score") is not None)
-                    for e in evs
+                    (e.get("state") in ("in", "post"))
+                    or (e.get("home_score") is not None and e.get("away_score") is not None)
+                    for e in events
                 )
             except Exception:
                 logger.exception("cron_syncscores: ESPN probe failed for week %s", w)
@@ -291,8 +319,8 @@ def cron_syncscores() -> dict:
                 chosen = w
                 break
 
+        # 5) Fallback: if nothing tripped, take the highest week (first in DESC list)
         if chosen is None:
-            # Fallback: highest week in season (shouldn’t happen often)
             chosen = weeks[0]
 
     summary = sync_week_scores_from_espn(chosen, season)
