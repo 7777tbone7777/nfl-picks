@@ -354,6 +354,214 @@ async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 sent_total += 1
 
     await m.reply_text(f"📨 Reminders sent: {sent_total} game messages.")
+async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /getscores <week_number> [all]
+
+    Shows each participant's wins/losses for the specified week based on
+    games that have a recorded winner (i.e., completed so far).
+    If 'all' is provided, also DM the same scoreboard to every participant.
+    """
+    m = update.effective_message
+    chat_id = str(update.effective_chat.id)
+    args = context.args or []
+
+    if not args:
+        return await m.reply_text("Usage: /getscores <week_number> [all]")
+
+    # Parse week
+    try:
+        week = int(args[0])
+    except ValueError:
+        return await m.reply_text("Week must be an integer, e.g. /getscores 2")
+
+    broadcast = (len(args) > 1 and args[1].lower() == "all")
+
+    from flask_app import create_app, db as _db
+    app = create_app()
+    with app.app_context():
+        # Admin guard (only Tony's Telegram chat may invoke)
+        is_admin = _db.session.execute(_text("""
+            SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
+        """), {"c": chat_id}).scalar() is not None
+        if not is_admin:
+            return await m.reply_text("Sorry, this command is restricted.")
+
+        # Resolve season for this week (latest)
+        season = _db.session.execute(_text("""
+            SELECT season_year FROM weeks
+            WHERE week_number=:w
+            ORDER BY season_year DESC
+            LIMIT 1
+        """), {"w": week}).scalar()
+        if not season:
+            return await m.reply_text(f"Week {week} not found in table weeks.")
+
+        # Completed games in this week
+        total_completed = _db.session.execute(_text("""
+            SELECT COUNT(*)
+            FROM games g
+            JOIN weeks w ON w.id = g.week_id
+            WHERE w.season_year=:y AND w.week_number=:w AND g.winner IS NOT NULL
+        """), {"y": season, "w": week}).scalar() or 0
+
+        if total_completed == 0:
+            return await m.reply_text(f"No games completed yet for Week {week} ({season}).")
+
+        # Per-participant wins/losses for completed games
+        rows = _db.session.execute(_text("""
+            WITH wg AS (
+              SELECT g.id, g.winner
+              FROM games g
+              JOIN weeks w ON w.id = g.week_id
+              WHERE w.season_year=:y AND w.week_number=:w AND g.winner IS NOT NULL
+            )
+            SELECT u.id,
+                   u.name,
+                   u.telegram_chat_id,
+                   COALESCE(SUM(CASE WHEN p.selected_team = wg.winner THEN 1 ELSE 0 END), 0) AS wins,
+                   COALESCE(SUM(CASE WHEN p.selected_team IS NOT NULL AND p.selected_team <> wg.winner THEN 1 ELSE 0 END), 0) AS losses
+            FROM participants u
+            LEFT JOIN picks p ON p.participant_id = u.id
+            LEFT JOIN wg ON wg.id = p.game_id
+            GROUP BY u.id, u.name, u.telegram_chat_id
+            ORDER BY wins DESC, u.name
+        """), {"y": season, "w": week}).mappings().all()
+
+        title = f"📈 Scoreboard — Week {week} ({season})  [completed games: {total_completed}]"
+        body_lines = [title, ""]
+        for r in rows:
+            body_lines.append(f"• {r['name']}: {int(r['wins'])}-{int(r['losses'])}")
+        body = "\n".join(body_lines)
+
+        # Reply in invoking chat
+        await m.reply_text(body)
+
+        # Optional broadcast
+        if broadcast:
+            sent = 0
+            for r in rows:
+                if r["telegram_chat_id"]:
+                    try:
+                        _send_message(r["telegram_chat_id"], body)
+                        sent += 1
+                    except Exception:
+                        logger.exception("Failed sending /getscores to %s", r["name"])
+            await m.reply_text(f"✅ Sent scoreboard to {sent} participant(s).")
+async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /seasonboard [all]
+
+    Shows a season-to-date scoreboard: per-week wins per participant and total,
+    ordered by total wins. Includes only completed games (games with a winner).
+    If 'all' is provided, DM the same board to every participant.
+    """
+    m = update.effective_message
+    chat_id = str(update.effective_chat.id)
+    args = context.args or []
+    broadcast = (len(args) >= 1 and args[0].lower() == "all")
+
+    from flask_app import create_app, db as _db
+    app = create_app()
+    with app.app_context():
+        # Admin guard
+        is_admin = _db.session.execute(_text("""
+            SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
+        """), {"c": chat_id}).scalar() is not None
+        if not is_admin:
+            return await m.reply_text("Sorry, this command is restricted.")
+
+        # Latest season
+        season = _db.session.execute(_text("""
+            SELECT MAX(season_year) FROM weeks
+        """)).scalar()
+        if not season:
+            return await m.reply_text("No season data found in weeks table.")
+
+        # All week numbers in season (ordered)
+        weeks = [r[0] for r in _db.session.execute(_text("""
+            SELECT DISTINCT week_number
+            FROM weeks
+            WHERE season_year=:y
+            ORDER BY week_number
+        """), {"y": season}).fetchall()]
+        if not weeks:
+            return await m.reply_text(f"No weeks found for season {season}.")
+
+        # Compute wins per participant per week for completed games
+        rows = _db.session.execute(_text("""
+            WITH wg AS (
+              SELECT w.week_number, g.id, g.winner
+              FROM games g
+              JOIN weeks w ON w.id = g.week_id
+              WHERE w.season_year=:y AND g.winner IS NOT NULL
+            )
+            SELECT u.id,
+                   u.name,
+                   u.telegram_chat_id,
+                   wg.week_number,
+                   COALESCE(SUM(CASE WHEN p.selected_team = wg.winner THEN 1 ELSE 0 END), 0) AS wins
+            FROM participants u
+            LEFT JOIN picks p ON p.participant_id = u.id
+            LEFT JOIN wg ON wg.id = p.game_id
+            GROUP BY u.id, u.name, u.telegram_chat_id, wg.week_number
+            ORDER BY u.name, wg.week_number
+        """), {"y": season}).mappings().all()
+
+        # Organize into dict: name -> {week_number: wins}
+        pdata = {}
+        chat_ids = {}
+        for r in rows:
+            name = r["name"]
+            if name not in pdata:
+                pdata[name] = {}
+                chat_ids[name] = r["telegram_chat_id"]
+            wk = r["week_number"]
+            if wk is not None:
+                pdata[name][wk] = int(r["wins"])
+
+        # Ensure all participants appear even if they have no completed wins yet
+        missing_participants = _db.session.execute(_text("""
+            SELECT id, name, telegram_chat_id FROM participants
+        """)).mappings().all()
+        for rp in missing_participants:
+            pdata.setdefault(rp["name"], {})
+            chat_ids.setdefault(rp["name"], rp["telegram_chat_id"])
+
+        # Build table lines
+        names = sorted(pdata.keys())
+        totals = {n: sum(pdata[n].get(w, 0) for w in weeks) for n in names}
+        names.sort(key=lambda n: (-totals[n], n))  # by total desc, then name
+
+        header = "🏆 Season-to-date Scoreboard"
+        sub = f"Season {season} — completed games only"
+        col_wks = " ".join(f"W{w}" for w in weeks)
+        title = f"{header}\n{sub}\n\nName   {col_wks}  | Total"
+
+        lines = [title]
+        for n in names:
+            wk_counts = [str(pdata[n].get(w, 0)) for w in weeks]
+            line = f"{n}: " + " ".join(wk_counts) + f"  | {totals[n]}"
+            lines.append(line)
+
+        body = "\n".join(lines)
+
+        await m.reply_text(body)
+
+        if broadcast:
+            sent = 0
+            for n in names:
+                cid = chat_ids.get(n)
+                if cid:
+                    try:
+                        _send_message(cid, body)
+                        sent += 1
+                    except Exception:
+                        logger.exception("Failed sending /seasonboard to %s", n)
+            await m.reply_text(f"✅ Sent season board to {sent} participant(s).")
+
 
 async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -494,6 +702,8 @@ def run_telegram_listener():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_pick))
     application.add_handler(CommandHandler("sendweek", sendweek_command))
+    application.add_handler(CommandHandler("getscores", getscores_command))
+    application.add_handler(CommandHandler("seasonboard", seasonboard_command))
     application.add_handler(CommandHandler("deletepicks", deletepicks_command))
     application.add_handler(CommandHandler("whoisleft", whoisleft_command))
     application.add_handler(CommandHandler("seepicks", seepicks_command))
