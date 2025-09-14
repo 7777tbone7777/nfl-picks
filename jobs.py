@@ -151,17 +151,30 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         has_winner_col = False
 
     # Pull DB games for the target week
-    rows = db.session.execute(
-        _text("""
-            SELECT g.id, g.away_team, g.home_team,
-                   g.status, g.home_score, g.away_score
-            FROM games g
-            JOIN weeks wk ON wk.id = g.week_id
-            WHERE wk.season_year = :y AND wk.week_number = :w
-            ORDER BY g.game_time
-        """),
-        {"y": season_year, "w": week},
-    ).mappings().all()
+    if has_winner_col:
+        rows = db.session.execute(
+            _text("""
+                SELECT g.id, g.away_team, g.home_team,
+                       g.status, g.home_score, g.away_score, g.winner
+                FROM games g
+                JOIN weeks wk ON wk.id = g.week_id
+                WHERE wk.season_year = :y AND wk.week_number = :w
+                ORDER BY g.game_time
+            """),
+            {"y": season_year, "w": week},
+        ).mappings().all()
+    else:
+        rows = db.session.execute(
+            _text("""
+                SELECT g.id, g.away_team, g.home_team,
+                       g.status, g.home_score, g.away_score
+                FROM games g
+                JOIN weeks wk ON wk.id = g.week_id
+                WHERE wk.season_year = :y AND wk.week_number = :w
+                ORDER BY g.game_time
+            """),
+            {"y": season_year, "w": week},
+        ).mappings().all()
 
     linkable = 0      # how many DB games had a corresponding ESPN event
     changed = 0       # how many DB rows we actually modified this run
@@ -202,6 +215,7 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         cur_status = r["status"]
         cur_home_score = r["home_score"]
         cur_away_score = r["away_score"]
+        cur_winner = r.get("winner") if has_winner_col else None
 
         # Determine winner from ESPN scores (if present)
         new_winner = None
@@ -228,8 +242,8 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         if ("home_score" in params) or ("away_score" in params):
             updated_scores += 1
 
-        # Winner (only if column exists and we have a decisive score)
-        if has_winner_col and new_winner:
+        # Winner (only if column exists, decisive score, and value actually changes)
+        if has_winner_col and new_winner and (cur_winner != new_winner):
             sets.append("winner = :winner")
             params["winner"] = new_winner
             updated_winner += 1
@@ -262,7 +276,7 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         "missing_in_espn": missing_in_espn,
         "unmatched_espn": unmatched_espn,
     }
-    return out
+
 def cron_syncscores() -> dict:
     """
     Pick the latest week that is actually active (in-progress or completed)
