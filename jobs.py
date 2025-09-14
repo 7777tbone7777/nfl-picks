@@ -213,8 +213,8 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
     return out
 def cron_syncscores() -> dict:
     """
-    Pick the latest season + latest week in your DB and sync from ESPN.
-    Safe to run repeatedly; returns the same summary dict as sync_week_scores_from_espn.
+    Pick the latest week that is actually active (in-progress or completed)
+    using BOTH DB signals and ESPN state, then sync from ESPN.
     """
     from sqlalchemy import text as _text
     app = create_app()
@@ -224,42 +224,57 @@ def cron_syncscores() -> dict:
             logger.warning("cron_syncscores: no season_year in weeks")
             return {"error": "no season_year in weeks"}
 
+        # Candidate weeks, newest -> oldest
+        weeks = [r[0] for r in db.session.execute(_text("""
+            SELECT DISTINCT week_number
+            FROM weeks
+            WHERE season_year=:y
+            ORDER BY week_number DESC
+        """), {"y": season}).fetchall()]
+        if not weeks:
+            return {"error": f"no week_number for season {season}"}
+
         now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-        row = db.session.execute(_text("""
-            WITH weeks_in_season AS (
-              SELECT week_number
-              FROM weeks
-              WHERE season_year = :y
-            ),
-            active_weeks AS (
-              SELECT w.week_number
-              FROM weeks w
-              JOIN games g ON g.week_id = w.id
-              WHERE w.season_year = :y
-              GROUP BY w.week_number
-              HAVING SUM(
-                CASE
-                  WHEN g.status IN ('final','in_progress')
-                    OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL)
-                    OR (g.game_time IS NOT NULL AND g.game_time <= :now)
-                  THEN 1 ELSE 0
-                END
-              ) > 0
+        chosen = None
+        for w in weeks:
+            # DB signals: any final/in_progress or scored, OR kickoff has passed
+            stats = db.session.execute(_text("""
+                SELECT
+                  SUM(CASE WHEN g.status IN ('final','in_progress')
+                            OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL)
+                           THEN 1 ELSE 0 END) AS progressed,
+                  MIN(g.game_time) AS first_kick
+                FROM games g
+                JOIN weeks wk ON wk.id = g.week_id
+                WHERE wk.season_year=:y AND wk.week_number=:w
+            """), {"y": season, "w": w}).mappings().first()
+
+            db_active = (int(stats["progressed"] or 0) > 0) or (
+                stats["first_kick"] is not None and stats["first_kick"] <= now
             )
-            SELECT COALESCE(
-              (SELECT MAX(week_number) FROM active_weeks),
-              (SELECT MAX(week_number) FROM weeks_in_season)
-            ) AS week_number
-        """), {"y": season, "now": now}).mappings().first()
 
-        week = row["week_number"] if row else None
-        if not week:
-            logger.warning("cron_syncscores: no week_number for season %s", season)
-            return {"error": f"no week_number for season {season}"}
-            return {"error": f"no week_number for season {season}"}
+            # ESPN signals: any event state in ('in','post') or any non-null scores
+            espn_active = False
+            try:
+                evs = fetch_espn_scoreboard(w, season)
+                espn_active = any(
+                    (e.get("state") in ("in", "post")) or
+                    (e.get("home_score") is not None and e.get("away_score") is not None)
+                    for e in evs
+                )
+            except Exception:
+                logger.exception("cron_syncscores: ESPN probe failed for week %s", w)
 
-    summary = sync_week_scores_from_espn(week, season)
+            if db_active or espn_active:
+                chosen = w
+                break
+
+        if chosen is None:
+            # Fallback: highest week in season (shouldn’t happen often)
+            chosen = weeks[0]
+
+    summary = sync_week_scores_from_espn(chosen, season)
     logger.info("cron_syncscores summary: %s", summary)
     return summary
 
