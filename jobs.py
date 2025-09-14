@@ -234,7 +234,7 @@ def cron_syncscores() -> dict:
 
     app = create_app()
     with app.app_context():
-        # 1) Ask ESPN for the current season/week (best signal)
+        # 1) ESPN current context
         espn_year = espn_type = espn_week = None
         try:
             espn_year, espn_type, espn_week = detect_current_context()
@@ -242,7 +242,7 @@ def cron_syncscores() -> dict:
         except Exception:
             logger.exception("detect_current_context failed")
 
-        # 2) Choose the season: prefer ESPN's season if our DB has it; else MAX(season_year)
+        # 2) Season selection
         season = None
         if espn_year is not None:
             has_espn_season = db.session.execute(
@@ -251,15 +251,13 @@ def cron_syncscores() -> dict:
             ).scalar()
             if has_espn_season is not None:
                 season = espn_year
-
         if season is None:
             season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
-
         if not season:
             logger.warning("cron_syncscores: no season_year in weeks")
             return {"error": "no season_year in weeks"}
 
-        # 3) Get the list of week numbers for this season (DESC so newest first)
+        # 3) Weeks list (DESC)
         weeks_rows = db.session.execute(
             _text("SELECT week_number FROM weeks WHERE season_year=:y ORDER BY week_number DESC"),
             {"y": season},
@@ -271,12 +269,20 @@ def cron_syncscores() -> dict:
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-        # If ESPN's "current week" exists in our DB, try that first
+        # Prefer ESPN's week if present in DB
         chosen = espn_week if (espn_week is not None and espn_week in weeks) else None
 
-        # 4) Walk weeks newest->oldest and see which one is "active" by DB or ESPN
-        for w in weeks:
-            # DB signals: any final/in_progress or any scored game, OR kickoff has passed
+        # 4) Only scan if we don't already have ESPN's week;
+        #    and never allow a FUTURE week (> espn_week) to override
+        if chosen is None:
+            scan_weeks = weeks
+            if espn_week is not None:
+                scan_weeks = [w for w in weeks if w <= espn_week]
+        else:
+            scan_weeks = []
+
+        for w in scan_weeks:
+            # DB signals
             stats = db.session.execute(
                 _text(
                     """
@@ -303,14 +309,14 @@ def cron_syncscores() -> dict:
                 first_kick = stats["first_kick"]
                 db_active = (progressed > 0) or (first_kick is not None and first_kick <= now)
 
-            # ESPN signals: any event state in ('in','post') or any non-null scores
+            # ESPN signals
             espn_active = False
             try:
-                events = fetch_espn_scoreboard(w, season)
+                evs = fetch_espn_scoreboard(w, season)
                 espn_active = any(
                     (e.get("state") in ("in", "post"))
                     or (e.get("home_score") is not None and e.get("away_score") is not None)
-                    for e in events
+                    for e in evs
                 )
             except Exception:
                 logger.exception("cron_syncscores: ESPN probe failed for week %s", w)
@@ -319,7 +325,7 @@ def cron_syncscores() -> dict:
                 chosen = w
                 break
 
-        # 5) Fallback: if nothing tripped, take the highest week (first in DESC list)
+        # Fallback
         if chosen is None:
             chosen = weeks[0]
 
