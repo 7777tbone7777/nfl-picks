@@ -117,113 +117,151 @@ def fetch_espn_scoreboard(week: int, season_year: int):
             # Be resilient to any weird ESPN edge cases
             continue
     return out
-
 def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
     """
-    Pull ESPN week data (from Step 1's fetch_espn_scoreboard) and UPDATE games in our DB.
-    Idempotent:
-      - Only writes fields that actually changed.
-      - Never regresses status (won't move final -> in_progress).
-      - Never overwrites existing scores/winner with NULL.
-    Returns a summary dict with counts.
+    Pull ESPN events for (season_year, week), match to DB games by team names,
+    update scores/status (and winner if present), and return a summary.
+    Adds `linkable` = # of DB games that had a matching ESPN event.
+    Keeps `matched` semantics as "rows changed this run" for backward-compatibility.
     """
     from sqlalchemy import text as _text
-    from flask_app import create_app
 
-    def _rank_status(s: str | None) -> int:
-        s = (s or "").lower()
-        if s in ("final", "post"):
-            return 3
-        if s in ("in", "in_progress", "live"):
-            return 2
-        return 1  # pre/scheduled/unknown
+    # Fetch ESPN events
+    events = fetch_espn_scoreboard(week, season_year)
 
-    app = create_app()
-    out = {
-        "season_year": season_year,
-        "week": week,
-        "total_games": 0,
-        "matched": 0,
-        "updated_scores": 0,
-        "updated_winner": 0,
-        "updated_status": 0,
-        "missing_in_espn": [],
-        "unmatched_espn": [],
-    }
+    # Build a case-insensitive lookup: (away, home) -> event
+    es_map = {}
+    for e in events:
+        a = (e.get("away_team") or "").strip().lower()
+        h = (e.get("home_team") or "").strip().lower()
+        es_map[(a, h)] = e
+    es_keys_remaining = set(es_map.keys())
 
-    with app.app_context():
-        # --- ESPN events (requires Step 1 helper) ---
-        events = fetch_espn_scoreboard(week, season_year)
-        es_map = {(e["away_team"], e["home_team"]): e for e in events}
-        seen_keys = set()
+    # Do we have a 'winner' column? (Postgres information_schema)
+    try:
+        has_winner_col = db.session.execute(
+            _text("""
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'games' AND column_name = 'winner'
+                LIMIT 1
+            """)
+        ).scalar() is not None
+    except Exception:
+        has_winner_col = False
 
-        # --- DB games for this week ---
-        rows = db.session.execute(_text("""
+    # Pull DB games for the target week
+    rows = db.session.execute(
+        _text("""
             SELECT g.id, g.away_team, g.home_team,
-                   g.away_score, g.home_score, g.status, g.winner
+                   g.status, g.home_score, g.away_score
             FROM games g
-            JOIN weeks w ON w.id = g.week_id
-            WHERE w.season_year = :y AND w.week_number = :w
+            JOIN weeks wk ON wk.id = g.week_id
+            WHERE wk.season_year = :y AND wk.week_number = :w
             ORDER BY g.game_time
-        """), {"y": season_year, "w": week}).mappings().all()
-        out["total_games"] = len(rows)
+        """),
+        {"y": season_year, "w": week},
+    ).mappings().all()
 
-        for r in rows:
-            key = (r["away_team"], r["home_team"])
-            ev = es_map.get(key)
-            if not ev:
-                out["missing_in_espn"].append(f"{r['away_team']} @ {r['home_team']}")
-                continue
-            seen_keys.add(key)
+    linkable = 0      # how many DB games had a corresponding ESPN event
+    changed = 0       # how many DB rows we actually modified this run
+    updated_scores = 0
+    updated_status = 0
+    updated_winner = 0
 
-            # ESPN values
-            hs = ev.get("home_score")
-            as_ = ev.get("away_score")
-            state = (ev.get("state") or "").lower()   # "pre" | "in" | "post"
-            win = ev.get("winner")
+    missing_in_espn = []   # DB games we couldn't find on ESPN
+    matched_keys = set()
 
-            # Decide desired status (never regress)
-            desired_status = "final" if state == "post" else ("in_progress" if state in ("in", "live") else None)
-            need_status = False
-            target_status = None
-            if desired_status and _rank_status(r["status"]) < _rank_status(desired_status):
-                need_status = True
-                target_status = "final" if desired_status == "final" else "in_progress"
+    # Map ESPN state -> our DB status
+    state_to_status = {"pre": "scheduled", "in": "in_progress", "post": "final"}
 
-            # Only update values that are non-NULL and changed
-            sets, params = [], {"id": r["id"]}
-            if hs is not None and hs != r["home_score"]:
-                sets.append("home_score = :hs")
-                params["hs"] = hs
-            if as_ is not None and as_ != r["away_score"]:
-                sets.append("away_score = :as_")
-                params["as_"] = as_
-            if win and win != r["winner"]:
-                sets.append("winner = :winner")
-                params["winner"] = win
-            if need_status:
-                sets.append("status = :st")
-                params["st"] = target_status
+    for r in rows:
+        db_id = r["id"]
+        db_away = (r["away_team"] or "").strip()
+        db_home = (r["home_team"] or "").strip()
+        key = (db_away.lower(), db_home.lower())
 
-            if not sets:
-                out["matched"] += 1
-                continue
+        ev = es_map.get(key)
+        if not ev:
+            missing_in_espn.append(f"{db_away} @ {db_home}")
+            continue
 
-            sql = "UPDATE games SET " + ", ".join(sets) + " WHERE id = :id"
+        # Found a linkable pair
+        linkable += 1
+        matched_keys.add(key)
+        if key in es_keys_remaining:
+            es_keys_remaining.remove(key)
+
+        # ESPN values
+        es_state = (ev.get("state") or "").lower()
+        es_status = state_to_status.get(es_state)  # None if unknown
+        es_home_score = ev.get("home_score")
+        es_away_score = ev.get("away_score")
+
+        # Current DB values
+        cur_status = r["status"]
+        cur_home_score = r["home_score"]
+        cur_away_score = r["away_score"]
+
+        # Determine winner from ESPN scores (if present)
+        new_winner = None
+        if isinstance(es_home_score, int) and isinstance(es_away_score, int) and es_home_score != es_away_score:
+            new_winner = db_home if es_home_score > es_away_score else db_away
+
+        # Build updates
+        sets = []
+        params = {"id": db_id}
+
+        # Status
+        if es_status and es_status != cur_status:
+            sets.append("status = :status")
+            params["status"] = es_status
+            updated_status += 1
+
+        # Scores
+        if es_home_score is not None and es_home_score != cur_home_score:
+            sets.append("home_score = :home_score")
+            params["home_score"] = es_home_score
+        if es_away_score is not None and es_away_score != cur_away_score:
+            sets.append("away_score = :away_score")
+            params["away_score"] = es_away_score
+        if ("home_score" in params) or ("away_score" in params):
+            updated_scores += 1
+
+        # Winner (only if column exists and we have a decisive score)
+        if has_winner_col and new_winner:
+            sets.append("winner = :winner")
+            params["winner"] = new_winner
+            updated_winner += 1
+
+        if sets:
+            sql = f"UPDATE games SET {', '.join(sets)} WHERE id = :id"
             db.session.execute(_text(sql), params)
+            changed += 1
 
-            if "hs" in params or "as_" in params:
-                out["updated_scores"] += 1
-            if "winner" in params:
-                out["updated_winner"] += 1
-            if "st" in params:
-                out["updated_status"] += 1
-
+    # Commit once at the end for performance
+    if changed:
         db.session.commit()
 
-        # Any ESPN events we didn't have in DB (nice-to-know)
-        out["unmatched_espn"] = [f"{a} @ {h}" for (a, h) in es_map.keys() - seen_keys]
+    # ESPN events that didn't find a DB counterpart
+    unmatched_espn = []
+    for a, h in es_keys_remaining:
+        # Pretty format using original-cased names if available
+        e = es_map[(a, h)]
+        unmatched_espn.append(f"{e.get('away_team','?')} @ {e.get('home_team','?')}")
 
+    return {
+        "season_year": season_year,
+        "week": week,
+        "total_games": len(rows),
+        "linkable": linkable,           # NEW: how many DB games were matchable by names
+        "matched": changed,             # kept semantics: rows actually changed this run
+        "updated_scores": updated_scores,
+        "updated_winner": updated_winner if has_winner_col else 0,
+        "updated_status": updated_status,
+        "missing_in_espn": missing_in_espn,
+        "unmatched_espn": unmatched_espn,
+    }
     return out
 def cron_syncscores() -> dict:
     """
