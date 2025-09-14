@@ -29,6 +29,7 @@ def cron_send_upcoming_week() -> dict:
     Find the next week whose first kickoff is in the future, then broadcast
     that week's pick buttons to all participants with telegram_chat_id.
     Runs ONLY on Tuesday (America/Los_Angeles) unless ALLOW_ANYDAY=1.
+    Skips if this season/week was already broadcast (dedupe).
     """
     from sqlalchemy import text as _text
     from datetime import datetime, timezone
@@ -37,6 +38,12 @@ def cron_send_upcoming_week() -> dict:
 
     app = create_app()
     with app.app_context():
+        # ---- Optional one-off block (quick kill switch) ----
+        block_week = os.getenv("BLOCK_WEEK")
+        if block_week:
+            logger.info("cron_send_upcoming_week: BLOCK_WEEK=%s set, skipping", block_week)
+            return {"status": "skipped_block_week", "block_week": block_week}
+
         # ---- Tuesday (PT) guard ----
         if os.getenv("ALLOW_ANYDAY") not in ("1", "true", "TRUE"):
             now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
@@ -44,9 +51,19 @@ def cron_send_upcoming_week() -> dict:
                 logger.info("cron_send_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
                 return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
 
-        # Use naive UTC for DB comparisons (matches how game_time is used elsewhere)
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        # ---- Ensure a dedupe table exists ----
+        db.session.execute(_text("""
+            CREATE TABLE IF NOT EXISTS week_broadcasts (
+                season_year INTEGER NOT NULL,
+                week_number INTEGER NOT NULL,
+                sent_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (season_year, week_number)
+            )
+        """))
+        db.session.commit()
 
+        # ---- Choose upcoming week ----
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
         if not season:
             logger.warning("cron_send_upcoming_week: no season_year in weeks")
@@ -68,6 +85,16 @@ def cron_send_upcoming_week() -> dict:
 
         week = int(upcoming["week_number"])
         games_count = int(upcoming["games"])
+
+        # ---- Dedupe: already sent for this season/week? ----
+        already = db.session.execute(
+            _text("SELECT 1 FROM week_broadcasts WHERE season_year=:y AND week_number=:w LIMIT 1"),
+            {"y": season, "w": week},
+        ).scalar()
+        if already:
+            logger.info("cron_send_upcoming_week: already sent for season=%s week=%s, skipping", season, week)
+            return {"status": "skipped_duplicate", "season_year": season, "week": week}
+
         parts_count = db.session.execute(_text(
             "SELECT COUNT(*) FROM participants WHERE telegram_chat_id IS NOT NULL"
         )).scalar() or 0
@@ -77,8 +104,15 @@ def cron_send_upcoming_week() -> dict:
             week, season, parts_count, games_count
         )
 
-        # Send one message per game per participant with inline pick buttons
+        # ---- Send ----
         send_week_games(week, season)
+
+        # ---- Record the send ----
+        db.session.execute(
+            _text("INSERT INTO week_broadcasts (season_year, week_number) VALUES (:y, :w) ON CONFLICT DO NOTHING"),
+            {"y": season, "w": week},
+        )
+        db.session.commit()
 
         return {
             "season_year": season,
