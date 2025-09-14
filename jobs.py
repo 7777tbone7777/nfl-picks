@@ -90,6 +90,114 @@ def fetch_espn_scoreboard(week: int, season_year: int):
             continue
     return out
 
+def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
+    """
+    Pull ESPN week data (from Step 1's fetch_espn_scoreboard) and UPDATE games in our DB.
+    Idempotent:
+      - Only writes fields that actually changed.
+      - Never regresses status (won't move final -> in_progress).
+      - Never overwrites existing scores/winner with NULL.
+    Returns a summary dict with counts.
+    """
+    from sqlalchemy import text as _text
+    from flask_app import create_app
+
+    def _rank_status(s: str | None) -> int:
+        s = (s or "").lower()
+        if s in ("final", "post"):
+            return 3
+        if s in ("in", "in_progress", "live"):
+            return 2
+        return 1  # pre/scheduled/unknown
+
+    app = create_app()
+    out = {
+        "season_year": season_year,
+        "week": week,
+        "total_games": 0,
+        "matched": 0,
+        "updated_scores": 0,
+        "updated_winner": 0,
+        "updated_status": 0,
+        "missing_in_espn": [],
+        "unmatched_espn": [],
+    }
+
+    with app.app_context():
+        # --- ESPN events (requires Step 1 helper) ---
+        events = fetch_espn_scoreboard(week, season_year)
+        es_map = {(e["away_team"], e["home_team"]): e for e in events}
+        seen_keys = set()
+
+        # --- DB games for this week ---
+        rows = db.session.execute(_text("""
+            SELECT g.id, g.away_team, g.home_team,
+                   g.away_score, g.home_score, g.status, g.winner
+            FROM games g
+            JOIN weeks w ON w.id = g.week_id
+            WHERE w.season_year = :y AND w.week_number = :w
+            ORDER BY g.game_time
+        """), {"y": season_year, "w": week}).mappings().all()
+        out["total_games"] = len(rows)
+
+        for r in rows:
+            key = (r["away_team"], r["home_team"])
+            ev = es_map.get(key)
+            if not ev:
+                out["missing_in_espn"].append(f"{r['away_team']} @ {r['home_team']}")
+                continue
+            seen_keys.add(key)
+
+            # ESPN values
+            hs = ev.get("home_score")
+            as_ = ev.get("away_score")
+            state = (ev.get("state") or "").lower()   # "pre" | "in" | "post"
+            win = ev.get("winner")
+
+            # Decide desired status (never regress)
+            desired_status = "final" if state == "post" else ("in_progress" if state in ("in", "live") else None)
+            need_status = False
+            target_status = None
+            if desired_status and _rank_status(r["status"]) < _rank_status(desired_status):
+                need_status = True
+                target_status = "final" if desired_status == "final" else "in_progress"
+
+            # Only update values that are non-NULL and changed
+            sets, params = [], {"id": r["id"]}
+            if hs is not None and hs != r["home_score"]:
+                sets.append("home_score = :hs")
+                params["hs"] = hs
+            if as_ is not None and as_ != r["away_score"]:
+                sets.append("away_score = :as_")
+                params["as_"] = as_
+            if win and win != r["winner"]:
+                sets.append("winner = :winner")
+                params["winner"] = win
+            if need_status:
+                sets.append("status = :st")
+                params["st"] = target_status
+
+            if not sets:
+                out["matched"] += 1
+                continue
+
+            sql = "UPDATE games SET " + ", ".join(sets) + " WHERE id = :id"
+            db.session.execute(_text(sql), params)
+
+            if "hs" in params or "as_" in params:
+                out["updated_scores"] += 1
+            if "winner" in params:
+                out["updated_winner"] += 1
+            if "st" in params:
+                out["updated_status"] += 1
+
+        db.session.commit()
+
+        # Any ESPN events we didn't have in DB (nice-to-know)
+        out["unmatched_espn"] = [f"{a} @ {h}" for (a, h) in es_map.keys() - seen_keys]
+
+    return out
+
 def _now_utc_naive():
     """UTC 'now' as naive datetime to match 'timestamp without time zone' columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -264,6 +372,70 @@ async def deletepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         f'🧹 Deleted {deleted} pick(s) for "{name}" in Week {week} ({season}). '
         f'Previously existed: {existing}.'
     )
+async def syncscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /syncscores <week_number> [season_year]
+    Pull ESPN for that week/season and write scores/status/winner into DB.
+    Idempotent; safe to run repeatedly.
+    """
+    m = update.effective_message
+    chat_id = str(update.effective_chat.id)
+    args = context.args or []
+    if not args:
+        return await m.reply_text("Usage: /syncscores <week_number> [season_year]")
+
+    # Parse week
+    try:
+        week = int(args[0])
+    except ValueError:
+        return await m.reply_text("Week must be an integer, e.g. /syncscores 2")
+
+    # Optional season
+    season_year = None
+    if len(args) >= 2:
+        try:
+            season_year = int(args[1])
+        except ValueError:
+            return await m.reply_text("Season year must be an integer, e.g. 2025")
+
+    from flask_app import create_app
+    app = create_app()
+    with app.app_context():
+        # Admin guard: only Tony's chat ID can invoke
+        is_admin = db.session.execute(_text("""
+            SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
+        """), {"c": chat_id}).scalar() is not None
+        if not is_admin:
+            return await m.reply_text("Sorry, this command is restricted.")
+
+        # Resolve season if not passed
+        if season_year is None:
+            season_year = db.session.execute(_text("""
+                SELECT season_year FROM weeks
+                WHERE week_number=:w
+                ORDER BY season_year DESC LIMIT 1
+            """), {"w": week}).scalar()
+            if not season_year:
+                return await m.reply_text(f"Week {week} not found in weeks.")
+
+        summary = sync_week_scores_from_espn(week, season_year)
+
+    # Compact summary
+    lines = [
+        f"🔄 Synced ESPN → DB for Week {summary['week']} ({summary['season_year']})",
+        f"Games in DB: {summary['total_games']}  |  No change: {summary['matched']}",
+        f"Updated → scores: {summary['updated_scores']}  winner: {summary['updated_winner']}  status: {summary['updated_status']}",
+    ]
+    if summary["missing_in_espn"]:
+        samp = ", ".join(summary["missing_in_espn"][:3])
+        lines.append(f"Missing in ESPN ({len(summary['missing_in_espn'])}): {samp}{' …' if len(summary['missing_in_espn'])>3 else ''}")
+    if summary["unmatched_espn"]:
+        samp = ", ".join(summary["unmatched_espn"][:3])
+        lines.append(f"Extra on ESPN ({len(summary['unmatched_espn'])}): {samp}{' …' if len(summary['unmatched_espn'])>3 else ''}")
+
+    await m.reply_text("\n".join(lines))
+
 async def whoisleft_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     chat_id = str(update.effective_chat.id)
@@ -801,6 +973,7 @@ def run_telegram_listener():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_pick))
     application.add_handler(CommandHandler("sendweek", sendweek_command))
+    application.add_handler(CommandHandler("syncscores", syncscores_command))
     application.add_handler(CommandHandler("getscores", getscores_command))
     application.add_handler(CommandHandler("seasonboard", seasonboard_command))
     application.add_handler(CommandHandler("deletepicks", deletepicks_command))
