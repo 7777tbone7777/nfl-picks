@@ -3,7 +3,7 @@ import logging
 from zoneinfo import ZoneInfo
 import httpx
 import os, asyncio, logging
-import json
+import sys, json
 from telegram.ext import CommandHandler
 from sqlalchemy import text as _text
 from flask_app import create_app
@@ -23,6 +23,56 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS","").replace(" ","").spli
 # --- ESPN NFL scoreboard (read-only fetch) ---
 # Regular season = seasontype=2. Preseason(1), Postseason(3).
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+
+def cron_send_upcoming_week() -> dict:
+    """
+    Find the next week whose first kickoff is in the future, then broadcast
+    that week's pick buttons to all participants with telegram_chat_id.
+    """
+    from sqlalchemy import text as _text
+
+    app = create_app()
+    with app.app_context():
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+        if not season:
+            logger.warning("cron_send_upcoming_week: no season_year in weeks")
+            return {"error": "no season_year in weeks"}
+
+        rows = db.session.execute(_text("""
+            SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
+            FROM weeks w
+            JOIN games g ON g.week_id = w.id
+            WHERE w.season_year = :y
+            GROUP BY w.week_number
+            ORDER BY w.week_number
+        """), {"y": season}).mappings().all()
+
+        upcoming = next((r for r in rows if r["first_kick"] and r["first_kick"] > now), None)
+        if not upcoming:
+            logger.warning("cron_send_upcoming_week: no upcoming week found (all kicks <= now)")
+            return {"error": "no upcoming week found"}
+
+        week = int(upcoming["week_number"])
+        games_count = int(upcoming["games"])
+        parts_count = db.session.execute(_text("""
+            SELECT COUNT(*) FROM participants WHERE telegram_chat_id IS NOT NULL
+        """)).scalar() or 0
+
+        logger.info(f"Broadcasting Week {week} {season} to {parts_count} participants "
+                    f"({games_count} games)")
+
+        # This sends one message per game per participant with inline pick buttons
+        send_week_games(week, season)
+
+        return {
+            "season_year": season,
+            "week": week,
+            "participants": parts_count,
+            "games": games_count,
+            "status": "sent",
+        }
 
 def detect_current_context(timeout: float = 15.0):
     """
@@ -1354,23 +1404,47 @@ async def sendweek_command(update, context):
         await update.message.reply_text("✅ Done.")
 if __name__ == "__main__":
     import sys, json
-    if len(sys.argv) >= 2 and sys.argv[1] == "cron":
+
+    cmd = sys.argv[1] if len(sys.argv) >= 2 else None
+    if cmd == "cron":
+        # Sync the CURRENT week (auto-detected) from ESPN to DB
         print(json.dumps(cron_syncscores()))
-    elif len(sys.argv) >= 3 and sys.argv[1] == "syncscores":
-        try:
-            week = int(sys.argv[2])
-        except Exception:
-            raise SystemExit("Usage: python jobs.py syncscores <week> [season_year]")
-        season = int(sys.argv[3]) if len(sys.argv) >= 4 else None
-        if season is None:
+
+    elif cmd == "sendweek_upcoming":
+        # Auto-detect the next week (first kickoff > now) and broadcast picks
+        print(json.dumps(cron_send_upcoming_week()))
+
+    elif cmd == "sendweek":
+        # Manual broadcast: python jobs.py sendweek <week> [season_year]
+        if len(sys.argv) < 3:
+            raise SystemExit("Usage: python jobs.py sendweek <week> [season_year]")
+        week = int(sys.argv[2])
+        if len(sys.argv) >= 4:
+            season = int(sys.argv[3])
+        else:
             from sqlalchemy import text as _text
             app = create_app()
             with app.app_context():
-                season = db.session.execute(_text("""
-                    SELECT season_year FROM weeks WHERE week_number=:w
-                    ORDER BY season_year DESC LIMIT 1
-                """), {"w": week}).scalar()
+                season = db.session.execute(
+                    _text("""
+                        SELECT season_year
+                        FROM weeks
+                        WHERE week_number = :w
+                        ORDER BY season_year DESC
+                        LIMIT 1
+                    """),
+                    {"w": week},
+                ).scalar()
                 if not season:
-                    raise SystemExit(f"Week {week} not found.")
-        print(json.dumps(sync_week_scores_from_espn(week, season)))
+                    raise SystemExit(f"Week {week} not found in any season.")
+        send_week_games(week, season)
+        print(json.dumps({"season_year": season, "week": week, "status": "sent"}))
+
+    else:
+        raise SystemExit(
+            "Usage:\n"
+            "  python jobs.py cron\n"
+            "  python jobs.py sendweek_upcoming\n"
+            "  python jobs.py sendweek <week> [season_year]\n"
+        )
 
