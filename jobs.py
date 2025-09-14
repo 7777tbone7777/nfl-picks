@@ -280,7 +280,7 @@ def cron_syncscores() -> dict:
         except Exception:
             logger.exception("detect_current_context failed")
 
-        # 2) Season selection
+        # 2) Season selection (prefer ESPN's if present in DB)
         season = None
         if espn_year is not None:
             has_espn_season = db.session.execute(
@@ -367,9 +367,10 @@ def cron_syncscores() -> dict:
         if chosen is None:
             chosen = weeks[0]
 
-    summary = sync_week_scores_from_espn(chosen, season)
-    logger.info("cron_syncscores summary: %s", summary)
-    return summary
+        # 5) IMPORTANT: run sync **inside** app context
+        summary = sync_week_scores_from_espn(chosen, season)
+        logger.info("cron_syncscores summary: %s", summary)
+        return summary
 
 def _now_utc_naive():
     """UTC 'now' as naive datetime to match 'timestamp without time zone' columns."""
