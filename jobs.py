@@ -218,7 +218,7 @@ def cron_syncscores() -> dict:
     """
     from sqlalchemy import text as _text
     app = create_app()
-        with app.app_context():
+    with app.app_context():
         season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
         if not season:
             logger.warning("cron_syncscores: no season_year in weeks")
