@@ -22,7 +22,7 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS","").replace(" ","").spli
 
 # --- ESPN NFL scoreboard (read-only fetch) ---
 # Regular season = seasontype=2. Preseason(1), Postseason(3).
-ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
+ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 
 def fetch_espn_scoreboard(week: int, season_year: int):
     """
