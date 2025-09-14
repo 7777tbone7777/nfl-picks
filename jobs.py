@@ -218,16 +218,45 @@ def cron_syncscores() -> dict:
     """
     from sqlalchemy import text as _text
     app = create_app()
-    with app.app_context():
+        with app.app_context():
         season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
         if not season:
             logger.warning("cron_syncscores: no season_year in weeks")
             return {"error": "no season_year in weeks"}
-        week = db.session.execute(_text(
-            "SELECT MAX(week_number) FROM weeks WHERE season_year=:y"
-        ), {"y": season}).scalar()
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        row = db.session.execute(_text("""
+            WITH weeks_in_season AS (
+              SELECT week_number
+              FROM weeks
+              WHERE season_year = :y
+            ),
+            active_weeks AS (
+              SELECT w.week_number
+              FROM weeks w
+              JOIN games g ON g.week_id = w.id
+              WHERE w.season_year = :y
+              GROUP BY w.week_number
+              HAVING SUM(
+                CASE
+                  WHEN g.status IN ('final','in_progress')
+                    OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL)
+                    OR (g.game_time IS NOT NULL AND g.game_time <= :now)
+                  THEN 1 ELSE 0
+                END
+              ) > 0
+            )
+            SELECT COALESCE(
+              (SELECT MAX(week_number) FROM active_weeks),
+              (SELECT MAX(week_number) FROM weeks_in_season)
+            ) AS week_number
+        """), {"y": season, "now": now}).mappings().first()
+
+        week = row["week_number"] if row else None
         if not week:
             logger.warning("cron_syncscores: no week_number for season %s", season)
+            return {"error": f"no week_number for season {season}"}
             return {"error": f"no week_number for season {season}"}
 
     summary = sync_week_scores_from_espn(week, season)
