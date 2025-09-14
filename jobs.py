@@ -24,6 +24,20 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS","").replace(" ","").spli
 # Regular season = seasontype=2. Preseason(1), Postseason(3).
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 
+def detect_current_context(timeout: float = 15.0):
+    """
+    Hit ESPN's no-parameter scoreboard and return (year, season_type_int, week_number).
+    season_type_int: 1=pre, 2=reg, 3=post
+    """
+    with httpx.Client(timeout=timeout, headers={"User-Agent": "nfl-picks-bot/1.0"}) as client:
+        j = client.get(ESPN_SCOREBOARD_URL).json()
+    year = int(j["season"]["year"])
+    st = j["season"]["type"]
+    if isinstance(st, str):
+        st = {"pre": 1, "reg": 2, "post": 3}.get(st.lower(), 2)
+    week = int(j["week"]["number"])
+    return year, int(st), week
+
 def fetch_espn_scoreboard(week: int, season_year: int):
     """
     Returns a list of dicts like:
@@ -41,8 +55,8 @@ def fetch_espn_scoreboard(week: int, season_year: int):
     with httpx.Client(timeout=15.0, headers={"User-Agent": "nfl-picks-bot/1.0"}) as client:
     # Try both parameter styles ESPN uses. First that succeeds wins.
         urls = [
-        f"{ESPN_SCOREBOARD_URL}?week={week}&year={season_year}&seasontype=2",
         f"{ESPN_SCOREBOARD_URL}?week={week}&dates={season_year}&seasontype=2",
+        f"{ESPN_SCOREBOARD_URL}?week={week}&year={season_year}&seasontype=2",
         ]
         resp = None
         for u in urls:
@@ -219,24 +233,31 @@ def cron_syncscores() -> dict:
     from sqlalchemy import text as _text
     app = create_app()
     with app.app_context():
-        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+        # Prefer ESPN-reported current season/week when available
+        espn_year = espn_type = espn_week = None
+        try:
+            espn_year, espn_type, espn_week = detect_current_context()
+            logger.info(f"ESPN context -> year={espn_year} type={espn_type} week={espn_week}")
+        except Exception:
+            logger.exception("detect_current_context failed")
+        # Choose season: use ESPN's season if present in DB; else fall back to MAX(season_year)
+        season = None
+        if espn_year is not None:
+            has_espn_season = db.session.execute(
+                _text("SELECT 1 FROM weeks WHERE season_year=:y LIMIT 1"), {"y": espn_year}
+            ).scalar()
+          if has_espn_season is not None:
+              season = espn_year
+        if season is None:
+           season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
         if not season:
-            logger.warning("cron_syncscores: no season_year in weeks")
-            return {"error": "no season_year in weeks"}
-
-        # Candidate weeks, newest -> oldest
-        weeks = [r[0] for r in db.session.execute(_text("""
-            SELECT DISTINCT week_number
-            FROM weeks
-            WHERE season_year=:y
-            ORDER BY week_number DESC
-        """), {"y": season}).fetchall()]
-        if not weeks:
-            return {"error": f"no week_number for season {season}"}
+           logger.warning("cron_syncscores: no season_year in weeks")
+           return {"error": "no season_year in weeks"}
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-        chosen = None
+        # If ESPN current week exists in DB, take it; otherwise keep None and evaluate below
+        chosen = espn_week if (espn_week is not None and espn_week in weeks) else None
         for w in weeks:
             # DB signals: any final/in_progress or scored, OR kickoff has passed
             stats = db.session.execute(_text("""
