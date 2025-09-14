@@ -398,12 +398,17 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not season:
             return await m.reply_text(f"Week {week} not found in table weeks.")
 
-        # Completed games in this week
+                # Completed games in this week (explicit winner OR both scores set and not a tie)
         total_completed = _db.session.execute(_text("""
             SELECT COUNT(*)
             FROM games g
             JOIN weeks w ON w.id = g.week_id
-            WHERE w.season_year=:y AND w.week_number=:w AND g.winner IS NOT NULL
+            WHERE w.season_year=:y
+              AND w.week_number=:w
+              AND (
+                    g.winner IS NOT NULL
+                 OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score <> g.away_score)
+              )
         """), {"y": season, "w": week}).scalar() or 0
 
         if total_completed == 0:
@@ -412,10 +417,22 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Per-participant wins/losses for completed games
         rows = _db.session.execute(_text("""
             WITH wg AS (
-              SELECT g.id, g.winner
+              SELECT
+                g.id,
+                CASE
+                  WHEN g.winner IS NOT NULL THEN g.winner
+                  WHEN g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score <> g.away_score
+                       THEN CASE WHEN g.home_score > g.away_score THEN g.home_team ELSE g.away_team END
+                  ELSE NULL
+                END AS winner
               FROM games g
               JOIN weeks w ON w.id = g.week_id
-              WHERE w.season_year=:y AND w.week_number=:w AND g.winner IS NOT NULL
+              WHERE w.season_year=:y
+                AND w.week_number=:w
+                AND (
+                     g.winner IS NOT NULL
+                  OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score <> g.away_score)
+                )
             )
             SELECT u.id,
                    u.name,
@@ -493,10 +510,22 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Compute wins per participant per week for completed games
         rows = _db.session.execute(_text("""
             WITH wg AS (
-              SELECT w.week_number, g.id, g.winner
+              SELECT
+                w.week_number,
+                g.id,
+                CASE
+                  WHEN g.winner IS NOT NULL THEN g.winner
+                  WHEN g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score <> g.away_score
+                       THEN CASE WHEN g.home_score > g.away_score THEN g.home_team ELSE g.away_team END
+                  ELSE NULL
+                END AS winner
               FROM games g
               JOIN weeks w ON w.id = g.week_id
-              WHERE w.season_year=:y AND g.winner IS NOT NULL
+              WHERE w.season_year=:y
+                AND (
+                     g.winner IS NOT NULL
+                  OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score <> g.away_score)
+                )
             )
             SELECT u.id,
                    u.name,
