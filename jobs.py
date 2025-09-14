@@ -211,6 +211,28 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         out["unmatched_espn"] = [f"{a} @ {h}" for (a, h) in es_map.keys() - seen_keys]
 
     return out
+def cron_syncscores() -> dict:
+    """
+    Pick the latest season + latest week in your DB and sync from ESPN.
+    Safe to run repeatedly; returns the same summary dict as sync_week_scores_from_espn.
+    """
+    from sqlalchemy import text as _text
+    app = create_app()
+    with app.app_context():
+        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+        if not season:
+            logger.warning("cron_syncscores: no season_year in weeks")
+            return {"error": "no season_year in weeks"}
+        week = db.session.execute(_text(
+            "SELECT MAX(week_number) FROM weeks WHERE season_year=:y"
+        ), {"y": season}).scalar()
+        if not week:
+            logger.warning("cron_syncscores: no week_number for season %s", season)
+            return {"error": f"no week_number for season {season}"}
+
+    summary = sync_week_scores_from_espn(week, season)
+    logger.info("cron_syncscores summary: %s", summary)
+    return summary
 
 def _now_utc_naive():
     """UTC 'now' as naive datetime to match 'timestamp without time zone' columns."""
@@ -1178,4 +1200,25 @@ async def sendweek_command(update, context):
     await asyncio.to_thread(_do_broadcast)
     if update.message:
         await update.message.reply_text("✅ Done.")
+if __name__ == "__main__":
+    import sys, json
+    if len(sys.argv) >= 2 and sys.argv[1] == "cron":
+        print(json.dumps(cron_syncscores()))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "syncscores":
+        try:
+            week = int(sys.argv[2])
+        except Exception:
+            raise SystemExit("Usage: python jobs.py syncscores <week> [season_year]")
+        season = int(sys.argv[3]) if len(sys.argv) >= 4 else None
+        if season is None:
+            from sqlalchemy import text as _text
+            app = create_app()
+            with app.app_context():
+                season = db.session.execute(_text("""
+                    SELECT season_year FROM weeks WHERE week_number=:w
+                    ORDER BY season_year DESC LIMIT 1
+                """), {"w": week}).scalar()
+                if not season:
+                    raise SystemExit(f"Week {week} not found.")
+        print(json.dumps(sync_week_scores_from_espn(week, season)))
 
