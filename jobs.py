@@ -28,11 +28,23 @@ def cron_send_upcoming_week() -> dict:
     """
     Find the next week whose first kickoff is in the future, then broadcast
     that week's pick buttons to all participants with telegram_chat_id.
+    Runs ONLY on Tuesday (America/Los_Angeles) unless ALLOW_ANYDAY=1.
     """
     from sqlalchemy import text as _text
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    import os
 
     app = create_app()
     with app.app_context():
+        # ---- Tuesday (PT) guard ----
+        if os.getenv("ALLOW_ANYDAY") not in ("1", "true", "TRUE"):
+            now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+            if now_pt.weekday() != 1:  # Monday=0, Tuesday=1
+                logger.info("cron_send_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
+                return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
+
+        # Use naive UTC for DB comparisons (matches how game_time is used elsewhere)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
 
         season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
@@ -56,14 +68,16 @@ def cron_send_upcoming_week() -> dict:
 
         week = int(upcoming["week_number"])
         games_count = int(upcoming["games"])
-        parts_count = db.session.execute(_text("""
-            SELECT COUNT(*) FROM participants WHERE telegram_chat_id IS NOT NULL
-        """)).scalar() or 0
+        parts_count = db.session.execute(_text(
+            "SELECT COUNT(*) FROM participants WHERE telegram_chat_id IS NOT NULL"
+        )).scalar() or 0
 
-        logger.info(f"Broadcasting Week {week} {season} to {parts_count} participants "
-                    f"({games_count} games)")
+        logger.info(
+            "Broadcasting Week %s %s to %s participants (%s games)",
+            week, season, parts_count, games_count
+        )
 
-        # This sends one message per game per participant with inline pick buttons
+        # Send one message per game per participant with inline pick buttons
         send_week_games(week, season)
 
         return {
