@@ -233,6 +233,206 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
         db.session.commit()
         return {"season_year": season_year, "week": week, "events": len(events), "created": created, "updated": updated}
 
+def _get_latest_season_year():
+    from sqlalchemy import text as _text
+    return db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+
+def _find_upcoming_week_row(season_year, now_naive_utc):
+    from sqlalchemy import text as _text
+    rows = db.session.execute(_text("""
+        SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
+        FROM weeks w
+        LEFT JOIN games g ON g.week_id = w.id
+        WHERE w.season_year = :y
+        GROUP BY w.week_number
+        ORDER BY w.week_number
+    """), {"y": season_year}).mappings().all()
+    for r in rows:
+        if r["first_kick"] and r["first_kick"] > now_naive_utc:
+            return r
+    return None
+
+def _compute_week_results(season_year: int, week: int):
+    """
+    Returns list of dicts: [{'participant_id':..., 'name':..., 'wins':int}, ...]
+    Counts a win when pick matches game winner (based on scores) for FINAL games.
+    """
+    from sqlalchemy import text as _text
+    rows = db.session.execute(_text("""
+        WITH week_games AS (
+          SELECT g.id AS game_id,
+                 CASE WHEN g.home_score > g.away_score THEN g.home_team
+                      WHEN g.away_score > g.home_score THEN g.away_team
+                      ELSE NULL END AS winner
+          FROM games g
+          JOIN weeks w ON w.id = g.week_id
+          WHERE w.season_year=:y AND w.week_number=:w AND g.status='final'
+        ),
+        per_participant AS (
+          SELECT p.id AS participant_id,
+                 COALESCE(p.display_name, p.name, CONCAT('P', p.id::text)) AS name
+          FROM participants p
+        ),
+        scores AS (
+          SELECT pp.participant_id,
+                 pp.name,
+                 COUNT(*) FILTER (WHERE lower(pk.pick) = lower(wg.winner)) AS wins
+          FROM per_participant pp
+          LEFT JOIN picks pk ON pk.participant_id = pp.participant_id
+          LEFT JOIN week_games wg ON wg.game_id = pk.game_id
+          GROUP BY pp.participant_id, pp.name
+        )
+        SELECT * FROM scores ORDER BY wins DESC, name ASC
+    """), {"y": season_year, "w": week}).mappings().all()
+    return [{"participant_id": r["participant_id"], "name": r["name"], "wins": int(r["wins"] or 0)} for r in rows]
+
+def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
+    """
+    Season totals starting from WEEK 2 (Week 1 treated as zero).
+    Returns [{'participant_id', 'name', 'wins'}, ...] ordered by wins desc.
+    """
+    from sqlalchemy import text as _text
+    rows = db.session.execute(_text("""
+        WITH season_games AS (
+          SELECT g.id AS game_id,
+                 CASE WHEN g.home_score > g.away_score THEN g.home_team
+                      WHEN g.away_score > g.home_score THEN g.away_team
+                      ELSE NULL END AS winner
+          FROM games g
+          JOIN weeks w ON w.id = g.week_id
+          WHERE w.season_year=:y AND w.week_number >= 2 AND w.week_number <= :wk AND g.status='final'
+        ),
+        per_participant AS (
+          SELECT p.id AS participant_id,
+                 COALESCE(p.display_name, p.name, CONCAT('P', p.id::text)) AS name
+          FROM participants p
+        ),
+        scores AS (
+          SELECT pp.participant_id,
+                 pp.name,
+                 COUNT(*) FILTER (WHERE lower(pk.pick) = lower(sg.winner)) AS wins
+          FROM per_participant pp
+          LEFT JOIN picks pk ON pk.participant_id = pp.participant_id
+          LEFT JOIN season_games sg ON sg.game_id = pk.game_id
+          GROUP BY pp.participant_id, pp.name
+        )
+        SELECT * FROM scores ORDER BY wins DESC, name ASC
+    """), {"y": season_year, "wk": up_to_week_inclusive}).mappings().all()
+    return [{"participant_id": r["participant_id"], "name": r["name"], "wins": int(r["wins"] or 0)} for r in rows]
+
+def _format_winners_and_totals(week: int, weekly_rows, season_rows):
+    # Weekly winners (could be tie)
+    if not weekly_rows:
+        weekly_line = f"Week {week} Winner: (no final games / no picks)"
+    else:
+        top = weekly_rows[0]["wins"]
+        winners = [r for r in weekly_rows if r["wins"] == top]
+        names = ", ".join(f"{w['name']} ({w['wins']})" for w in winners)
+        weekly_line = f"🏆 Week {week} Winner(s): {names}"
+
+    # Season table (compact)
+    lines = ["\n📊 Season Standings (through Week " + str(week) + "):"]
+    rank = 1
+    for r in season_rows:
+        lines.append(f"{rank}. {r['name']} — {r['wins']}")
+        rank += 1
+    return weekly_line + "\n" + "\n".join(lines)
+
+def cron_announce_weekly_winners() -> dict:
+    """
+    Tuesday (America/Los_Angeles) 08:55 PT: announce last week's winners + season totals,
+    broadcasted to all participants with telegram_chat_id. De-duped per season/week.
+    """
+    from sqlalchemy import text as _text
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    import os, httpx
+
+    app = create_app()
+    with app.app_context():
+        # Tuesday guard (PT)
+        now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+        if now_pt.weekday() != 1:  # Monday=0, Tuesday=1
+            logger.info("cron_announce_weekly_winners: skip (not Tuesday PT) now_pt=%s", now_pt)
+            return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
+
+        # Determine "last completed" week as (upcoming_week - 1)
+        now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        season = _get_latest_season_year()
+        if not season:
+            return {"error": "no season_year in weeks"}
+
+        upcoming = _find_upcoming_week_row(season, now_utc_naive)
+        if not upcoming:
+            # If no upcoming, assume max existing week and announce that-1
+            last_week = db.session.execute(_text("""
+                SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y
+            """), {"y": season}).scalar() or 0
+            week_to_announce = max(2, last_week)  # never below 2 for season totals rule
+        else:
+            week_to_announce = max(2, int(upcoming["week_number"]) - 1)
+
+        # Dedupe table (separate from sendweek)
+        db.session.execute(_text("""
+            CREATE TABLE IF NOT EXISTS week_announcements (
+                season_year INTEGER NOT NULL,
+                week_number INTEGER NOT NULL,
+                sent_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (season_year, week_number)
+            )
+        """))
+        db.session.commit()
+
+        # Try to claim this announcement first (prevents double sends)
+        claimed = db.session.execute(_text("""
+            INSERT INTO week_announcements (season_year, week_number)
+            VALUES (:y, :w)
+            ON CONFLICT (season_year, week_number) DO NOTHING
+            RETURNING 1
+        """), {"y": season, "w": week_to_announce}).first()
+        if not claimed:
+            db.session.commit()
+            logger.info("cron_announce_weekly_winners: already sent for %s W%s; skipping", season, week_to_announce)
+            return {"status": "skipped_duplicate", "season_year": season, "week": week_to_announce}
+
+        # Compute results
+        weekly = _compute_week_results(season, week_to_announce)
+        season_totals = _compute_season_totals(season, week_to_announce)
+        text_msg = _format_winners_and_totals(week_to_announce, weekly, season_totals)
+
+        # Broadcast
+        participants = db.session.execute(_text("""
+            SELECT id, COALESCE(display_name, name, CONCAT('P', id::text)) AS name, telegram_chat_id
+            FROM participants
+            WHERE telegram_chat_id IS NOT NULL
+        """)).mappings().all()
+
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not token:
+            logger.warning("cron_announce_weekly_winners: TELEGRAM_BOT_TOKEN not set")
+            return {"error": "TELEGRAM_BOT_TOKEN not set"}
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        sent = 0
+        with httpx.Client(timeout=20) as client:
+            for p in participants:
+                try:
+                    r = client.post(url, json={"chat_id": p["telegram_chat_id"], "text": text_msg})
+                    r.raise_for_status()
+                    sent += 1
+                    logger.info("📣 Announced to %s", p["name"])
+                except Exception:
+                    logger.exception("Failed announcing to participant_id=%s", p["id"])
+
+        db.session.commit()
+        return {
+            "status": "sent",
+            "season_year": season,
+            "week": week_to_announce,
+            "recipients": sent,
+            "weekly_top": weekly[0]["wins"] if weekly else 0,
+            "participants_ranked": len(season_totals),
+        }
 
 def cron_import_upcoming_week() -> dict:
     """
@@ -1769,14 +1969,93 @@ if __name__ == "__main__":
             raise SystemExit("Usage: python jobs.py import-week <season_year> <week>")
         season_year = int(sys.argv[2])
         week = int(sys.argv[3])
-
-        # This function is idempotent (upserts)
         print(json.dumps(import_week_from_espn(season_year, week)))
 
     elif cmd == "import-week-upcoming":
         # Import the upcoming week (Tue-guarded) so the 9am sender has data:
         #   python jobs.py import-week-upcoming
         print(json.dumps(cron_import_upcoming_week()))
+
+    elif cmd == "announce-winners":
+        # Tuesday-guarded: announce last week's winners + season totals
+        print(json.dumps(cron_announce_weekly_winners()))
+
+    elif cmd == "announce-winners-now":
+        # FORCE an immediate announcement (bypasses Tuesday guard) — will SEND
+        from flask_app import create_app
+        from models import db
+        from sqlalchemy import text as _text
+        from datetime import datetime, timezone
+        import os, httpx
+
+        app = create_app()
+        with app.app_context():
+            season = _get_latest_season_year()
+            if not season:
+                raise SystemExit("No season_year found.")
+
+            now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            upcoming = _find_upcoming_week_row(season, now_utc_naive)
+            if upcoming:
+                week_to_announce = max(2, int(upcoming["week_number"]) - 1)
+            else:
+                last_week = db.session.execute(
+                    _text("SELECT COALESCE(MAX(week_number),0) FROM weeks WHERE season_year=:y"),
+                    {"y": season},
+                ).scalar() or 0
+                week_to_announce = max(2, last_week)
+
+            # Ensure dedupe table, then try to claim this week
+            db.session.execute(_text("""
+                CREATE TABLE IF NOT EXISTS week_announcements (
+                    season_year INTEGER NOT NULL,
+                    week_number INTEGER NOT NULL,
+                    sent_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (season_year, week_number)
+                )
+            """))
+            claimed = db.session.execute(_text("""
+                INSERT INTO week_announcements (season_year, week_number)
+                VALUES (:y, :w)
+                ON CONFLICT (season_year, week_number) DO NOTHING
+                RETURNING 1
+            """), {"y": season, "w": week_to_announce}).first()
+            if not claimed:
+                db.session.commit()
+                print(json.dumps({"status": "skipped_duplicate", "season_year": season, "week": week_to_announce}))
+                raise SystemExit(0)
+
+            weekly = _compute_week_results(season, week_to_announce)
+            season_totals = _compute_season_totals(season, week_to_announce)
+            msg = _format_winners_and_totals(week_to_announce, weekly, season_totals)
+
+            token = os.getenv("TELEGRAM_BOT_TOKEN")
+            if not token:
+                raise SystemExit("TELEGRAM_BOT_TOKEN not set.")
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+            participants = db.session.execute(_text("""
+                SELECT id, COALESCE(display_name, name, CONCAT('P', id::text)) AS name, telegram_chat_id
+                FROM participants
+                WHERE telegram_chat_id IS NOT NULL
+            """)).mappings().all()
+
+            sent = 0
+            with httpx.Client(timeout=20) as client:
+                for p in participants:
+                    r = client.post(url, json={"chat_id": p["telegram_chat_id"], "text": msg})
+                    r.raise_for_status()
+                    sent += 1
+
+            db.session.commit()
+            print(json.dumps({
+                "status": "sent",
+                "season_year": season,
+                "week": week_to_announce,
+                "recipients": sent,
+                "weekly_top": (weekly[0]["wins"] if weekly else 0),
+                "participants_ranked": len(season_totals),
+            }))
 
     else:
         raise SystemExit(
@@ -1786,5 +2065,7 @@ if __name__ == "__main__":
             "  python jobs.py sendweek <week> [season_year]\n"
             "  python jobs.py import-week <season_year> <week>\n"
             "  python jobs.py import-week-upcoming\n"
+            "  python jobs.py announce-winners\n"
+            "  python jobs.py announce-winners-now\n"
         )
 
