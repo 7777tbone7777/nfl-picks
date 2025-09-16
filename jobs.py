@@ -1250,6 +1250,7 @@ async def whoisleft_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /remindweek <week> [participant name...]
 # If no name is supplied, nudges everyone with remaining picks.
 # Only sends games with g.game_time > now (future), and where no pick exists.
+
 async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     chat_id = str(update.effective_chat.id)
@@ -1461,6 +1462,7 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         logger.exception("Failed sending /getscores to %s", r["name"])
             await m.reply_text(f"✅ Sent scoreboard to {sent} participant(s).")
+
 async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
@@ -1492,8 +1494,8 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not season:
             return await m.reply_text("No season data found in weeks table.")
 
-        # All week numbers in season (ordered)
-        weeks = [r[0] for r in _db.session.execute(_text("""
+        # All weeks present in that season (ordered)
+        weeks = [int(r[0]) for r in _db.session.execute(_text("""
             SELECT DISTINCT week_number
             FROM weeks
             WHERE season_year=:y
@@ -1534,17 +1536,12 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             ORDER BY u.name, wg.week_number
         """), {"y": season}).mappings().all()
 
-        # Organize into dict: name -> {week_number: wins}
-        pdata = {}
-        chat_ids = {}
+        # Organize: name -> {week_number: wins}, and collect chat ids
+        pdata: dict[str, dict[int, int]] = {}
+        chat_ids: dict[str, str | None] = {}
         for r in rows:
-            name = r["name"]
-            if name not in pdata:
-                pdata[name] = {}
-                chat_ids[name] = r["telegram_chat_id"]
-            wk = r["week_number"]
-            if wk is not None:
-                pdata[name][wk] = int(r["wins"])
+            pdata.setdefault(r["name"], {})[int(r["week_number"])] = int(r["wins"])
+            chat_ids.setdefault(r["name"], r["telegram_chat_id"])
 
         # Ensure all participants appear even if they have no completed wins yet
         missing_participants = _db.session.execute(_text("""
@@ -1554,38 +1551,41 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             pdata.setdefault(rp["name"], {})
             chat_ids.setdefault(rp["name"], rp["telegram_chat_id"])
 
-        # Build table lines
+        # Build table with fixed-width columns, rendered via <pre> ... </pre>
         names = sorted(pdata.keys())
         totals = {n: sum(pdata[n].get(w, 0) for w in weeks) for n in names}
         names.sort(key=lambda n: (-totals[n], n))  # by total desc, then name
 
-        header = "🏆 Season-to-date Scoreboard"
-        sub = f"Season {season} — completed games only"
-        col_wks = " ".join(f"W{w}" for w in weeks)
-        title = f"{header}\n{sub}\n\nName   {col_wks}  | Total"
+        header_html = "<b>🏆 Season-to-date Scoreboard</b>"
+        sub_html = f"<i>Season {season} — completed games only</i>"
 
-        lines = [title]
+        col_wks = " ".join(f"W{w}" for w in weeks)
+        name_w = max(4, max(len(n) for n in names) if names else 4)
+
+        table_lines = [f'{"Name":<{name_w}}  {col_wks}  | Total']
         for n in names:
             wk_counts = [str(pdata[n].get(w, 0)) for w in weeks]
-            line = f"{n}: " + " ".join(wk_counts) + f"  | {totals[n]}"
-            lines.append(line)
+            row = f'{n:<{name_w}}  {" ".join(wk_counts)}  | {totals[n]}'
+            table_lines.append(row)
 
-        body = "\n".join(lines)
+        table = "\n".join(table_lines)
+        body = f"{header_html}\n{sub_html}\n<pre>{table}</pre>"
 
-        await m.reply_text(body)
+        # Reply in invoking chat (HTML parse mode so <pre> is monospaced)
+        await m.reply_text(body, parse_mode="HTML", disable_web_page_preview=True)
 
+        # Optional broadcast
         if broadcast:
             sent = 0
             for n in names:
                 cid = chat_ids.get(n)
                 if cid:
                     try:
-                        _send_message(cid, body)
+                        _send_message(cid, body, parse_mode="HTML")
                         sent += 1
                     except Exception:
                         logger.exception("Failed sending /seasonboard to %s", n)
             await m.reply_text(f"✅ Sent season board to {sent} participant(s).")
-
 
 async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1734,18 +1734,44 @@ def run_telegram_listener():
     application.add_handler(CommandHandler("seepicks", seepicks_command))
     application.add_handler(CommandHandler("remindweek", remindweek_command))
     application.run_polling()
-def _send_message(chat_id: str, text: str, reply_markup: dict | None = None):
-    """Low-level helper to send a message via Telegram HTTP API (sync call)."""
-    if not TELEGRAM_BOT_TOKEN:
+def _send_message(
+    chat_id: str,
+    text: str,
+    reply_markup: dict | str | None = None,
+    parse_mode: str | None = None,
+):
+    """
+    Low-level helper to send a message via Telegram HTTP API (sync call).
+
+    - chat_id: Telegram chat id
+    - text: message body
+    - reply_markup: dict (will be JSON-encoded) or a pre-encoded JSON string
+    - parse_mode: e.g. "HTML" or "MarkdownV2"
+
+    When parse_mode is provided, we also disable link previews so score tables
+    wrapped in <pre> blocks stay clean.
+    """
+    import json, httpx, os
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-    data = {"chat_id": chat_id, "text": text}
+
+    base_url = globals().get("TELEGRAM_API_URL") or f"https://api.telegram.org/bot{token}"
+    url = f"{base_url}/sendMessage"
+
+    data: dict[str, object] = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+        data["disable_web_page_preview"] = True
+
     if reply_markup is not None:
-        # Accept either a dict (encode) or a pre-encoded JSON string
         data["reply_markup"] = (
             reply_markup if isinstance(reply_markup, str) else json.dumps(reply_markup)
         )
+
     with httpx.Client(timeout=20) as client:
-        resp = client.post(f"{TELEGRAM_API_URL}/sendMessage", data=data)
+        resp = client.post(url, data=data)
         resp.raise_for_status()
 
 def send_week_games(week_number: int, season_year: int):
