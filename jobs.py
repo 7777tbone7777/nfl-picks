@@ -134,6 +134,163 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             "updated": updated,
         }
 
+def import_week_from_espn(season_year: int, week: int) -> dict:
+    """
+    Ensure (season_year, week) exists in weeks; upsert all games for that week
+    from ESPN into games (home/away/time/status/scores). Idempotent.
+    """
+    from sqlalchemy import text as _text
+    from datetime import datetime, timezone
+
+    app = create_app()
+    with app.app_context():
+        # Ensure week exists; get week_id
+        row = db.session.execute(
+            _text("""
+                INSERT INTO weeks (season_year, week_number)
+                VALUES (:y, :w)
+                ON CONFLICT (season_year, week_number) DO NOTHING
+                RETURNING id
+            """),
+            {"y": season_year, "w": week},
+        ).first()
+        if row:
+            week_id = row[0]
+        else:
+            week_id = db.session.execute(
+                _text("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
+                {"y": season_year, "w": week},
+            ).scalar()
+
+        events = fetch_espn_scoreboard(week, season_year)
+        state_to_status = {"pre": "scheduled", "in": "in_progress", "post": "final"}
+
+        def _parse_start(ts: str):
+            if not ts:
+                return None
+            s = ts.replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo:
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)  # store naive UTC
+                return dt
+            except Exception:
+                return None
+
+        created = 0
+        updated = 0
+        for e in events:
+            away = (e.get("away_team") or "").strip()
+            home = (e.get("home_team") or "").strip()
+            start_dt = _parse_start(e.get("start_time"))
+            status = state_to_status.get((e.get("state") or "").lower(), "scheduled")
+            home_score = e.get("home_score")
+            away_score = e.get("away_score")
+
+            res = db.session.execute(
+                _text("""
+                    UPDATE games
+                    SET game_time = COALESCE(:game_time, game_time),
+                        status     = COALESCE(:status, status),
+                        home_score = COALESCE(:home_score, home_score),
+                        away_score = COALESCE(:away_score, away_score)
+                    WHERE week_id=:week_id
+                      AND lower(home_team)=lower(:home)
+                      AND lower(away_team)=lower(:away)
+                """),
+                {
+                    "game_time": start_dt,
+                    "status": status,
+                    "home_score": home_score,
+                    "away_score": away_score,
+                    "week_id": week_id,
+                    "home": home,
+                    "away": away,
+                },
+            )
+            if res.rowcount == 0:
+                db.session.execute(
+                    _text("""
+                        INSERT INTO games
+                            (week_id, home_team, away_team, game_time, status, home_score, away_score)
+                        VALUES
+                            (:week_id, :home, :away, :game_time, :status, :home_score, :away_score)
+                    """),
+                    {
+                        "week_id": week_id,
+                        "home": home,
+                        "away": away,
+                        "game_time": start_dt,
+                        "status": status,
+                        "home_score": home_score,
+                        "away_score": away_score,
+                    },
+                )
+                created += 1
+            else:
+                updated += 1
+
+        db.session.commit()
+        return {"season_year": season_year, "week": week, "events": len(events), "created": created, "updated": updated}
+
+
+def cron_import_upcoming_week() -> dict:
+    """
+    On Tuesday (America/Los_Angeles), import the NEXT upcoming week (first_kick > now)
+    from ESPN into the DB so the 9am sender has data. Safe to run daily (Tue-guarded).
+    """
+    from sqlalchemy import text as _text
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    app = create_app()
+    with app.app_context():
+        # Tuesday guard (PT)
+        now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+        if now_pt.weekday() != 1:  # Monday=0, Tuesday=1
+            logger.info("cron_import_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
+            return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+        if not season:
+            return {"error": "no season_year in weeks"}
+
+        # Find the next week with kickoff in the future
+        rows = db.session.execute(_text("""
+            SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
+            FROM weeks w
+            LEFT JOIN games g ON g.week_id = w.id
+            WHERE w.season_year = :y
+            GROUP BY w.week_number
+            ORDER BY w.week_number
+        """), {"y": season}).mappings().all()
+
+        upcoming = next((r for r in rows if r["first_kick"] and r["first_kick"] > now), None)
+        # If no week has future kickoff (or week exists but has 0 games), try to infer by +1
+        if not upcoming:
+            # fall back to max week in season + 1
+            max_week = db.session.execute(_text("""
+                SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y
+            """), {"y": season}).scalar() or 0
+            target_week = max_week + 1
+        else:
+            target_week = int(upcoming["week_number"])
+
+        # Import (idempotent)
+        result = import_week_from_espn(season, target_week)
+
+        # Recount games for logging
+        count_after = db.session.execute(_text("""
+            SELECT COUNT(*) FROM games g
+            JOIN weeks w ON w.id = g.week_id
+            WHERE w.season_year=:y AND w.week_number=:w
+        """), {"y": season, "w": target_week}).scalar()
+
+        logger.info("cron_import_upcoming_week: imported Week %s %s, games now=%s",
+                    target_week, season, count_after)
+        return {"status": "imported", "season_year": season, "week": target_week, "games": count_after, **result}
+
 def cron_send_upcoming_week() -> dict:
     """
     Find the next week whose first kickoff is in the future, then broadcast
@@ -1560,6 +1717,7 @@ async def sendweek_command(update, context):
     await asyncio.to_thread(_do_broadcast)
     if update.message:
         await update.message.reply_text("✅ Done.")
+
 if __name__ == "__main__":
     import sys, json
 
@@ -1605,16 +1763,20 @@ if __name__ == "__main__":
         print(json.dumps({"season_year": season_year, "week": week, "status": "sent"}))
 
     elif cmd == "import-week":
-        # Import a week's games from ESPN into the DB: python jobs.py import-week <season_year> <week>
+        # Import a specific week's games from ESPN into the DB:
+        #   python jobs.py import-week <season_year> <week>
         if len(sys.argv) < 4:
             raise SystemExit("Usage: python jobs.py import-week <season_year> <week>")
         season_year = int(sys.argv[2])
         week = int(sys.argv[3])
 
-        app = create_app()
-        with app.app_context():
-            result = import_week_from_espn(season_year, week)
-        print(json.dumps(result))
+        # This function is idempotent (upserts)
+        print(json.dumps(import_week_from_espn(season_year, week)))
+
+    elif cmd == "import-week-upcoming":
+        # Import the upcoming week (Tue-guarded) so the 9am sender has data:
+        #   python jobs.py import-week-upcoming
+        print(json.dumps(cron_import_upcoming_week()))
 
     else:
         raise SystemExit(
@@ -1623,5 +1785,6 @@ if __name__ == "__main__":
             "  python jobs.py sendweek_upcoming\n"
             "  python jobs.py sendweek <week> [season_year]\n"
             "  python jobs.py import-week <season_year> <week>\n"
+            "  python jobs.py import-week-upcoming\n"
         )
 
