@@ -24,6 +24,116 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS","").replace(" ","").spli
 # Regular season = seasontype=2. Preseason(1), Postseason(3).
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 
+def import_week_from_espn(season_year: int, week: int) -> dict:
+    """
+    Create/ensure the (season_year, week) exists in weeks; upsert all games
+    for that week from ESPN into the games table (home/away/time/status/scores).
+    Matching is by (home_team, away_team) case-insensitive within the week.
+    """
+    from sqlalchemy import text as _text
+    from datetime import datetime, timezone
+
+    app = create_app()
+    with app.app_context():
+        # Ensure week exists; get week_id
+        row = db.session.execute(
+            _text("""
+                INSERT INTO weeks (season_year, week_number)
+                VALUES (:y, :w)
+                ON CONFLICT (season_year, week_number) DO NOTHING
+                RETURNING id
+            """),
+            {"y": season_year, "w": week},
+        ).first()
+        if row:
+            week_id = row[0]
+        else:
+            week_id = db.session.execute(
+                _text("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
+                {"y": season_year, "w": week},
+            ).scalar()
+
+        # Pull ESPN events
+        events = fetch_espn_scoreboard(week, season_year)
+        state_to_status = {"pre": "scheduled", "in": "in_progress", "post": "final"}
+
+        def _parse_start(ts: str):
+            if not ts:
+                return None
+            s = ts.replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo:
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)  # store as naive UTC like your schema
+                return dt
+            except Exception:
+                return None
+
+        created = 0
+        updated = 0
+
+        for e in events:
+            away = (e.get("away_team") or "").strip()
+            home = (e.get("home_team") or "").strip()
+            start_dt = _parse_start(e.get("start_time"))
+            status = state_to_status.get((e.get("state") or "").lower(), "scheduled")
+            home_score = e.get("home_score")
+            away_score = e.get("away_score")
+
+            # Try update existing game (match by teams within the week)
+            res = db.session.execute(
+                _text("""
+                    UPDATE games
+                    SET game_time = COALESCE(:game_time, game_time),
+                        status     = COALESCE(:status, status),
+                        home_score = COALESCE(:home_score, home_score),
+                        away_score = COALESCE(:away_score, away_score)
+                    WHERE week_id=:week_id
+                      AND lower(home_team)=lower(:home)
+                      AND lower(away_team)=lower(:away)
+                """),
+                {
+                    "game_time": start_dt,
+                    "status": status,
+                    "home_score": home_score,
+                    "away_score": away_score,
+                    "week_id": week_id,
+                    "home": home,
+                    "away": away,
+                },
+            )
+            if res.rowcount == 0:
+                # Insert new game
+                db.session.execute(
+                    _text("""
+                        INSERT INTO games
+                            (week_id, home_team, away_team, game_time, status, home_score, away_score)
+                        VALUES
+                            (:week_id, :home, :away, :game_time, :status, :home_score, :away_score)
+                    """),
+                    {
+                        "week_id": week_id,
+                        "home": home,
+                        "away": away,
+                        "game_time": start_dt,
+                        "status": status,
+                        "home_score": home_score,
+                        "away_score": away_score,
+                    },
+                )
+                created += 1
+            else:
+                updated += 1
+
+        db.session.commit()
+        return {
+            "season_year": season_year,
+            "week": week,
+            "events": len(events),
+            "created": created,
+            "updated": updated,
+        }
+
 def cron_send_upcoming_week() -> dict:
     """
     Find the next week whose first kickoff is in the future, then broadcast
@@ -1454,6 +1564,7 @@ if __name__ == "__main__":
     import sys, json
 
     cmd = sys.argv[1] if len(sys.argv) >= 2 else None
+
     if cmd == "cron":
         # Sync the CURRENT week (auto-detected) from ESPN to DB
         print(json.dumps(cron_syncscores()))
@@ -1467,13 +1578,15 @@ if __name__ == "__main__":
         if len(sys.argv) < 3:
             raise SystemExit("Usage: python jobs.py sendweek <week> [season_year]")
         week = int(sys.argv[2])
-        if len(sys.argv) >= 4:
-            season = int(sys.argv[3])
-        else:
-            from sqlalchemy import text as _text
-            app = create_app()
-            with app.app_context():
-                season = db.session.execute(
+
+        app = create_app()
+        with app.app_context():
+            if len(sys.argv) >= 4:
+                season_year = int(sys.argv[3])
+            else:
+                from sqlalchemy import text as _text
+                from models import db
+                season_year = db.session.execute(
                     _text("""
                         SELECT season_year
                         FROM weeks
@@ -1483,10 +1596,25 @@ if __name__ == "__main__":
                     """),
                     {"w": week},
                 ).scalar()
-                if not season:
+                if not season_year:
                     raise SystemExit(f"Week {week} not found in any season.")
-        send_week_games(week, season)
-        print(json.dumps({"season_year": season, "week": week, "status": "sent"}))
+
+            # Send the week to all participants with telegram_chat_id
+            send_week_games(week, season_year)
+
+        print(json.dumps({"season_year": season_year, "week": week, "status": "sent"}))
+
+    elif cmd == "import-week":
+        # Import a week's games from ESPN into the DB: python jobs.py import-week <season_year> <week>
+        if len(sys.argv) < 4:
+            raise SystemExit("Usage: python jobs.py import-week <season_year> <week>")
+        season_year = int(sys.argv[2])
+        week = int(sys.argv[3])
+
+        app = create_app()
+        with app.app_context():
+            result = import_week_from_espn(season_year, week)
+        print(json.dumps(result))
 
     else:
         raise SystemExit(
@@ -1494,5 +1622,6 @@ if __name__ == "__main__":
             "  python jobs.py cron\n"
             "  python jobs.py sendweek_upcoming\n"
             "  python jobs.py sendweek <week> [season_year]\n"
+            "  python jobs.py import-week <season_year> <week>\n"
         )
 
