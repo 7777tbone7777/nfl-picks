@@ -1480,7 +1480,7 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     from flask_app import create_app, db as _db
     app = create_app()
     with app.app_context():
-        # Admin guard
+        # Admin guard (adjust if you want broader access)
         is_admin = _db.session.execute(_text("""
             SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
         """), {"c": chat_id}).scalar() is not None
@@ -1488,13 +1488,11 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             return await m.reply_text("Sorry, this command is restricted.")
 
         # Latest season
-        season = _db.session.execute(_text("""
-            SELECT MAX(season_year) FROM weeks
-        """)).scalar()
+        season = _db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
         if not season:
             return await m.reply_text("No season data found in weeks table.")
 
-        # All weeks present in that season (ordered)
+        # All weeks present for that season (ordered)
         weeks = [int(r[0]) for r in _db.session.execute(_text("""
             SELECT DISTINCT week_number
             FROM weeks
@@ -1539,15 +1537,22 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Organize: name -> {week_number: wins}, and collect chat ids
         pdata: dict[str, dict[int, int]] = {}
         chat_ids: dict[str, str | None] = {}
+
         for r in rows:
-            pdata.setdefault(r["name"], {})[int(r["week_number"])] = int(r["wins"])
-            chat_ids.setdefault(r["name"], r["telegram_chat_id"])
+            name = r["name"] or "?"
+            wk = r["week_number"]
+            if wk is None:                 # <-- guard against NULL week rows
+                # This happens for participants with zero completed picks
+                # because of the LEFT JOIN on wg; just skip.
+                continue
+            wins_i = int(r["wins"] or 0)   # tolerate None just in case
+            pdata.setdefault(name, {})[int(wk)] = wins_i
+            chat_ids.setdefault(name, r["telegram_chat_id"])
 
         # Ensure all participants appear even if they have no completed wins yet
-        missing_participants = _db.session.execute(_text("""
-            SELECT id, name, telegram_chat_id FROM participants
-        """)).mappings().all()
-        for rp in missing_participants:
+        for rp in _db.session.execute(_text(
+            "SELECT id, name, telegram_chat_id FROM participants"
+        )).mappings().all():
             pdata.setdefault(rp["name"], {})
             chat_ids.setdefault(rp["name"], rp["telegram_chat_id"])
 
