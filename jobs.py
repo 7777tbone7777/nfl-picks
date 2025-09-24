@@ -491,12 +491,11 @@ def cron_import_upcoming_week() -> dict:
                     target_week, season, count_after)
         return {"status": "imported", "season_year": season, "week": target_week, "games": count_after, **result}
 
-def cron_send_upcoming_week() -> dict:
+def cron_import_upcoming_week() -> dict:
     """
-    Find the next week whose first kickoff is in the future, then broadcast
-    that week's pick buttons to all participants with telegram_chat_id.
-    Runs ONLY on Tuesday (America/Los_Angeles) unless ALLOW_ANYDAY=1.
-    Skips if this season/week was already broadcast (dedupe).
+    On Tuesday (America/Los_Angeles), import the NEXT upcoming week (first_kick > now)
+    from ESPN into the DB so the 9am sender has data. Safe to run daily (Tue-guarded).
+    Honours ALLOW_ANYDAY to enable mid-week testing.
     """
     from sqlalchemy import text as _text
     from datetime import datetime, timezone
@@ -505,89 +504,52 @@ def cron_send_upcoming_week() -> dict:
 
     app = create_app()
     with app.app_context():
-        # ---- Optional one-off block (quick kill switch) ----
-        block_week = os.getenv("BLOCK_WEEK")
-        if block_week:
-            logger.info("cron_send_upcoming_week: BLOCK_WEEK=%s set, skipping", block_week)
-            return {"status": "skipped_block_week", "block_week": block_week}
+        # Tuesday guard (PT) with ALLOW_ANYDAY override (matches sendweek_upcoming behavior)
+        now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+        allow_anyday = os.getenv("ALLOW_ANYDAY", "").strip().lower() in {"1", "true", "yes", "on"}
+        if not allow_anyday and now_pt.weekday() != 1:  # Monday=0, Tuesday=1
+            logger.info("cron_import_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
+            return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
 
-        # ---- Tuesday (PT) guard ----
-        if os.getenv("ALLOW_ANYDAY") not in ("1", "true", "TRUE"):
-            now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
-            if now_pt.weekday() != 1:  # Monday=0, Tuesday=1
-                logger.info("cron_send_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
-                return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
-
-        # ---- Ensure a dedupe table exists ----
-        db.session.execute(_text("""
-            CREATE TABLE IF NOT EXISTS week_broadcasts (
-                season_year INTEGER NOT NULL,
-                week_number INTEGER NOT NULL,
-                sent_at TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (season_year, week_number)
-            )
-        """))
-        db.session.commit()
-
-        # ---- Choose upcoming week ----
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
         if not season:
-            logger.warning("cron_send_upcoming_week: no season_year in weeks")
             return {"error": "no season_year in weeks"}
 
+        # Find the next week with kickoff in the future
         rows = db.session.execute(_text("""
             SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
             FROM weeks w
-            JOIN games g ON g.week_id = w.id
+            LEFT JOIN games g ON g.week_id = w.id
             WHERE w.season_year = :y
             GROUP BY w.week_number
             ORDER BY w.week_number
         """), {"y": season}).mappings().all()
 
         upcoming = next((r for r in rows if r["first_kick"] and r["first_kick"] > now), None)
+        # If no week has future kickoff (or week exists but has 0 games), try to infer by +1
         if not upcoming:
-            logger.warning("cron_send_upcoming_week: no upcoming week found (all kicks <= now)")
-            return {"error": "no upcoming week found"}
+            # fall back to max week in season + 1
+            max_week = db.session.execute(_text("""
+                SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y
+            """), {"y": season}).scalar() or 0
+            target_week = max_week + 1
+        else:
+            target_week = int(upcoming["week_number"])
 
-        week = int(upcoming["week_number"])
-        games_count = int(upcoming["games"])
+        # Import (idempotent)
+        result = import_week_from_espn(season, target_week)
 
-        # ---- Dedupe: already sent for this season/week? ----
-        already = db.session.execute(
-            _text("SELECT 1 FROM week_broadcasts WHERE season_year=:y AND week_number=:w LIMIT 1"),
-            {"y": season, "w": week},
-        ).scalar()
-        if already:
-            logger.info("cron_send_upcoming_week: already sent for season=%s week=%s, skipping", season, week)
-            return {"status": "skipped_duplicate", "season_year": season, "week": week}
+        # Recount games for logging
+        count_after = db.session.execute(_text("""
+            SELECT COUNT(*) FROM games g
+            JOIN weeks w ON w.id = g.week_id
+            WHERE w.season_year=:y AND w.week_number=:w
+        """), {"y": season, "w": target_week}).scalar()
 
-        parts_count = db.session.execute(_text(
-            "SELECT COUNT(*) FROM participants WHERE telegram_chat_id IS NOT NULL"
-        )).scalar() or 0
-
-        logger.info(
-            "Broadcasting Week %s %s to %s participants (%s games)",
-            week, season, parts_count, games_count
-        )
-
-        # ---- Send ----
-        send_week_games(week, season)
-
-        # ---- Record the send ----
-        db.session.execute(
-            _text("INSERT INTO week_broadcasts (season_year, week_number) VALUES (:y, :w) ON CONFLICT DO NOTHING"),
-            {"y": season, "w": week},
-        )
-        db.session.commit()
-
-        return {
-            "season_year": season,
-            "week": week,
-            "participants": parts_count,
-            "games": games_count,
-            "status": "sent",
-        }
+        logger.info("cron_import_upcoming_week: imported Week %s %s, games now=%s",
+                    target_week, season, count_after)
+        return {"status": "imported", "season_year": season, "week": target_week, "games": count_after, **result}
 
 def detect_current_context(timeout: float = 15.0):
     """
