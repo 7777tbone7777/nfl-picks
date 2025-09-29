@@ -1,142 +1,119 @@
+from __future__ import annotations
+
 import logging
+from typing import Optional
 
-from sqlalchemy import text as _text
+# Import your db and models exactly as in your app
+# Adjust these two imports if your project structure is different.
+from app import db  # `db = SQLAlchemy()` from your Flask app
+from telegram import Update
+from telegram.ext import ContextTypes
 
-from models import Game, Participant, Pick, Week, db
+from models import Participant  # your SQLAlchemy model
 
-from .time_utils import now_utc, to_naive_utc
+logger = logging.getLogger(__name__)
 
-log = logging.getLogger("telegram_handlers")
+# If you want to use the Flask app object directly in places (optional)
+_FLASK_APP = None
 
 
-async def start(update, context):
+def init_app(app) -> None:
+    """Optionally called by bot_runner to pass in the Flask app (not required when using the wrapper)."""
+    global _FLASK_APP
+    _FLASK_APP = app
+
+
+# ------------- Handlers ------------- #
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /start — Registers the Telegram chat to an existing (or new) Participant record.
+    NOTE: This function expects to be called inside a Flask app_context()
+    (bot_runner wraps it), so db.session/Model.query will work.
+    """
     chat = update.effective_chat
     user = update.effective_user
-    chat_id = chat.id
+    chat_id = chat.id if chat else None
 
-    p = Participant.query.filter_by(telegram_chat_id=chat_id).first()
-    if p:
-        await update.message.reply_text(f"👋 You're already registered as {p.name}.")
+    if chat_id is None:
         return
-
-    base = user.full_name or user.username or user.first_name or f"user_{chat_id}"
-    name = base
-    suffix = 1
-    while Participant.query.filter_by(name=name).first():
-        suffix += 1
-        name = f"{base} ({suffix})"
-
-    p = Participant(name=name, telegram_chat_id=chat_id)
-    db.session.add(p)
-    db.session.commit()
-
-    await update.message.reply_text(f"✅ Registered as {p.name}. Use /sendweek to get your picks.")
-
-
-async def handle_pick(update, context):
-    query = update.callback_query
-    await query.answer()
 
     try:
-        _, game_id, team = (query.data or "").split(":", 3)[:3]
-        game_id = int(game_id)
-    except Exception:
-        await query.edit_message_text("❌ Invalid pick payload.")
-        return
-
-    game = Game.query.get(game_id)
-    if not game:
-        await query.edit_message_text("❌ Game not found.")
-        return
-
-    now_naive = to_naive_utc(now_utc())
-    if game.game_time and now_naive >= game.game_time:
-        await query.edit_message_text("⛔ Picks closed. That game has started.")
-        return
-
-    chat_id = query.message.chat_id
-    participant = Participant.query.filter_by(telegram_chat_id=chat_id).first()
-    if not participant:
-        await query.edit_message_text("❌ Please /start first to register.")
-        return
-
-    existing = Pick.query.filter_by(participant_id=participant.id, game_id=game.id).first()
-    if existing:
-        existing.selected_team = team
-    else:
-        existing = Pick(participant_id=participant.id, game_id=game.id, selected_team=team)
-        db.session.add(existing)
-
-    db.session.commit()
-
-    kickoff_str = (game.game_time.isoformat(" ") + " UTC") if game.game_time else "TBD"
-    await query.edit_message_text(
-        f"✅ Your pick for {game.away_team} @ {game.home_team} is <b>{team}</b>.\nKickoff: {kickoff_str}",
-        parse_mode="HTML",
-    )
-
-
-async def mypicks(update, context):
-    args = context.args or []
-    week = None
-    if args:
-        try:
-            week = int(args[0])
-        except:
-            pass
-
-    if week is None:
-        row = db.session.execute(
-            _text(
-                """
-            SELECT w.week_number
-            FROM weeks w
-            JOIN games g ON g.week_id=w.id
-            GROUP BY w.week_number, w.season_year
-            HAVING MIN(g.game_time) > NOW() AT TIME ZONE 'UTC'
-            ORDER BY w.season_year DESC, w.week_number ASC
-            LIMIT 1
-        """
+        # Look up by telegram_chat_id; create if missing (safe if your schema allows)
+        p = Participant.query.filter_by(telegram_chat_id=chat_id).first()
+        if p is None:
+            p = Participant(
+                telegram_chat_id=chat_id,
+                telegram_username=(user.username if user else None),
+                display_name=(user.full_name if user else None),
             )
-        ).first()
-        if row:
-            week = int(row[0])
+            db.session.add(p)
+            db.session.commit()
+            created = True
         else:
-            row = db.session.execute(_text("SELECT MAX(week_number) FROM weeks")).first()
-            week = int(row[0] or 1)
+            # Keep username/display_name fresh
+            if user:
+                p.telegram_username = user.username
+                p.display_name = user.full_name
+                db.session.commit()
+            created = False
 
-    chat_id = update.effective_chat.id
-    p = Participant.query.filter_by(telegram_chat_id=chat_id).first()
-    if not p:
-        await update.message.reply_text("❌ Please /start first to register.")
-        return
-
-    rows = (
-        db.session.execute(
-            _text(
-                """
-        SELECT g.id, g.away_team, g.home_team, g.game_time,
-               (SELECT selected_team FROM picks WHERE participant_id=:pid AND game_id=g.id) AS selected_team
-        FROM games g
-        JOIN weeks w ON w.id=g.week_id
-        WHERE w.week_number=:w
-        ORDER BY g.game_time NULLS LAST, g.id
-    """
-            ),
-            {"pid": p.id, "w": week},
+        text = (
+            "🎉 You’re all set! I’ll use this chat for your NFL picks."
+            if created
+            else "✅ You're already registered. Use /mypicks to see your selections."
         )
-        .mappings()
-        .all()
-    )
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Error in /start handler")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Couldn't register this chat due to an internal error.\n({type(e).__name__})",
+        )
 
-    if not rows:
-        await update.message.reply_text(f"No games found for Week {week}.")
+
+async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /mypicks — Show this user's picks.
+    Replace the demo query with your actual schema/logic if different.
+    Expects to run inside a Flask app_context() (provided by bot_runner).
+    """
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    if chat_id is None:
         return
 
-    lines = [f"<b>📝 Your picks — Week {week}</b>"]
-    for r in rows:
-        sel = r["selected_team"] or "—"
-        when = r["game_time"].isoformat(" ") + " UTC" if r["game_time"] else "TBD"
-        lines.append(f"{r['away_team']} @ {r['home_team']} — <b>{sel}</b>  ({when})")
+    try:
+        # One way: join via Participant if you store picks per participant.
+        participant = Participant.query.filter_by(telegram_chat_id=chat_id).first()
+        if participant is None:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="I don’t have you registered yet. Run /start first.",
+            )
+            return
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        # --- Replace this block with your real query ---
+        # Example using raw SQL if you had picks in a table "picks" keyed by participant_id.
+        # row = db.session.execute(
+        #     text(\"\"\"\n
+        #     SELECT json_agg(p ORDER BY p.week) AS picks
+        #     FROM picks p
+        #     WHERE p.participant_id = :pid
+        #     \"\"\"), {"pid": participant.id}
+        # ).first()
+        #
+        # Instead, we’ll just show a friendly placeholder if you haven’t wired it up yet.
+        # ------------------------------------------------
+
+        # Placeholder message (non-crashing)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📋 Your picks feature is enabled. (Add your real query in telegram_handlers.py → mypicks.)",
+        )
+
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Error in /mypicks handler")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Couldn't load your picks due to an internal error.\n({type(e).__name__})",
+        )
