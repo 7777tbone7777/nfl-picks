@@ -5,9 +5,9 @@ extend-ignore = E203,W503
 
 per-file-ignores =
     # Whole legacy trees
-    old/*: E501,F401,F811,E722,E999,F821
-    nfl-picks-old-workinggreat/*: E501,F401,F811,E722,F821
-    WORKING/*: E501,F401,F811,E722,F821
+    old/*: E501,F401,F811,E722,E999,F821,E225,E331
+    nfl-picks-old-workinggreat/*: E501,F401,F811,E722,F821,E225,E331
+    WORKING/*: E501,F401,F811,E722,F821,E225,E331
 
     # Specific legacy modules in current tree
     app-old.py: E501,F401
