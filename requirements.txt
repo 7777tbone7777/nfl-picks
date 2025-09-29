@@ -1,9 +1,9 @@
-Flask==2.3.3
+Flask==3.1.2
 Flask-SQLAlchemy==3.0.5
-psycopg2-binary==2.9.7
-APScheduler==3.10.4
-requests==2.31.0
-gunicorn==21.2.0
-streamlit==1.27.2
+SQLAlchemy==2.0.43
+gunicorn==23.0.0
+psycopg2-binary==2.9.9
 python-telegram-bot>=20.7
 httpx>=0.25.2
+APScheduler==3.10.4
+requests==2.31.0

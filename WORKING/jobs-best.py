@@ -3,7 +3,7 @@ import logging
 from zoneinfo import ZoneInfo
 import httpx
 import os, asyncio, logging
-import sys, json
+import json
 from telegram.ext import CommandHandler
 from sqlalchemy import text as _text
 from flask_app import create_app
@@ -24,585 +24,6 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS","").replace(" ","").spli
 # Regular season = seasontype=2. Preseason(1), Postseason(3).
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 
-def import_week_from_espn(season_year: int, week: int) -> dict:
-    """
-    Create/ensure the (season_year, week) exists in weeks; upsert all games
-    for that week from ESPN into the games table (home/away/time/status/scores).
-    Matching is by (home_team, away_team) case-insensitive within the week.
-    """
-    from sqlalchemy import text as _text
-    from datetime import datetime, timezone
-
-    app = create_app()
-    with app.app_context():
-        # Ensure week exists; get week_id
-        row = db.session.execute(
-            _text("""
-                INSERT INTO weeks (season_year, week_number)
-                VALUES (:y, :w)
-                ON CONFLICT (season_year, week_number) DO NOTHING
-                RETURNING id
-            """),
-            {"y": season_year, "w": week},
-        ).first()
-        if row:
-            week_id = row[0]
-        else:
-            week_id = db.session.execute(
-                _text("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
-                {"y": season_year, "w": week},
-            ).scalar()
-
-        # Pull ESPN events
-        events = fetch_espn_scoreboard(week, season_year)
-        state_to_status = {"pre": "scheduled", "in": "in_progress", "post": "final"}
-
-        def _parse_start(ts: str):
-            if not ts:
-                return None
-            s = ts.replace("Z", "+00:00")
-            try:
-                dt = datetime.fromisoformat(s)
-                if dt.tzinfo:
-                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)  # store as naive UTC like your schema
-                return dt
-            except Exception:
-                return None
-
-        created = 0
-        updated = 0
-
-        for e in events:
-            away = (e.get("away_team") or "").strip()
-            home = (e.get("home_team") or "").strip()
-            start_dt = _parse_start(e.get("start_time"))
-            status = state_to_status.get((e.get("state") or "").lower(), "scheduled")
-            home_score = e.get("home_score")
-            away_score = e.get("away_score")
-
-            # Try update existing game (match by teams within the week)
-            res = db.session.execute(
-                _text("""
-                    UPDATE games
-                    SET game_time = COALESCE(:game_time, game_time),
-                        status     = COALESCE(:status, status),
-                        home_score = COALESCE(:home_score, home_score),
-                        away_score = COALESCE(:away_score, away_score)
-                    WHERE week_id=:week_id
-                      AND lower(home_team)=lower(:home)
-                      AND lower(away_team)=lower(:away)
-                """),
-                {
-                    "game_time": start_dt,
-                    "status": status,
-                    "home_score": home_score,
-                    "away_score": away_score,
-                    "week_id": week_id,
-                    "home": home,
-                    "away": away,
-                },
-            )
-            if res.rowcount == 0:
-                # Insert new game
-                db.session.execute(
-                    _text("""
-                        INSERT INTO games
-                            (week_id, home_team, away_team, game_time, status, home_score, away_score)
-                        VALUES
-                            (:week_id, :home, :away, :game_time, :status, :home_score, :away_score)
-                    """),
-                    {
-                        "week_id": week_id,
-                        "home": home,
-                        "away": away,
-                        "game_time": start_dt,
-                        "status": status,
-                        "home_score": home_score,
-                        "away_score": away_score,
-                    },
-                )
-                created += 1
-            else:
-                updated += 1
-
-        db.session.commit()
-        return {
-            "season_year": season_year,
-            "week": week,
-            "events": len(events),
-            "created": created,
-            "updated": updated,
-        }
-
-def import_week_from_espn(season_year: int, week: int) -> dict:
-    """
-    Ensure (season_year, week) exists in weeks; upsert all games for that week
-    from ESPN into games (home/away/time/status/scores). Idempotent.
-    """
-    from sqlalchemy import text as _text
-    from datetime import datetime, timezone
-
-    app = create_app()
-    with app.app_context():
-        # Ensure week exists; get week_id
-        row = db.session.execute(
-            _text("""
-                INSERT INTO weeks (season_year, week_number)
-                VALUES (:y, :w)
-                ON CONFLICT (season_year, week_number) DO NOTHING
-                RETURNING id
-            """),
-            {"y": season_year, "w": week},
-        ).first()
-        if row:
-            week_id = row[0]
-        else:
-            week_id = db.session.execute(
-                _text("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
-                {"y": season_year, "w": week},
-            ).scalar()
-
-        events = fetch_espn_scoreboard(week, season_year)
-        state_to_status = {"pre": "scheduled", "in": "in_progress", "post": "final"}
-
-        def _parse_start(ts: str):
-            if not ts:
-                return None
-            s = ts.replace("Z", "+00:00")
-            try:
-                dt = datetime.fromisoformat(s)
-                if dt.tzinfo:
-                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)  # store naive UTC
-                return dt
-            except Exception:
-                return None
-
-        created = 0
-        updated = 0
-        for e in events:
-            away = (e.get("away_team") or "").strip()
-            home = (e.get("home_team") or "").strip()
-            start_dt = _parse_start(e.get("start_time"))
-            status = state_to_status.get((e.get("state") or "").lower(), "scheduled")
-            home_score = e.get("home_score")
-            away_score = e.get("away_score")
-
-            res = db.session.execute(
-                _text("""
-                    UPDATE games
-                    SET game_time = COALESCE(:game_time, game_time),
-                        status     = COALESCE(:status, status),
-                        home_score = COALESCE(:home_score, home_score),
-                        away_score = COALESCE(:away_score, away_score)
-                    WHERE week_id=:week_id
-                      AND lower(home_team)=lower(:home)
-                      AND lower(away_team)=lower(:away)
-                """),
-                {
-                    "game_time": start_dt,
-                    "status": status,
-                    "home_score": home_score,
-                    "away_score": away_score,
-                    "week_id": week_id,
-                    "home": home,
-                    "away": away,
-                },
-            )
-            if res.rowcount == 0:
-                db.session.execute(
-                    _text("""
-                        INSERT INTO games
-                            (week_id, home_team, away_team, game_time, status, home_score, away_score)
-                        VALUES
-                            (:week_id, :home, :away, :game_time, :status, :home_score, :away_score)
-                    """),
-                    {
-                        "week_id": week_id,
-                        "home": home,
-                        "away": away,
-                        "game_time": start_dt,
-                        "status": status,
-                        "home_score": home_score,
-                        "away_score": away_score,
-                    },
-                )
-                created += 1
-            else:
-                updated += 1
-
-        db.session.commit()
-        return {"season_year": season_year, "week": week, "events": len(events), "created": created, "updated": updated}
-
-def _get_latest_season_year():
-    from sqlalchemy import text as _text
-    return db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
-
-def _find_upcoming_week_row(season_year, now_naive_utc):
-    from sqlalchemy import text as _text
-    rows = db.session.execute(_text("""
-        SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
-        FROM weeks w
-        LEFT JOIN games g ON g.week_id = w.id
-        WHERE w.season_year = :y
-        GROUP BY w.week_number
-        ORDER BY w.week_number
-    """), {"y": season_year}).mappings().all()
-    for r in rows:
-        if r["first_kick"] and r["first_kick"] > now_naive_utc:
-            return r
-    return None
-
-def _compute_week_results(season_year: int, week: int):
-    """
-    Returns list of dicts: [{'participant_id':..., 'name':..., 'wins':int}, ...]
-    Counts a win when pick matches game winner (based on scores) for FINAL games.
-    """
-    from sqlalchemy import text as _text
-    rows = db.session.execute(_text("""
-        WITH week_games AS (
-          SELECT g.id AS game_id,
-                 CASE WHEN g.home_score > g.away_score THEN g.home_team
-                      WHEN g.away_score > g.home_score THEN g.away_team
-                      ELSE NULL END AS winner
-          FROM games g
-          JOIN weeks w ON w.id = g.week_id
-          WHERE w.season_year=:y AND w.week_number=:w AND g.status='final'
-        ),
-        per_participant AS (
-          SELECT p.id AS participant_id,
-                 COALESCE(p.display_name, p.name, CONCAT('P', p.id::text)) AS name
-          FROM participants p
-        ),
-        scores AS (
-          SELECT pp.participant_id,
-                 pp.name,
-                 COUNT(*) FILTER (WHERE lower(pk.pick) = lower(wg.winner)) AS wins
-          FROM per_participant pp
-          LEFT JOIN picks pk ON pk.participant_id = pp.participant_id
-          LEFT JOIN week_games wg ON wg.game_id = pk.game_id
-          GROUP BY pp.participant_id, pp.name
-        )
-        SELECT * FROM scores ORDER BY wins DESC, name ASC
-    """), {"y": season_year, "w": week}).mappings().all()
-    return [{"participant_id": r["participant_id"], "name": r["name"], "wins": int(r["wins"] or 0)} for r in rows]
-
-def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
-    """
-    Season totals starting from WEEK 2 (Week 1 treated as zero).
-    Returns [{'participant_id', 'name', 'wins'}, ...] ordered by wins desc.
-    """
-    from sqlalchemy import text as _text
-    rows = db.session.execute(_text("""
-        WITH season_games AS (
-          SELECT g.id AS game_id,
-                 CASE WHEN g.home_score > g.away_score THEN g.home_team
-                      WHEN g.away_score > g.home_score THEN g.away_team
-                      ELSE NULL END AS winner
-          FROM games g
-          JOIN weeks w ON w.id = g.week_id
-          WHERE w.season_year=:y AND w.week_number >= 2 AND w.week_number <= :wk AND g.status='final'
-        ),
-        per_participant AS (
-          SELECT p.id AS participant_id,
-                 COALESCE(p.display_name, p.name, CONCAT('P', p.id::text)) AS name
-          FROM participants p
-        ),
-        scores AS (
-          SELECT pp.participant_id,
-                 pp.name,
-                 COUNT(*) FILTER (WHERE lower(pk.pick) = lower(sg.winner)) AS wins
-          FROM per_participant pp
-          LEFT JOIN picks pk ON pk.participant_id = pp.participant_id
-          LEFT JOIN season_games sg ON sg.game_id = pk.game_id
-          GROUP BY pp.participant_id, pp.name
-        )
-        SELECT * FROM scores ORDER BY wins DESC, name ASC
-    """), {"y": season_year, "wk": up_to_week_inclusive}).mappings().all()
-    return [{"participant_id": r["participant_id"], "name": r["name"], "wins": int(r["wins"] or 0)} for r in rows]
-
-def _format_winners_and_totals(week: int, weekly_rows, season_rows):
-    # Weekly winners (could be tie)
-    if not weekly_rows:
-        weekly_line = f"Week {week} Winner: (no final games / no picks)"
-    else:
-        top = weekly_rows[0]["wins"]
-        winners = [r for r in weekly_rows if r["wins"] == top]
-        names = ", ".join(f"{w['name']} ({w['wins']})" for w in winners)
-        weekly_line = f"🏆 Week {week} Winner(s): {names}"
-
-    # Season table (compact)
-    lines = ["\n📊 Season Standings (through Week " + str(week) + "):"]
-    rank = 1
-    for r in season_rows:
-        lines.append(f"{rank}. {r['name']} — {r['wins']}")
-        rank += 1
-    return weekly_line + "\n" + "\n".join(lines)
-
-def cron_announce_weekly_winners() -> dict:
-    """
-    Tuesday (America/Los_Angeles) 08:55 PT: announce last week's winners + season totals,
-    broadcasted to all participants with telegram_chat_id. De-duped per season/week.
-    """
-    from sqlalchemy import text as _text
-    from datetime import datetime, timezone
-    from zoneinfo import ZoneInfo
-    import os, httpx
-
-    app = create_app()
-    with app.app_context():
-        # Tuesday guard (PT)
-        now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
-        if now_pt.weekday() != 1:  # Monday=0, Tuesday=1
-            logger.info("cron_announce_weekly_winners: skip (not Tuesday PT) now_pt=%s", now_pt)
-            return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
-
-        # Determine "last completed" week as (upcoming_week - 1)
-        now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-        season = _get_latest_season_year()
-        if not season:
-            return {"error": "no season_year in weeks"}
-
-        upcoming = _find_upcoming_week_row(season, now_utc_naive)
-        if not upcoming:
-            # If no upcoming, assume max existing week and announce that-1
-            last_week = db.session.execute(_text("""
-                SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y
-            """), {"y": season}).scalar() or 0
-            week_to_announce = max(2, last_week)  # never below 2 for season totals rule
-        else:
-            week_to_announce = max(2, int(upcoming["week_number"]) - 1)
-
-        # Dedupe table (separate from sendweek)
-        db.session.execute(_text("""
-            CREATE TABLE IF NOT EXISTS week_announcements (
-                season_year INTEGER NOT NULL,
-                week_number INTEGER NOT NULL,
-                sent_at TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (season_year, week_number)
-            )
-        """))
-        db.session.commit()
-
-        # Try to claim this announcement first (prevents double sends)
-        claimed = db.session.execute(_text("""
-            INSERT INTO week_announcements (season_year, week_number)
-            VALUES (:y, :w)
-            ON CONFLICT (season_year, week_number) DO NOTHING
-            RETURNING 1
-        """), {"y": season, "w": week_to_announce}).first()
-        if not claimed:
-            db.session.commit()
-            logger.info("cron_announce_weekly_winners: already sent for %s W%s; skipping", season, week_to_announce)
-            return {"status": "skipped_duplicate", "season_year": season, "week": week_to_announce}
-
-        # Compute results
-        weekly = _compute_week_results(season, week_to_announce)
-        season_totals = _compute_season_totals(season, week_to_announce)
-        text_msg = _format_winners_and_totals(week_to_announce, weekly, season_totals)
-
-        # Broadcast
-        participants = db.session.execute(_text("""
-            SELECT id, COALESCE(display_name, name, CONCAT('P', id::text)) AS name, telegram_chat_id
-            FROM participants
-            WHERE telegram_chat_id IS NOT NULL
-        """)).mappings().all()
-
-        token = os.getenv("TELEGRAM_BOT_TOKEN")
-        if not token:
-            logger.warning("cron_announce_weekly_winners: TELEGRAM_BOT_TOKEN not set")
-            return {"error": "TELEGRAM_BOT_TOKEN not set"}
-
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        sent = 0
-        with httpx.Client(timeout=20) as client:
-            for p in participants:
-                try:
-                    r = client.post(url, json={"chat_id": p["telegram_chat_id"], "text": text_msg})
-                    r.raise_for_status()
-                    sent += 1
-                    logger.info("📣 Announced to %s", p["name"])
-                except Exception:
-                    logger.exception("Failed announcing to participant_id=%s", p["id"])
-
-        db.session.commit()
-        return {
-            "status": "sent",
-            "season_year": season,
-            "week": week_to_announce,
-            "recipients": sent,
-            "weekly_top": weekly[0]["wins"] if weekly else 0,
-            "participants_ranked": len(season_totals),
-        }
-
-def cron_import_upcoming_week() -> dict:
-    """
-    On Tuesday (America/Los_Angeles), import the NEXT upcoming week (first_kick > now)
-    from ESPN into the DB so the 9am sender has data. Safe to run daily (Tue-guarded).
-    """
-    from sqlalchemy import text as _text
-    from datetime import datetime, timezone
-    from zoneinfo import ZoneInfo
-
-    app = create_app()
-    with app.app_context():
-        # Tuesday guard (PT)
-        now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
-        if now_pt.weekday() != 1:  # Monday=0, Tuesday=1
-            logger.info("cron_import_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
-            return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
-
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
-        if not season:
-            return {"error": "no season_year in weeks"}
-
-        # Find the next week with kickoff in the future
-        rows = db.session.execute(_text("""
-            SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
-            FROM weeks w
-            LEFT JOIN games g ON g.week_id = w.id
-            WHERE w.season_year = :y
-            GROUP BY w.week_number
-            ORDER BY w.week_number
-        """), {"y": season}).mappings().all()
-
-        upcoming = next((r for r in rows if r["first_kick"] and r["first_kick"] > now), None)
-        # If no week has future kickoff (or week exists but has 0 games), try to infer by +1
-        if not upcoming:
-            # fall back to max week in season + 1
-            max_week = db.session.execute(_text("""
-                SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y
-            """), {"y": season}).scalar() or 0
-            target_week = max_week + 1
-        else:
-            target_week = int(upcoming["week_number"])
-
-        # Import (idempotent)
-        result = import_week_from_espn(season, target_week)
-
-        # Recount games for logging
-        count_after = db.session.execute(_text("""
-            SELECT COUNT(*) FROM games g
-            JOIN weeks w ON w.id = g.week_id
-            WHERE w.season_year=:y AND w.week_number=:w
-        """), {"y": season, "w": target_week}).scalar()
-
-        logger.info("cron_import_upcoming_week: imported Week %s %s, games now=%s",
-                    target_week, season, count_after)
-        return {"status": "imported", "season_year": season, "week": target_week, "games": count_after, **result}
-
-def cron_send_upcoming_week() -> dict:
-    """
-    Find the next week whose first kickoff is in the future, then broadcast
-    that week's pick buttons to all participants with telegram_chat_id.
-    Runs ONLY on Tuesday (America/Los_Angeles) unless ALLOW_ANYDAY=1.
-    Skips if this season/week was already broadcast (dedupe).
-    """
-    from sqlalchemy import text as _text
-    from datetime import datetime, timezone
-    from zoneinfo import ZoneInfo
-    import os
-
-    app = create_app()
-    with app.app_context():
-        # ---- Optional one-off block (quick kill switch) ----
-        block_week = os.getenv("BLOCK_WEEK")
-        if block_week:
-            logger.info("cron_send_upcoming_week: BLOCK_WEEK=%s set, skipping", block_week)
-            return {"status": "skipped_block_week", "block_week": block_week}
-
-        # ---- Tuesday (PT) guard ----
-        if os.getenv("ALLOW_ANYDAY") not in ("1", "true", "TRUE"):
-            now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
-            if now_pt.weekday() != 1:  # Monday=0, Tuesday=1
-                logger.info("cron_send_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
-                return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
-
-        # ---- Ensure a dedupe table exists ----
-        db.session.execute(_text("""
-            CREATE TABLE IF NOT EXISTS week_broadcasts (
-                season_year INTEGER NOT NULL,
-                week_number INTEGER NOT NULL,
-                sent_at TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (season_year, week_number)
-            )
-        """))
-        db.session.commit()
-
-        # ---- Choose upcoming week ----
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
-        if not season:
-            logger.warning("cron_send_upcoming_week: no season_year in weeks")
-            return {"error": "no season_year in weeks"}
-
-        rows = db.session.execute(_text("""
-            SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
-            FROM weeks w
-            JOIN games g ON g.week_id = w.id
-            WHERE w.season_year = :y
-            GROUP BY w.week_number
-            ORDER BY w.week_number
-        """), {"y": season}).mappings().all()
-
-        upcoming = next((r for r in rows if r["first_kick"] and r["first_kick"] > now), None)
-        if not upcoming:
-            logger.warning("cron_send_upcoming_week: no upcoming week found (all kicks <= now)")
-            return {"error": "no upcoming week found"}
-
-        week = int(upcoming["week_number"])
-        games_count = int(upcoming["games"])
-
-        # ---- Dedupe: already sent for this season/week? ----
-        already = db.session.execute(
-            _text("SELECT 1 FROM week_broadcasts WHERE season_year=:y AND week_number=:w LIMIT 1"),
-            {"y": season, "w": week},
-        ).scalar()
-        if already:
-            logger.info("cron_send_upcoming_week: already sent for season=%s week=%s, skipping", season, week)
-            return {"status": "skipped_duplicate", "season_year": season, "week": week}
-
-        parts_count = db.session.execute(_text(
-            "SELECT COUNT(*) FROM participants WHERE telegram_chat_id IS NOT NULL"
-        )).scalar() or 0
-
-        logger.info(
-            "Broadcasting Week %s %s to %s participants (%s games)",
-            week, season, parts_count, games_count
-        )
-
-        # ---- Send ----
-        send_week_games(week, season)
-
-        # ---- Record the send ----
-        db.session.execute(
-            _text("INSERT INTO week_broadcasts (season_year, week_number) VALUES (:y, :w) ON CONFLICT DO NOTHING"),
-            {"y": season, "w": week},
-        )
-        db.session.commit()
-
-        return {
-            "season_year": season,
-            "week": week,
-            "participants": parts_count,
-            "games": games_count,
-            "status": "sent",
-        }
-
-def detect_current_context(timeout: float = 15.0):
-    """
-    Hit ESPN's no-parameter scoreboard and return (year, season_type_int, week_number).
-    season_type_int: 1=pre, 2=reg, 3=post
-    """
-    with httpx.Client(timeout=timeout, headers={"User-Agent": "nfl-picks-bot/1.0"}) as client:
-        j = client.get(ESPN_SCOREBOARD_URL).json()
-    year = int(j["season"]["year"])
-    st = j["season"]["type"]
-    if isinstance(st, str):
-        st = {"pre": 1, "reg": 2, "post": 3}.get(st.lower(), 2)
-    week = int(j["week"]["number"])
-    return year, int(st), week
-
 def fetch_espn_scoreboard(week: int, season_year: int):
     """
     Returns a list of dicts like:
@@ -620,8 +41,8 @@ def fetch_espn_scoreboard(week: int, season_year: int):
     with httpx.Client(timeout=15.0, headers={"User-Agent": "nfl-picks-bot/1.0"}) as client:
     # Try both parameter styles ESPN uses. First that succeeds wins.
         urls = [
-        f"{ESPN_SCOREBOARD_URL}?week={week}&dates={season_year}&seasontype=2",
         f"{ESPN_SCOREBOARD_URL}?week={week}&year={season_year}&seasontype=2",
+        f"{ESPN_SCOREBOARD_URL}?week={week}&dates={season_year}&seasontype=2",
         ]
         resp = None
         for u in urls:
@@ -682,274 +103,136 @@ def fetch_espn_scoreboard(week: int, season_year: int):
             # Be resilient to any weird ESPN edge cases
             continue
     return out
+
 def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
     """
-    Pull ESPN events for (season_year, week), match to DB games by team names,
-    update scores/status (and winner if present), and return a summary.
-    Adds `linkable` = # of DB games that had a matching ESPN event.
-    Keeps `matched` semantics as "rows changed this run" for backward-compatibility.
+    Pull ESPN week data (from Step 1's fetch_espn_scoreboard) and UPDATE games in our DB.
+    Idempotent:
+      - Only writes fields that actually changed.
+      - Never regresses status (won't move final -> in_progress).
+      - Never overwrites existing scores/winner with NULL.
+    Returns a summary dict with counts.
     """
     from sqlalchemy import text as _text
+    from flask_app import create_app
 
-    # Fetch ESPN events
-    events = fetch_espn_scoreboard(week, season_year)
-
-    # Build a case-insensitive lookup: (away, home) -> event
-    es_map = {}
-    for e in events:
-        a = (e.get("away_team") or "").strip().lower()
-        h = (e.get("home_team") or "").strip().lower()
-        es_map[(a, h)] = e
-    es_keys_remaining = set(es_map.keys())
-
-    # Do we have a 'winner' column? (Postgres information_schema)
-    try:
-        has_winner_col = db.session.execute(
-            _text("""
-                SELECT 1
-                FROM information_schema.columns
-                WHERE table_name = 'games' AND column_name = 'winner'
-                LIMIT 1
-            """)
-        ).scalar() is not None
-    except Exception:
-        has_winner_col = False
-
-    # Pull DB games for the target week
-    if has_winner_col:
-        rows = db.session.execute(
-            _text("""
-                SELECT g.id, g.away_team, g.home_team,
-                       g.status, g.home_score, g.away_score, g.winner
-                FROM games g
-                JOIN weeks wk ON wk.id = g.week_id
-                WHERE wk.season_year = :y AND wk.week_number = :w
-                ORDER BY g.game_time
-            """),
-            {"y": season_year, "w": week},
-        ).mappings().all()
-    else:
-        rows = db.session.execute(
-            _text("""
-                SELECT g.id, g.away_team, g.home_team,
-                       g.status, g.home_score, g.away_score
-                FROM games g
-                JOIN weeks wk ON wk.id = g.week_id
-                WHERE wk.season_year = :y AND wk.week_number = :w
-                ORDER BY g.game_time
-            """),
-            {"y": season_year, "w": week},
-        ).mappings().all()
-
-    linkable = 0      # how many DB games had a corresponding ESPN event
-    changed = 0       # how many DB rows we actually modified this run
-    updated_scores = 0
-    updated_status = 0
-    updated_winner = 0
-
-    missing_in_espn = []   # DB games we couldn't find on ESPN
-    matched_keys = set()
-
-    # Map ESPN state -> our DB status
-    state_to_status = {"pre": "scheduled", "in": "in_progress", "post": "final"}
-
-    for r in rows:
-        db_id = r["id"]
-        db_away = (r["away_team"] or "").strip()
-        db_home = (r["home_team"] or "").strip()
-        key = (db_away.lower(), db_home.lower())
-
-        ev = es_map.get(key)
-        if not ev:
-            missing_in_espn.append(f"{db_away} @ {db_home}")
-            continue
-
-        # Found a linkable pair
-        linkable += 1
-        matched_keys.add(key)
-        if key in es_keys_remaining:
-            es_keys_remaining.remove(key)
-
-        # ESPN values
-        es_state = (ev.get("state") or "").lower()
-        es_status = state_to_status.get(es_state)  # None if unknown
-        es_home_score = ev.get("home_score")
-        es_away_score = ev.get("away_score")
-
-        # Current DB values
-        cur_status = r["status"]
-        cur_home_score = r["home_score"]
-        cur_away_score = r["away_score"]
-        cur_winner = r.get("winner") if has_winner_col else None
-
-        # Determine winner from ESPN scores (if present)
-        new_winner = None
-        if isinstance(es_home_score, int) and isinstance(es_away_score, int) and es_home_score != es_away_score:
-            new_winner = db_home if es_home_score > es_away_score else db_away
-
-        # Build updates
-        sets = []
-        params = {"id": db_id}
-
-        # Status
-        if es_status and es_status != cur_status:
-            sets.append("status = :status")
-            params["status"] = es_status
-            updated_status += 1
-
-        # Scores
-        if es_home_score is not None and es_home_score != cur_home_score:
-            sets.append("home_score = :home_score")
-            params["home_score"] = es_home_score
-        if es_away_score is not None and es_away_score != cur_away_score:
-            sets.append("away_score = :away_score")
-            params["away_score"] = es_away_score
-        if ("home_score" in params) or ("away_score" in params):
-            updated_scores += 1
-
-        # Winner (only if column exists, decisive score, and value actually changes)
-        if has_winner_col and new_winner and (cur_winner != new_winner):
-            sets.append("winner = :winner")
-            params["winner"] = new_winner
-            updated_winner += 1
-
-        if sets:
-            sql = f"UPDATE games SET {', '.join(sets)} WHERE id = :id"
-            db.session.execute(_text(sql), params)
-            changed += 1
-
-    # Commit once at the end for performance
-    if changed:
-        db.session.commit()
-
-    # ESPN events that didn't find a DB counterpart
-    unmatched_espn = []
-    for a, h in es_keys_remaining:
-        # Pretty format using original-cased names if available
-        e = es_map[(a, h)]
-        unmatched_espn.append(f"{e.get('away_team','?')} @ {e.get('home_team','?')}")
-
-    return {
-        "season_year": season_year,
-        "week": week,
-        "total_games": len(rows),
-        "linkable": linkable,           # NEW: how many DB games were matchable by names
-        "matched": changed,             # kept semantics: rows actually changed this run
-        "updated_scores": updated_scores,
-        "updated_winner": updated_winner if has_winner_col else 0,
-        "updated_status": updated_status,
-        "missing_in_espn": missing_in_espn,
-        "unmatched_espn": unmatched_espn,
-    }
-
-def cron_syncscores() -> dict:
-    """
-    Pick the latest week that is actually active (in-progress or completed)
-    using BOTH DB signals and ESPN state, then sync from ESPN.
-    """
-    from sqlalchemy import text as _text
+    def _rank_status(s: str | None) -> int:
+        s = (s or "").lower()
+        if s in ("final", "post"):
+            return 3
+        if s in ("in", "in_progress", "live"):
+            return 2
+        return 1  # pre/scheduled/unknown
 
     app = create_app()
-    with app.app_context():
-        # 1) ESPN current context
-        espn_year = espn_type = espn_week = None
-        try:
-            espn_year, espn_type, espn_week = detect_current_context()
-            logger.info(f"ESPN context -> year={espn_year} type={espn_type} week={espn_week}")
-        except Exception:
-            logger.exception("detect_current_context failed")
+    out = {
+        "season_year": season_year,
+        "week": week,
+        "total_games": 0,
+        "matched": 0,
+        "updated_scores": 0,
+        "updated_winner": 0,
+        "updated_status": 0,
+        "missing_in_espn": [],
+        "unmatched_espn": [],
+    }
 
-        # 2) Season selection (prefer ESPN's if present in DB)
-        season = None
-        if espn_year is not None:
-            has_espn_season = db.session.execute(
-                _text("SELECT 1 FROM weeks WHERE season_year=:y LIMIT 1"),
-                {"y": espn_year},
-            ).scalar()
-            if has_espn_season is not None:
-                season = espn_year
-        if season is None:
-            season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+    with app.app_context():
+        # --- ESPN events (requires Step 1 helper) ---
+        events = fetch_espn_scoreboard(week, season_year)
+        es_map = {(e["away_team"], e["home_team"]): e for e in events}
+        seen_keys = set()
+
+        # --- DB games for this week ---
+        rows = db.session.execute(_text("""
+            SELECT g.id, g.away_team, g.home_team,
+                   g.away_score, g.home_score, g.status, g.winner
+            FROM games g
+            JOIN weeks w ON w.id = g.week_id
+            WHERE w.season_year = :y AND w.week_number = :w
+            ORDER BY g.game_time
+        """), {"y": season_year, "w": week}).mappings().all()
+        out["total_games"] = len(rows)
+
+        for r in rows:
+            key = (r["away_team"], r["home_team"])
+            ev = es_map.get(key)
+            if not ev:
+                out["missing_in_espn"].append(f"{r['away_team']} @ {r['home_team']}")
+                continue
+            seen_keys.add(key)
+
+            # ESPN values
+            hs = ev.get("home_score")
+            as_ = ev.get("away_score")
+            state = (ev.get("state") or "").lower()   # "pre" | "in" | "post"
+            win = ev.get("winner")
+
+            # Decide desired status (never regress)
+            desired_status = "final" if state == "post" else ("in_progress" if state in ("in", "live") else None)
+            need_status = False
+            target_status = None
+            if desired_status and _rank_status(r["status"]) < _rank_status(desired_status):
+                need_status = True
+                target_status = "final" if desired_status == "final" else "in_progress"
+
+            # Only update values that are non-NULL and changed
+            sets, params = [], {"id": r["id"]}
+            if hs is not None and hs != r["home_score"]:
+                sets.append("home_score = :hs")
+                params["hs"] = hs
+            if as_ is not None and as_ != r["away_score"]:
+                sets.append("away_score = :as_")
+                params["as_"] = as_
+            if win and win != r["winner"]:
+                sets.append("winner = :winner")
+                params["winner"] = win
+            if need_status:
+                sets.append("status = :st")
+                params["st"] = target_status
+
+            if not sets:
+                out["matched"] += 1
+                continue
+
+            sql = "UPDATE games SET " + ", ".join(sets) + " WHERE id = :id"
+            db.session.execute(_text(sql), params)
+
+            if "hs" in params or "as_" in params:
+                out["updated_scores"] += 1
+            if "winner" in params:
+                out["updated_winner"] += 1
+            if "st" in params:
+                out["updated_status"] += 1
+
+        db.session.commit()
+
+        # Any ESPN events we didn't have in DB (nice-to-know)
+        out["unmatched_espn"] = [f"{a} @ {h}" for (a, h) in es_map.keys() - seen_keys]
+
+    return out
+def cron_syncscores() -> dict:
+    """
+    Pick the latest season + latest week in your DB and sync from ESPN.
+    Safe to run repeatedly; returns the same summary dict as sync_week_scores_from_espn.
+    """
+    from sqlalchemy import text as _text
+    app = create_app()
+    with app.app_context():
+        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
         if not season:
             logger.warning("cron_syncscores: no season_year in weeks")
             return {"error": "no season_year in weeks"}
+        week = db.session.execute(_text(
+            "SELECT MAX(week_number) FROM weeks WHERE season_year=:y"
+        ), {"y": season}).scalar()
+        if not week:
+            logger.warning("cron_syncscores: no week_number for season %s", season)
+            return {"error": f"no week_number for season {season}"}
 
-        # 3) Weeks list (DESC)
-        weeks_rows = db.session.execute(
-            _text("SELECT week_number FROM weeks WHERE season_year=:y ORDER BY week_number DESC"),
-            {"y": season},
-        ).all()
-        weeks = [r[0] for r in weeks_rows]
-        if not weeks:
-            logger.warning("cron_syncscores: no weeks found for season %s", season)
-            return {"error": f"no weeks found for season {season}"}
-
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-
-        # Prefer ESPN's week if present in DB
-        chosen = espn_week if (espn_week is not None and espn_week in weeks) else None
-
-        # 4) Only scan if we don't already have ESPN's week;
-        #    and never allow a FUTURE week (> espn_week) to override
-        if chosen is None:
-            scan_weeks = weeks
-            if espn_week is not None:
-                scan_weeks = [w for w in weeks if w <= espn_week]
-        else:
-            scan_weeks = []
-
-        for w in scan_weeks:
-            # DB signals
-            stats = db.session.execute(
-                _text(
-                    """
-                    SELECT
-                      SUM(
-                        CASE
-                          WHEN g.status IN ('final','in_progress')
-                               OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL)
-                          THEN 1 ELSE 0
-                        END
-                      ) AS progressed,
-                      MIN(g.game_time) AS first_kick
-                    FROM games g
-                    JOIN weeks wk ON wk.id = g.week_id
-                    WHERE wk.season_year=:y AND wk.week_number=:w
-                    """
-                ),
-                {"y": season, "w": w},
-            ).mappings().first()
-
-            db_active = False
-            if stats:
-                progressed = int(stats["progressed"] or 0)
-                first_kick = stats["first_kick"]
-                db_active = (progressed > 0) or (first_kick is not None and first_kick <= now)
-
-            # ESPN signals
-            espn_active = False
-            try:
-                evs = fetch_espn_scoreboard(w, season)
-                espn_active = any(
-                    (e.get("state") in ("in", "post"))
-                    or (e.get("home_score") is not None and e.get("away_score") is not None)
-                    for e in evs
-                )
-            except Exception:
-                logger.exception("cron_syncscores: ESPN probe failed for week %s", w)
-
-            if db_active or espn_active:
-                chosen = w
-                break
-
-        # Fallback
-        if chosen is None:
-            chosen = weeks[0]
-
-        # 5) IMPORTANT: run sync **inside** app context
-        summary = sync_week_scores_from_espn(chosen, season)
-        logger.info("cron_syncscores summary: %s", summary)
-        return summary
+    summary = sync_week_scores_from_espn(week, season)
+    logger.info("cron_syncscores summary: %s", summary)
+    return summary
 
 def _now_utc_naive():
     """UTC 'now' as naive datetime to match 'timestamp without time zone' columns."""
@@ -1250,7 +533,6 @@ async def whoisleft_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /remindweek <week> [participant name...]
 # If no name is supplied, nudges everyone with remaining picks.
 # Only sends games with g.game_time > now (future), and where no pick exists.
-
 async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     chat_id = str(update.effective_chat.id)
@@ -1462,7 +744,6 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         logger.exception("Failed sending /getscores to %s", r["name"])
             await m.reply_text(f"✅ Sent scoreboard to {sent} participant(s).")
-
 async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
@@ -1480,7 +761,7 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     from flask_app import create_app, db as _db
     app = create_app()
     with app.app_context():
-        # Admin guard (adjust if you want broader access)
+        # Admin guard
         is_admin = _db.session.execute(_text("""
             SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
         """), {"c": chat_id}).scalar() is not None
@@ -1488,12 +769,14 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             return await m.reply_text("Sorry, this command is restricted.")
 
         # Latest season
-        season = _db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+        season = _db.session.execute(_text("""
+            SELECT MAX(season_year) FROM weeks
+        """)).scalar()
         if not season:
             return await m.reply_text("No season data found in weeks table.")
 
-        # All weeks present for that season (ordered)
-        weeks = [int(r[0]) for r in _db.session.execute(_text("""
+        # All week numbers in season (ordered)
+        weeks = [r[0] for r in _db.session.execute(_text("""
             SELECT DISTINCT week_number
             FROM weeks
             WHERE season_year=:y
@@ -1534,63 +817,58 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             ORDER BY u.name, wg.week_number
         """), {"y": season}).mappings().all()
 
-        # Organize: name -> {week_number: wins}, and collect chat ids
-        pdata: dict[str, dict[int, int]] = {}
-        chat_ids: dict[str, str | None] = {}
-
+        # Organize into dict: name -> {week_number: wins}
+        pdata = {}
+        chat_ids = {}
         for r in rows:
-            name = r["name"] or "?"
+            name = r["name"]
+            if name not in pdata:
+                pdata[name] = {}
+                chat_ids[name] = r["telegram_chat_id"]
             wk = r["week_number"]
-            if wk is None:                 # <-- guard against NULL week rows
-                # This happens for participants with zero completed picks
-                # because of the LEFT JOIN on wg; just skip.
-                continue
-            wins_i = int(r["wins"] or 0)   # tolerate None just in case
-            pdata.setdefault(name, {})[int(wk)] = wins_i
-            chat_ids.setdefault(name, r["telegram_chat_id"])
+            if wk is not None:
+                pdata[name][wk] = int(r["wins"])
 
         # Ensure all participants appear even if they have no completed wins yet
-        for rp in _db.session.execute(_text(
-            "SELECT id, name, telegram_chat_id FROM participants"
-        )).mappings().all():
+        missing_participants = _db.session.execute(_text("""
+            SELECT id, name, telegram_chat_id FROM participants
+        """)).mappings().all()
+        for rp in missing_participants:
             pdata.setdefault(rp["name"], {})
             chat_ids.setdefault(rp["name"], rp["telegram_chat_id"])
 
-        # Build table with fixed-width columns, rendered via <pre> ... </pre>
+        # Build table lines
         names = sorted(pdata.keys())
         totals = {n: sum(pdata[n].get(w, 0) for w in weeks) for n in names}
         names.sort(key=lambda n: (-totals[n], n))  # by total desc, then name
 
-        header_html = "<b>🏆 Season-to-date Scoreboard</b>"
-        sub_html = f"<i>Season {season} — completed games only</i>"
-
+        header = "🏆 Season-to-date Scoreboard"
+        sub = f"Season {season} — completed games only"
         col_wks = " ".join(f"W{w}" for w in weeks)
-        name_w = max(4, max(len(n) for n in names) if names else 4)
+        title = f"{header}\n{sub}\n\nName   {col_wks}  | Total"
 
-        table_lines = [f'{"Name":<{name_w}}  {col_wks}  | Total']
+        lines = [title]
         for n in names:
             wk_counts = [str(pdata[n].get(w, 0)) for w in weeks]
-            row = f'{n:<{name_w}}  {" ".join(wk_counts)}  | {totals[n]}'
-            table_lines.append(row)
+            line = f"{n}: " + " ".join(wk_counts) + f"  | {totals[n]}"
+            lines.append(line)
 
-        table = "\n".join(table_lines)
-        body = f"{header_html}\n{sub_html}\n<pre>{table}</pre>"
+        body = "\n".join(lines)
 
-        # Reply in invoking chat (HTML parse mode so <pre> is monospaced)
-        await m.reply_text(body, parse_mode="HTML", disable_web_page_preview=True)
+        await m.reply_text(body)
 
-        # Optional broadcast
         if broadcast:
             sent = 0
             for n in names:
                 cid = chat_ids.get(n)
                 if cid:
                     try:
-                        _send_message(cid, body, parse_mode="HTML")
+                        _send_message(cid, body)
                         sent += 1
                     except Exception:
                         logger.exception("Failed sending /seasonboard to %s", n)
             await m.reply_text(f"✅ Sent season board to {sent} participant(s).")
+
 
 async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1739,44 +1017,18 @@ def run_telegram_listener():
     application.add_handler(CommandHandler("seepicks", seepicks_command))
     application.add_handler(CommandHandler("remindweek", remindweek_command))
     application.run_polling()
-def _send_message(
-    chat_id: str,
-    text: str,
-    reply_markup: dict | str | None = None,
-    parse_mode: str | None = None,
-):
-    """
-    Low-level helper to send a message via Telegram HTTP API (sync call).
-
-    - chat_id: Telegram chat id
-    - text: message body
-    - reply_markup: dict (will be JSON-encoded) or a pre-encoded JSON string
-    - parse_mode: e.g. "HTML" or "MarkdownV2"
-
-    When parse_mode is provided, we also disable link previews so score tables
-    wrapped in <pre> blocks stay clean.
-    """
-    import json, httpx, os
-
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
+def _send_message(chat_id: str, text: str, reply_markup: dict | None = None):
+    """Low-level helper to send a message via Telegram HTTP API (sync call)."""
+    if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-
-    base_url = globals().get("TELEGRAM_API_URL") or f"https://api.telegram.org/bot{token}"
-    url = f"{base_url}/sendMessage"
-
-    data: dict[str, object] = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        data["parse_mode"] = parse_mode
-        data["disable_web_page_preview"] = True
-
+    data = {"chat_id": chat_id, "text": text}
     if reply_markup is not None:
+        # Accept either a dict (encode) or a pre-encoded JSON string
         data["reply_markup"] = (
             reply_markup if isinstance(reply_markup, str) else json.dumps(reply_markup)
         )
-
     with httpx.Client(timeout=20) as client:
-        resp = client.post(url, data=data)
+        resp = client.post(f"{TELEGRAM_API_URL}/sendMessage", data=data)
         resp.raise_for_status()
 
 def send_week_games(week_number: int, season_year: int):
@@ -1948,155 +1200,25 @@ async def sendweek_command(update, context):
     await asyncio.to_thread(_do_broadcast)
     if update.message:
         await update.message.reply_text("✅ Done.")
-
 if __name__ == "__main__":
     import sys, json
-
-    cmd = sys.argv[1] if len(sys.argv) >= 2 else None
-
-    if cmd == "cron":
-        # Sync the CURRENT week (auto-detected) from ESPN to DB
+    if len(sys.argv) >= 2 and sys.argv[1] == "cron":
         print(json.dumps(cron_syncscores()))
-
-    elif cmd == "sendweek_upcoming":
-        # Auto-detect the next week (first kickoff > now) and broadcast picks
-        print(json.dumps(cron_send_upcoming_week()))
-
-    elif cmd == "sendweek":
-        # Manual broadcast: python jobs.py sendweek <week> [season_year]
-        if len(sys.argv) < 3:
-            raise SystemExit("Usage: python jobs.py sendweek <week> [season_year]")
-        week = int(sys.argv[2])
-
-        app = create_app()
-        with app.app_context():
-            if len(sys.argv) >= 4:
-                season_year = int(sys.argv[3])
-            else:
-                from sqlalchemy import text as _text
-                from models import db
-                season_year = db.session.execute(
-                    _text("""
-                        SELECT season_year
-                        FROM weeks
-                        WHERE week_number = :w
-                        ORDER BY season_year DESC
-                        LIMIT 1
-                    """),
-                    {"w": week},
-                ).scalar()
-                if not season_year:
-                    raise SystemExit(f"Week {week} not found in any season.")
-
-            # Send the week to all participants with telegram_chat_id
-            send_week_games(week, season_year)
-
-        print(json.dumps({"season_year": season_year, "week": week, "status": "sent"}))
-
-    elif cmd == "import-week":
-        # Import a specific week's games from ESPN into the DB:
-        #   python jobs.py import-week <season_year> <week>
-        if len(sys.argv) < 4:
-            raise SystemExit("Usage: python jobs.py import-week <season_year> <week>")
-        season_year = int(sys.argv[2])
-        week = int(sys.argv[3])
-        print(json.dumps(import_week_from_espn(season_year, week)))
-
-    elif cmd == "import-week-upcoming":
-        # Import the upcoming week (Tue-guarded) so the 9am sender has data:
-        #   python jobs.py import-week-upcoming
-        print(json.dumps(cron_import_upcoming_week()))
-
-    elif cmd == "announce-winners":
-        # Tuesday-guarded: announce last week's winners + season totals
-        print(json.dumps(cron_announce_weekly_winners()))
-
-    elif cmd == "announce-winners-now":
-        # FORCE an immediate announcement (bypasses Tuesday guard) — will SEND
-        from flask_app import create_app
-        from models import db
-        from sqlalchemy import text as _text
-        from datetime import datetime, timezone
-        import os, httpx
-
-        app = create_app()
-        with app.app_context():
-            season = _get_latest_season_year()
-            if not season:
-                raise SystemExit("No season_year found.")
-
-            now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-            upcoming = _find_upcoming_week_row(season, now_utc_naive)
-            if upcoming:
-                week_to_announce = max(2, int(upcoming["week_number"]) - 1)
-            else:
-                last_week = db.session.execute(
-                    _text("SELECT COALESCE(MAX(week_number),0) FROM weeks WHERE season_year=:y"),
-                    {"y": season},
-                ).scalar() or 0
-                week_to_announce = max(2, last_week)
-
-            # Ensure dedupe table, then try to claim this week
-            db.session.execute(_text("""
-                CREATE TABLE IF NOT EXISTS week_announcements (
-                    season_year INTEGER NOT NULL,
-                    week_number INTEGER NOT NULL,
-                    sent_at TIMESTAMPTZ DEFAULT NOW(),
-                    PRIMARY KEY (season_year, week_number)
-                )
-            """))
-            claimed = db.session.execute(_text("""
-                INSERT INTO week_announcements (season_year, week_number)
-                VALUES (:y, :w)
-                ON CONFLICT (season_year, week_number) DO NOTHING
-                RETURNING 1
-            """), {"y": season, "w": week_to_announce}).first()
-            if not claimed:
-                db.session.commit()
-                print(json.dumps({"status": "skipped_duplicate", "season_year": season, "week": week_to_announce}))
-                raise SystemExit(0)
-
-            weekly = _compute_week_results(season, week_to_announce)
-            season_totals = _compute_season_totals(season, week_to_announce)
-            msg = _format_winners_and_totals(week_to_announce, weekly, season_totals)
-
-            token = os.getenv("TELEGRAM_BOT_TOKEN")
-            if not token:
-                raise SystemExit("TELEGRAM_BOT_TOKEN not set.")
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-            participants = db.session.execute(_text("""
-                SELECT id, COALESCE(display_name, name, CONCAT('P', id::text)) AS name, telegram_chat_id
-                FROM participants
-                WHERE telegram_chat_id IS NOT NULL
-            """)).mappings().all()
-
-            sent = 0
-            with httpx.Client(timeout=20) as client:
-                for p in participants:
-                    r = client.post(url, json={"chat_id": p["telegram_chat_id"], "text": msg})
-                    r.raise_for_status()
-                    sent += 1
-
-            db.session.commit()
-            print(json.dumps({
-                "status": "sent",
-                "season_year": season,
-                "week": week_to_announce,
-                "recipients": sent,
-                "weekly_top": (weekly[0]["wins"] if weekly else 0),
-                "participants_ranked": len(season_totals),
-            }))
-
-    else:
-        raise SystemExit(
-            "Usage:\n"
-            "  python jobs.py cron\n"
-            "  python jobs.py sendweek_upcoming\n"
-            "  python jobs.py sendweek <week> [season_year]\n"
-            "  python jobs.py import-week <season_year> <week>\n"
-            "  python jobs.py import-week-upcoming\n"
-            "  python jobs.py announce-winners\n"
-            "  python jobs.py announce-winners-now\n"
-        )
+    elif len(sys.argv) >= 3 and sys.argv[1] == "syncscores":
+        try:
+            week = int(sys.argv[2])
+        except Exception:
+            raise SystemExit("Usage: python jobs.py syncscores <week> [season_year]")
+        season = int(sys.argv[3]) if len(sys.argv) >= 4 else None
+        if season is None:
+            from sqlalchemy import text as _text
+            app = create_app()
+            with app.app_context():
+                season = db.session.execute(_text("""
+                    SELECT season_year FROM weeks WHERE week_number=:w
+                    ORDER BY season_year DESC LIMIT 1
+                """), {"w": week}).scalar()
+                if not season:
+                    raise SystemExit(f"Week {week} not found.")
+        print(json.dumps(sync_week_scores_from_espn(week, season)))
 
