@@ -1,7 +1,8 @@
-import streamlit as st
-from supabase import create_client
 import os
 import uuid
+
+import streamlit as st
+from supabase import create_client
 
 # --- Supabase setup ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -12,6 +13,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 if "user" not in st.session_state:
     st.session_state.user = None
 
+
 def login(email, password):
     try:
         response = supabase.auth.sign_in_with_password({"email": email, "password": password})
@@ -20,34 +22,33 @@ def login(email, password):
     except Exception as e:
         st.error(f"Login failed: {e}")
 
+
 def logout():
     st.session_state.user = None
     st.success("Logged out!")
 
+
 # --- Save Functions ---
 def save_journal_entry(text):
-    supabase.table("journals").insert({
-        "id": str(uuid.uuid4()),
-        "user_id": st.session_state.user.id,
-        "text": text
-    }).execute()
+    supabase.table("journals").insert(
+        {"id": str(uuid.uuid4()), "user_id": st.session_state.user.id, "text": text}
+    ).execute()
     st.success("✅ Journal entry saved successfully!")
 
+
 def save_goal(text):
-    supabase.table("goals").insert({
-        "id": str(uuid.uuid4()),
-        "user_id": st.session_state.user.id,
-        "text": text
-    }).execute()
+    supabase.table("goals").insert(
+        {"id": str(uuid.uuid4()), "user_id": st.session_state.user.id, "text": text}
+    ).execute()
     st.success("🎯 Goal saved successfully!")
 
+
 def save_calendar_block(text):
-    supabase.table("calendar_blocks").insert({
-        "id": str(uuid.uuid4()),
-        "user_id": st.session_state.user.id,
-        "text": text
-    }).execute()
+    supabase.table("calendar_blocks").insert(
+        {"id": str(uuid.uuid4()), "user_id": st.session_state.user.id, "text": text}
+    ).execute()
     st.success("📅 Calendar block saved successfully!")
+
 
 # --- UI Pages ---
 def show_login():
@@ -58,6 +59,7 @@ def show_login():
     if st.button("Login"):
         login(email, password)
 
+
 def show_main():
     st.sidebar.success(f"Logged in as {st.session_state.user.email}")
     if st.sidebar.button("Logout"):
@@ -65,7 +67,10 @@ def show_main():
         st.stop()
 
     st.sidebar.header("Choose an Action")
-    choice = st.sidebar.radio("What do you want to do?", ["Journal Entry", "Set a Goal", "Calendar Block", "Review Progress"])
+    choice = st.sidebar.radio(
+        "What do you want to do?",
+        ["Journal Entry", "Set a Goal", "Calendar Block", "Review Progress"],
+    )
 
     # Journal Entry
     if choice == "Journal Entry":
@@ -99,6 +104,7 @@ def show_main():
         st.header("📊 Review Progress")
         st.info("Progress review logic is unchanged.")
 
+
 # --- Main Entry Point ---
 def main():
     if st.session_state.user:
@@ -106,6 +112,6 @@ def main():
     else:
         show_login()
 
+
 if __name__ == "__main__":
     main()
-

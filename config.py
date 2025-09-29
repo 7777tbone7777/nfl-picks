@@ -1,7 +1,7 @@
-
 import os
 from dataclasses import dataclass
 from typing import List, Optional
+
 
 @dataclass(frozen=True)
 class BotConfig:
@@ -12,11 +12,12 @@ class BotConfig:
     espn_retries: int = 3
     espn_backoff_s: float = 1.5
 
+
 def _parse_admin_ids(raw: Optional[str]) -> List[int]:
     vals: List[int] = []
     if not raw:
         return vals
-    for part in raw.split(','):
+    for part in raw.split(","):
         part = part.strip()
         if not part:
             continue
@@ -25,6 +26,7 @@ def _parse_admin_ids(raw: Optional[str]) -> List[int]:
         except ValueError:
             continue
     return vals
+
 
 def load_config() -> BotConfig:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()

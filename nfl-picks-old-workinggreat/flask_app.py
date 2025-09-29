@@ -1,7 +1,10 @@
 # flask_app.py
 import os
+
 from flask import Flask
+
 from models import db
+
 
 def create_app():
     app = Flask(__name__)
@@ -17,4 +20,3 @@ def create_app():
 
     # TODO: register blueprints/routes here when you add them
     return app
-

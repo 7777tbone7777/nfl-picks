@@ -1,13 +1,16 @@
 # nfl_data.py
-import requests
-from datetime import datetime, timedelta
-from flask_app import create_app
-from models import db, Week, Game
 import sys
+from datetime import datetime, timedelta
+
+import requests
+
+from flask_app import create_app
+from models import Game, Week, db
 
 # ------------------------
 # Helpers
 # ------------------------
+
 
 def current_season_year():
     """
@@ -31,6 +34,7 @@ def _parse_kickoff(date_str: str) -> datetime:
 # Main functions
 # ------------------------
 
+
 def fetch_and_create_week(week_number: int, season_year: int = None):
     """Fetch schedule for a given week/year from ESPN and insert into DB."""
     if season_year is None:
@@ -49,7 +53,11 @@ def fetch_and_create_week(week_number: int, season_year: int = None):
             # Picks deadline = earliest kickoff, usually Thursday night
             first_event = min(data["events"], key=lambda e: e["date"])
             deadline = _parse_kickoff(first_event["date"])
-            week = Week(week_number=week_number, season_year=season_year, picks_deadline=deadline)
+            week = Week(
+                week_number=week_number,
+                season_year=season_year,
+                picks_deadline=deadline,
+            )
             db.session.add(week)
             db.session.commit()
             print(f"Created Week {week_number}, {season_year}")
@@ -151,4 +159,3 @@ if __name__ == "__main__":
         week = int(sys.argv[2])
         season = int(sys.argv[3]) if len(sys.argv) > 3 else current_season_year()
         update_scores_for_week(week, season)
-

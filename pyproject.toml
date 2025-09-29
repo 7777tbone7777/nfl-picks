@@ -1,0 +1,12 @@
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+# Use a literal multiline string so backslashes don't need escaping.
+extend-exclude = '''
+(^old/jobs-corrupted\.py$)
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+

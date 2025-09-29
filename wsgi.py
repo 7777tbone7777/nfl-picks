@@ -1,6 +1,8 @@
 # wsgi.py — define and expose the Flask app (no imports from flask_app here!)
 import os
+
 from flask import Flask
+
 from models import db  # make sure nfl-picks/models.py exists and defines `db = SQLAlchemy()`
 
 # Optional: trust proxy headers on Heroku (so request.url, scheme, host are correct)
@@ -41,6 +43,7 @@ def create_app() -> Flask:
     # This is optional and safely ignored if you don't have such a module.
     try:
         from routes import bp as routes_bp  # noqa: E402
+
         app.register_blueprint(routes_bp)
     except Exception:
         # No routes blueprint found (or not needed) — that's fine.

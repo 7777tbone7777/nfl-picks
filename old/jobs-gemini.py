@@ -1,22 +1,27 @@
-import os
 import logging
-import httpx # Changed from 'h px'
-from datetime import datetime # Added for general date/time use
-from zoneinfo import ZoneInfo # Added for timezone conversion
+import os
+from datetime import datetime  # Added for general date/time use
+from zoneinfo import ZoneInfo  # Added for timezone conversion
 
-from app import create_app # Changed from 'flask_app' to 'app' as per app.py
-from models import db, Week, Game, Participant, Pick
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode # Corrected imports
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes # Corrected imports
-from sqlalchemy import and_ # Added for calculating results
+import httpx  # Changed from 'h px'
+from app import create_app  # Changed from 'flask_app' to 'app' as per app.py
+from sqlalchemy import and_  # Added for calculating results
+from telegram import InlineKeyboardButton  # Corrected imports
+from telegram import InlineKeyboardMarkup, ParseMode, Update
+from telegram.ext import Application  # Corrected imports
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
+
+from models import Game, Participant, Pick, Week, db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jobs")
 
 # Ensure TELEGRAM_BOT_TOKEN is set in your environment variables
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
-    logger.error("TELEGRAM_BOT_TOKEN environment variable not set. Telegram features will not work.")
+    logger.error(
+        "TELEGRAM_BOT_TOKEN environment variable not set. Telegram features will not work."
+    )
     # Exit or raise error if token is critical for execution
     # For now, we'll just log and continue, but messages won't send.
 
@@ -40,7 +45,9 @@ def send_week_games(week_number: int, season_year: int) -> None:
         games = Game.query.filter_by(week_id=week.id).order_by(Game.game_time).all()
 
         if not games:
-            logger.warning(f"No games found for week {week_number}, season {season_year}. Skipping sending games.")
+            logger.warning(
+                f"No games found for week {week_number}, season {season_year}. Skipping sending games."
+            )
             return
 
         for p in participants:
@@ -48,53 +55,66 @@ def send_week_games(week_number: int, season_year: int) -> None:
                 logger.info(f"Skipping {p.name}: No Telegram chat ID found.")
                 continue
 
-            logger.info(f"Sending Week {week_number} games to {p.name} (chat_id: {p.telegram_chat_id})...")
-            
+            logger.info(
+                f"Sending Week {week_number} games to {p.name} (chat_id: {p.telegram_chat_id})..."
+            )
+
             for g in games:
                 # Convert game time to Pacific Time (PT) for display
                 # g.game_time is naive UTC, so make it aware first
                 game_time_utc = g.game_time.replace(tzinfo=ZoneInfo("UTC"))
                 local_time_pt = game_time_utc.astimezone(ZoneInfo("America/Los_Angeles"))
-                
+
                 # Check if the pick has already been made by this participant for this game
-                existing_pick = Pick.query.filter_by(
-                    participant_id=p.id,
-                    game_id=g.id
-                ).first()
+                existing_pick = Pick.query.filter_by(participant_id=p.id, game_id=g.id).first()
 
                 # Text for the message
                 text = f"{g.away_team} @ {g.home_team}\n{local_time_pt.strftime('%a %b %d %I:%M %p PT')}"
-                
+
                 # If a pick already exists, indicate it
                 if existing_pick:
                     text += f"\n*Your current pick: {existing_pick.selected_team}*"
 
-                keyboard = InlineKeyboardMarkup([
+                keyboard = InlineKeyboardMarkup(
                     [
-                        InlineKeyboardButton(g.away_team, callback_data=f"pick:{p.id}:{g.id}:{g.away_team}"),
-                        InlineKeyboardButton(g.home_team, callback_data=f"pick:{p.id}:{g.id}:{g.home_team}"),
+                        [
+                            InlineKeyboardButton(
+                                g.away_team,
+                                callback_data=f"pick:{p.id}:{g.id}:{g.away_team}",
+                            ),
+                            InlineKeyboardButton(
+                                g.home_team,
+                                callback_data=f"pick:{p.id}:{g.id}:{g.home_team}",
+                            ),
+                        ]
                     ]
-                ])
+                )
 
                 try:
-                    resp = httpx.post( # Corrected client to httpx
+                    resp = httpx.post(  # Corrected client to httpx
                         f"{TELEGRAM_API_URL}/sendMessage",
                         json={
                             "chat_id": p.telegram_chat_id,
                             "text": text,
                             "reply_markup": keyboard.to_dict(),
-                            "parse_mode": "Markdown" # Use Markdown to bold the current pick
+                            "parse_mode": "Markdown",  # Use Markdown to bold the current pick
                         },
-                        timeout=10 # Add a timeout for robustness
+                        timeout=10,  # Add a timeout for robustness
                     )
-                    resp.raise_for_status() # Raises an exception for 4xx/5xx responses
+                    resp.raise_for_status()  # Raises an exception for 4xx/5xx responses
                     logger.info(f"✅ Sent game to {p.name}: {g.away_team} @ {g.home_team}")
                 except httpx.HTTPStatusError as e:
-                    logger.error(f"💥 HTTP Error sending game to {p.name} (chat_id: {p.telegram_chat_id}): {e.response.status_code} - {e.response.text}")
+                    logger.error(
+                        f"💥 HTTP Error sending game to {p.name} (chat_id: {p.telegram_chat_id}): {e.response.status_code} - {e.response.text}"
+                    )
                 except httpx.RequestError as e:
-                    logger.error(f"💥 Request Error sending game to {p.name} (chat_id: {p.telegram_chat_id}): {e}")
+                    logger.error(
+                        f"💥 Request Error sending game to {p.name} (chat_id: {p.telegram_chat_id}): {e}"
+                    )
                 except Exception as e:
-                    logger.error(f"💥 Unexpected Error sending game to {p.name} (chat_id: {p.telegram_chat_id}): {e}")
+                    logger.error(
+                        f"💥 Unexpected Error sending game to {p.name} (chat_id: {p.telegram_chat_id}): {e}"
+                    )
 
 
 async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,11 +125,11 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
 
-    await query.answer() # Acknowledge the callback query
+    await query.answer()  # Acknowledge the callback query
 
     try:
         # data format: "pick:participant_id:game_id:team"
-        _, participant_id_str, game_id_str, team = query.data.split(":", 3) # Use 3 for maxsplit
+        _, participant_id_str, game_id_str, team = query.data.split(":", 3)  # Use 3 for maxsplit
         participant_id = int(participant_id_str)
         game_id = int(game_id_str)
     except ValueError:
@@ -128,7 +148,9 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         week = Week.query.get(game.week_id)
         if week and datetime.utcnow() > week.picks_deadline:
-            await query.edit_message_text(f"❌ Deadline for Week {week.week_number} has passed. Cannot change pick.")
+            await query.edit_message_text(
+                f"❌ Deadline for Week {week.week_number} has passed. Cannot change pick."
+            )
             return
 
         pick = Pick.query.filter_by(participant_id=participant_id, game_id=game_id).first()
@@ -136,18 +158,24 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Note: The model column is 'selected_team', not 'team'
             pick = Pick(participant_id=participant_id, game_id=game_id, selected_team=team)
             db.session.add(pick)
-            logger.info(f"Created new pick for participant {participant_id}, game {game_id}: {team}")
+            logger.info(
+                f"Created new pick for participant {participant_id}, game {game_id}: {team}"
+            )
         else:
             old_team = pick.selected_team
             pick.selected_team = team
-            logger.info(f"Updated pick for participant {participant_id}, game {game_id}: {old_team} -> {team}")
-        
+            logger.info(
+                f"Updated pick for participant {participant_id}, game {game_id}: {old_team} -> {team}"
+            )
+
         try:
             db.session.commit()
             await query.edit_message_text(f"✅ Pick saved: You picked *{team}*")
         except Exception as e:
             db.session.rollback()
-            logger.error(f"💥 Error saving pick for participant {participant_id}, game {game_id}: {e}")
+            logger.error(
+                f"💥 Error saving pick for participant {participant_id}, game {game_id}: {e}"
+            )
             await query.edit_message_text("❌ Error saving your pick to the database.")
 
 
@@ -162,7 +190,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"📩 /start received from {user.username} (id={chat_id})")
 
     if not user.username:
-        await update.message.reply_text("👋 Welcome! To link your Telegram account, please set a public Telegram username in your Telegram settings.")
+        await update.message.reply_text(
+            "👋 Welcome! To link your Telegram account, please set a public Telegram username in your Telegram settings."
+        )
         return
 
     app = create_app()
@@ -171,17 +201,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Note: This assumes participant.name in DB is the Telegram username.
         # You might need a more robust linking mechanism (e.g., a unique code).
         participant = Participant.query.filter_by(name=user.username).first()
-        
+
         if participant:
             participant.telegram_chat_id = str(chat_id)
             try:
                 db.session.commit()
-                logger.info(f"🔗 Linked participant '{participant.name}' (DB ID: {participant.id}) to Telegram chat_id {chat_id}")
-                await update.message.reply_text(f"👋 Welcome {participant.name}! Your Telegram account is now linked. You'll receive game picks and reminders here.")
+                logger.info(
+                    f"🔗 Linked participant '{participant.name}' (DB ID: {participant.id}) to Telegram chat_id {chat_id}"
+                )
+                await update.message.reply_text(
+                    f"👋 Welcome {participant.name}! Your Telegram account is now linked. You'll receive game picks and reminders here."
+                )
             except Exception as e:
                 db.session.rollback()
-                logger.error(f"💥 Error linking participant {participant.name} to chat_id {chat_id}: {e}")
-                await update.message.reply_text("❌ Error linking your Telegram account. Please try again or contact support.")
+                logger.error(
+                    f"💥 Error linking participant {participant.name} to chat_id {chat_id}: {e}"
+                )
+                await update.message.reply_text(
+                    "❌ Error linking your Telegram account. Please try again or contact support."
+                )
         else:
             logger.info(f"🤷‍♀️ No participant found for Telegram username '{user.username}'.")
             await update.message.reply_text(
@@ -189,12 +227,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Please make sure your Telegram username matches the name you registered with, or contact the pool administrator."
             )
 
-async def send_notification_telegram(chat_id: str, message: str, parse_mode: str = ParseMode.HTML) -> bool:
+
+async def send_notification_telegram(
+    chat_id: str, message: str, parse_mode: str = ParseMode.HTML
+) -> bool:
     """Helper function to send a Telegram message to a specific chat_id."""
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set, cannot send Telegram message.")
         return False
-    
+
     try:
         resp = httpx.post(
             f"{TELEGRAM_API_URL}/sendMessage",
@@ -203,20 +244,24 @@ async def send_notification_telegram(chat_id: str, message: str, parse_mode: str
                 "text": message,
                 "parse_mode": parse_mode,
             },
-            timeout=10
+            timeout=10,
         )
         resp.raise_for_status()
         logger.info(f"✅ Telegram message sent to chat_id {chat_id}.")
         return True
     except httpx.HTTPStatusError as e:
-        logger.error(f"💥 HTTP Error sending Telegram notification to {chat_id}: {e.response.status_code} - {e.response.text}")
+        logger.error(
+            f"💥 HTTP Error sending Telegram notification to {chat_id}: {e.response.status_code} - {e.response.text}"
+        )
     except httpx.RequestError as e:
         logger.error(f"💥 Request Error sending Telegram notification to {chat_id}: {e}")
     except Exception as e:
         logger.error(f"💥 Unexpected Error sending Telegram notification to {chat_id}: {e}")
     return False
 
+
 # --- Refactored notification functions to use Telegram ---
+
 
 def send_week_launch_notification(week_number: int, app_instance):
     """Sends a launch notification for a new week to all participants via Telegram."""
@@ -226,7 +271,7 @@ def send_week_launch_notification(week_number: int, app_instance):
             if not p.telegram_chat_id:
                 logger.warning(f"Skipping launch notification for {p.name}: No Telegram chat ID.")
                 continue
-            
+
             # Assuming 'app_instance' refers to the Flask app, and you can generate URLs
             # Make sure this `url_for` is correctly configured if it's used in a non-request context.
             # For this context, it will likely generate relative paths, which might not be external.
@@ -238,9 +283,10 @@ def send_week_launch_notification(week_number: int, app_instance):
 
             message = f"🏈 Week {week_number} of NFL Picks is *LIVE*! Time to make your selections. I'll send you each game individually."
             send_notification_telegram(p.telegram_chat_id, message, parse_mode=ParseMode.MARKDOWN)
-            
+
             # After sending the launch message, send the individual games
-            send_week_games(week_number, datetime.now().year) # Assuming current year for new week
+            send_week_games(week_number, datetime.now().year)  # Assuming current year for new week
+
 
 def check_and_send_reminders(app_instance):
     """
@@ -248,14 +294,18 @@ def check_and_send_reminders(app_instance):
     """
     with app_instance.app_context():
         now = datetime.utcnow()
-        current_week = Week.query.filter(Week.picks_deadline > now).order_by(Week.week_number).first()
+        current_week = (
+            Week.query.filter(Week.picks_deadline > now).order_by(Week.week_number).first()
+        )
         if not current_week:
             logger.info("No current week for reminders.")
             return
 
         games_count = Game.query.filter_by(week_id=current_week.id).count()
         if games_count == 0:
-            logger.warning(f"No games found for current week {current_week.week_number}. Skipping reminders.")
+            logger.warning(
+                f"No games found for current week {current_week.week_number}. Skipping reminders."
+            )
             return
 
         participants = Participant.query.all()
@@ -264,34 +314,45 @@ def check_and_send_reminders(app_instance):
                 logger.warning(f"Skipping reminder for {p.name}: No Telegram chat ID found.")
                 continue
 
-            picks_count = Pick.query.filter_by(participant_id=p.id).join(Game).filter(Game.week_id==current_week.id).count()
+            picks_count = (
+                Pick.query.filter_by(participant_id=p.id)
+                .join(Game)
+                .filter(Game.week_id == current_week.id)
+                .count()
+            )
             if picks_count < games_count:
                 hours_left = (current_week.picks_deadline - now).total_seconds() / 3600
-                reminder_kind = 'deadline' if hours_left <= 48 else 'nudge' # Use 'kind' from Reminder model
-                
+                reminder_kind = (
+                    "deadline" if hours_left <= 48 else "nudge"
+                )  # Use 'kind' from Reminder model
+
                 # Check if this specific reminder has already been sent for this kind and participant
                 if not Reminder.query.filter_by(
                     participant_id=p.id,
                     week_id=current_week.id,
                     kind=reminder_kind,
-                    channel='telegram'
+                    channel="telegram",
                 ).first():
                     missing_count = games_count - picks_count
-                    
+
                     message = f"🔔 *Reminder {p.name}*! You still have *{missing_count}* games unpicked for Week {current_week.week_number}. The deadline is approaching!"
                     # For Telegram, we'll re-send the game buttons if they haven't picked.
                     # Or a direct message asking them to check.
                     # For simplicity, let's just send the reminder message.
                     # If you want to resend buttons for *only* unpicked games, that's more complex.
-                    
-                    if send_notification_telegram(p.telegram_chat_id, message, parse_mode=ParseMode.MARKDOWN):
-                        db.session.add(Reminder(
-                            participant_id=p.id,
-                            week_id=current_week.id,
-                            kind=reminder_kind,
-                            channel='telegram',
-                            status='sent'
-                        ))
+
+                    if send_notification_telegram(
+                        p.telegram_chat_id, message, parse_mode=ParseMode.MARKDOWN
+                    ):
+                        db.session.add(
+                            Reminder(
+                                participant_id=p.id,
+                                week_id=current_week.id,
+                                kind=reminder_kind,
+                                channel="telegram",
+                                status="sent",
+                            )
+                        )
         db.session.commit()
         logger.info("Reminder check complete.")
 
@@ -308,42 +369,45 @@ def calculate_and_send_results(app_instance):
 
         week_to_score = latest_week.week_number
         season_to_score = latest_week.season_year
-        
+
         # Make sure scores are up-to-date before calculating results
         try:
             from nfl_data import update_scores_for_week
+
             logger.info(f"Updating scores for Week {week_to_score} before calculating results...")
             update_scores_for_week(week_to_score, season_to_score)
         except ImportError:
-            logger.warning("Warning: update_scores_for_week function not found. Skipping score updates.")
+            logger.warning(
+                "Warning: update_scores_for_week function not found. Skipping score updates."
+            )
         except Exception as e:
             logger.error(f"Error updating scores for Week {week_to_score}: {e}")
 
-        games = Game.query.filter_by(week_id=latest_week.id, status='final').all()
-        
+        games = Game.query.filter_by(week_id=latest_week.id, status="final").all()
+
         # Update pick results (W/L) based on final game scores
         for game in games:
             winner = None
             if game.home_score is not None and game.away_score is not None:
-                if game.home_score > game.away_score: 
+                if game.home_score > game.away_score:
                     winner = game.home_team
-                elif game.away_score > game.home_score: 
+                elif game.away_score > game.home_score:
                     winner = game.away_team
-            
+
             # Ensure game.winner is set in the DB as well for dashboard/standings
             if winner and game.winner != winner:
-                game.winner = winner # Update the game model's winner field
-                db.session.add(game) # Mark for commit
-            
+                game.winner = winner  # Update the game model's winner field
+                db.session.add(game)  # Mark for commit
+
             if winner is None:
-                continue # Skip games without a clear winner (e.g., ties, or not fully scored)
+                continue  # Skip games without a clear winner (e.g., ties, or not fully scored)
 
             for pick in Pick.query.filter_by(game_id=game.id).all():
                 if pick.selected_team == winner:
-                    pick.result = 'W'
+                    pick.result = "W"
                 else:
-                    pick.result = 'L'
-                db.session.add(pick) # Mark for commit
+                    pick.result = "L"
+                db.session.add(pick)  # Mark for commit
 
         db.session.commit()
         logger.info(f"Scored all final games for Week {week_to_score} and updated picks.")
@@ -354,18 +418,36 @@ def calculate_and_send_results(app_instance):
                 logger.warning(f"Skipping results for {p.name}: No Telegram chat ID.")
                 continue
 
-            wins = Pick.query.filter(
-                and_(Pick.participant_id == p.id, Pick.result == 'W', Game.week_id == latest_week.id)
-            ).join(Game).count() # Ensure Game.week_id filter is applied to the join
+            wins = (
+                Pick.query.filter(
+                    and_(
+                        Pick.participant_id == p.id,
+                        Pick.result == "W",
+                        Game.week_id == latest_week.id,
+                    )
+                )
+                .join(Game)
+                .count()
+            )  # Ensure Game.week_id filter is applied to the join
 
-            losses = Pick.query.filter(
-                and_(Pick.participant_id == p.id, Pick.result == 'L', Game.week_id == latest_week.id)
-            ).join(Game).count() # Ensure Game.week_id filter is applied to the join
-            
+            losses = (
+                Pick.query.filter(
+                    and_(
+                        Pick.participant_id == p.id,
+                        Pick.result == "L",
+                        Game.week_id == latest_week.id,
+                    )
+                )
+                .join(Game)
+                .count()
+            )  # Ensure Game.week_id filter is applied to the join
+
             # Format results message
-            message = f"🎉 *NFL Picks Week {week_to_score} Results for {p.name}* 🎉\n" \
-                      f"You finished with a record of *{wins} wins* and *{losses} losses*!"
-            
+            message = (
+                f"🎉 *NFL Picks Week {week_to_score} Results for {p.name}* 🎉\n"
+                f"You finished with a record of *{wins} wins* and *{losses} losses*!"
+            )
+
             # Optionally list specific picks and their results
             # user_picks_for_week = Pick.query.filter(
             #     and_(Pick.participant_id == p.id, Game.week_id == latest_week.id)
@@ -394,7 +476,8 @@ def run_telegram_listener():
     application.add_handler(CallbackQueryHandler(handle_pick))
 
     # Run the bot until the user presses Ctrl-C or the process receives a signal.
-    application.run_polling(poll_interval=1) # Set a small poll_interval for quicker response
+    application.run_polling(poll_interval=1)  # Set a small poll_interval for quicker response
+
 
 # --- Old Twilio functions removed or commented out ---
 # The original `send_sms` function is removed as we are fully moving to Telegram for notifications.

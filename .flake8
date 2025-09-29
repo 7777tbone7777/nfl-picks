@@ -1,0 +1,22 @@
+[flake8]
+# Let lines be longer than Black's wrap to avoid nitpicks on legacy code.
+max-line-length = 120
+extend-ignore = E203,W503
+
+per-file-ignores =
+    # Whole legacy trees
+    old/*: E501,F401,F811,E722,E999,F821
+    nfl-picks-old-workinggreat/*: E501,F401,F811,E722,F821
+    WORKING/*: E501,F401,F811,E722,F821
+
+    # Specific legacy modules in current tree
+    app-old.py: E501,F401
+    bot/app-old.py: E501,F401
+    bot/espn_client.py: E501,E722
+    espn_client.py: E501,E722
+    telegram_handlers.py: E501,E722,F401
+    bot/telegram_handlers.py: E501,E722,F401
+
+    # A couple cron files with long strings/log lines
+    cron_jobs.py: E501
+    bot/cron_jobs.py: E501

@@ -1,7 +1,9 @@
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler
-from .logging_setup import setup_logging
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+
 from .config import load_config
-from .telegram_handlers import start, handle_pick, mypicks
+from .logging_setup import setup_logging
+from .telegram_handlers import handle_pick, mypicks, start
+
 
 def main():
     setup_logging()
@@ -15,6 +17,7 @@ def main():
     app.add_handler(CommandHandler("mypicks", mypicks))
 
     app.run_polling(allowed_updates=Application.ALL_UPDATE_TYPES)
+
 
 if __name__ == "__main__":
     main()

@@ -1,16 +1,18 @@
-import os
+import asyncio
+import json
 import logging
-from zoneinfo import ZoneInfo
-import httpx
-import os, asyncio, logging
-import sys, json
-from telegram.ext import CommandHandler
-from sqlalchemy import text as _text
-from flask_app import create_app
-from models import db, Participant, Week, Game, Pick
-from telegram import Update
-from telegram.ext import ContextTypes
+import os
+import sys
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import httpx
+from sqlalchemy import text as _text
+from telegram import Update
+from telegram.ext import CommandHandler, ContextTypes
+
+from flask_app import create_app
+from models import Game, Participant, Pick, Week, db
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -18,11 +20,14 @@ logger = logging.getLogger("jobs")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS","").replace(" ","").split(",") if x.isdigit()}
+ADMIN_IDS = {
+    int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",") if x.isdigit()
+}
 
 # --- ESPN NFL scoreboard (read-only fetch) ---
 # Regular season = seasontype=2. Preseason(1), Postseason(3).
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+
 
 def import_week_from_espn(season_year: int, week: int) -> dict:
     """
@@ -30,19 +35,22 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
     for that week from ESPN into the games table (home/away/time/status/scores).
     Matching is by (home_team, away_team) case-insensitive within the week.
     """
-    from sqlalchemy import text as _text
     from datetime import datetime, timezone
+
+    from sqlalchemy import text as _text
 
     app = create_app()
     with app.app_context():
         # Ensure week exists; get week_id
         row = db.session.execute(
-            _text("""
+            _text(
+                """
                 INSERT INTO weeks (season_year, week_number)
                 VALUES (:y, :w)
                 ON CONFLICT (season_year, week_number) DO NOTHING
                 RETURNING id
-            """),
+            """
+            ),
             {"y": season_year, "w": week},
         ).first()
         if row:
@@ -64,7 +72,9 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             try:
                 dt = datetime.fromisoformat(s)
                 if dt.tzinfo:
-                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)  # store as naive UTC like your schema
+                    dt = dt.astimezone(timezone.utc).replace(
+                        tzinfo=None
+                    )  # store as naive UTC like your schema
                 return dt
             except Exception:
                 return None
@@ -82,7 +92,8 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
 
             # Try update existing game (match by teams within the week)
             res = db.session.execute(
-                _text("""
+                _text(
+                    """
                     UPDATE games
                     SET game_time = COALESCE(:game_time, game_time),
                         status     = COALESCE(:status, status),
@@ -91,7 +102,8 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
                     WHERE week_id=:week_id
                       AND lower(home_team)=lower(:home)
                       AND lower(away_team)=lower(:away)
-                """),
+                """
+                ),
                 {
                     "game_time": start_dt,
                     "status": status,
@@ -105,12 +117,14 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             if res.rowcount == 0:
                 # Insert new game
                 db.session.execute(
-                    _text("""
+                    _text(
+                        """
                         INSERT INTO games
                             (week_id, home_team, away_team, game_time, status, home_score, away_score)
                         VALUES
                             (:week_id, :home, :away, :game_time, :status, :home_score, :away_score)
-                    """),
+                    """
+                    ),
                     {
                         "week_id": week_id,
                         "home": home,
@@ -134,24 +148,28 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             "updated": updated,
         }
 
+
 def import_week_from_espn(season_year: int, week: int) -> dict:
     """
     Ensure (season_year, week) exists in weeks; upsert all games for that week
     from ESPN into games (home/away/time/status/scores). Idempotent.
     """
-    from sqlalchemy import text as _text
     from datetime import datetime, timezone
+
+    from sqlalchemy import text as _text
 
     app = create_app()
     with app.app_context():
         # Ensure week exists; get week_id
         row = db.session.execute(
-            _text("""
+            _text(
+                """
                 INSERT INTO weeks (season_year, week_number)
                 VALUES (:y, :w)
                 ON CONFLICT (season_year, week_number) DO NOTHING
                 RETURNING id
-            """),
+            """
+            ),
             {"y": season_year, "w": week},
         ).first()
         if row:
@@ -188,7 +206,8 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             away_score = e.get("away_score")
 
             res = db.session.execute(
-                _text("""
+                _text(
+                    """
                     UPDATE games
                     SET game_time = COALESCE(:game_time, game_time),
                         status     = COALESCE(:status, status),
@@ -197,7 +216,8 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
                     WHERE week_id=:week_id
                       AND lower(home_team)=lower(:home)
                       AND lower(away_team)=lower(:away)
-                """),
+                """
+                ),
                 {
                     "game_time": start_dt,
                     "status": status,
@@ -210,12 +230,14 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             )
             if res.rowcount == 0:
                 db.session.execute(
-                    _text("""
+                    _text(
+                        """
                         INSERT INTO games
                             (week_id, home_team, away_team, game_time, status, home_score, away_score)
                         VALUES
                             (:week_id, :home, :away, :game_time, :status, :home_score, :away_score)
-                    """),
+                    """
+                    ),
                     {
                         "week_id": week_id,
                         "home": home,
@@ -231,26 +253,46 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
                 updated += 1
 
         db.session.commit()
-        return {"season_year": season_year, "week": week, "events": len(events), "created": created, "updated": updated}
+        return {
+            "season_year": season_year,
+            "week": week,
+            "events": len(events),
+            "created": created,
+            "updated": updated,
+        }
+
 
 def _get_latest_season_year():
     from sqlalchemy import text as _text
+
     return db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+
 
 def _find_upcoming_week_row(season_year, now_naive_utc):
     from sqlalchemy import text as _text
-    rows = db.session.execute(_text("""
+
+    rows = (
+        db.session.execute(
+            _text(
+                """
         SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
         FROM weeks w
         LEFT JOIN games g ON g.week_id = w.id
         WHERE w.season_year = :y
         GROUP BY w.week_number
         ORDER BY w.week_number
-    """), {"y": season_year}).mappings().all()
+    """
+            ),
+            {"y": season_year},
+        )
+        .mappings()
+        .all()
+    )
     for r in rows:
         if r["first_kick"] and r["first_kick"] > now_naive_utc:
             return r
     return None
+
 
 def _compute_week_results(season_year: int, week: int):
     """
@@ -258,7 +300,11 @@ def _compute_week_results(season_year: int, week: int):
     Counts a win when pick matches game winner (based on scores) for FINAL games.
     """
     from sqlalchemy import text as _text
-    rows = db.session.execute(_text("""
+
+    rows = (
+        db.session.execute(
+            _text(
+                """
         WITH week_games AS (
           SELECT g.id AS game_id,
                  CASE WHEN g.home_score > g.away_score THEN g.home_team
@@ -283,8 +329,22 @@ def _compute_week_results(season_year: int, week: int):
           GROUP BY pp.participant_id, pp.name
         )
         SELECT * FROM scores ORDER BY wins DESC, name ASC
-    """), {"y": season_year, "w": week}).mappings().all()
-    return [{"participant_id": r["participant_id"], "name": r["name"], "wins": int(r["wins"] or 0)} for r in rows]
+    """
+            ),
+            {"y": season_year, "w": week},
+        )
+        .mappings()
+        .all()
+    )
+    return [
+        {
+            "participant_id": r["participant_id"],
+            "name": r["name"],
+            "wins": int(r["wins"] or 0),
+        }
+        for r in rows
+    ]
+
 
 def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
     """
@@ -292,7 +352,11 @@ def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
     Returns [{'participant_id', 'name', 'wins'}, ...] ordered by wins desc.
     """
     from sqlalchemy import text as _text
-    rows = db.session.execute(_text("""
+
+    rows = (
+        db.session.execute(
+            _text(
+                """
         WITH season_games AS (
           SELECT g.id AS game_id,
                  CASE WHEN g.home_score > g.away_score THEN g.home_team
@@ -317,8 +381,22 @@ def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
           GROUP BY pp.participant_id, pp.name
         )
         SELECT * FROM scores ORDER BY wins DESC, name ASC
-    """), {"y": season_year, "wk": up_to_week_inclusive}).mappings().all()
-    return [{"participant_id": r["participant_id"], "name": r["name"], "wins": int(r["wins"] or 0)} for r in rows]
+    """
+            ),
+            {"y": season_year, "wk": up_to_week_inclusive},
+        )
+        .mappings()
+        .all()
+    )
+    return [
+        {
+            "participant_id": r["participant_id"],
+            "name": r["name"],
+            "wins": int(r["wins"] or 0),
+        }
+        for r in rows
+    ]
+
 
 def _format_winners_and_totals(week: int, weekly_rows, season_rows):
     # Weekly winners (could be tie)
@@ -338,15 +416,18 @@ def _format_winners_and_totals(week: int, weekly_rows, season_rows):
         rank += 1
     return weekly_line + "\n" + "\n".join(lines)
 
+
 def cron_announce_weekly_winners() -> dict:
     """
     Tuesday (America/Los_Angeles) 08:55 PT: announce last week's winners + season totals,
     broadcasted to all participants with telegram_chat_id. De-duped per season/week.
     """
-    from sqlalchemy import text as _text
+    import os
     from datetime import datetime, timezone
     from zoneinfo import ZoneInfo
-    import os, httpx
+
+    import httpx
+    from sqlalchemy import text as _text
 
     app = create_app()
     with app.app_context():
@@ -365,35 +446,60 @@ def cron_announce_weekly_winners() -> dict:
         upcoming = _find_upcoming_week_row(season, now_utc_naive)
         if not upcoming:
             # If no upcoming, assume max existing week and announce that-1
-            last_week = db.session.execute(_text("""
+            last_week = (
+                db.session.execute(
+                    _text(
+                        """
                 SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y
-            """), {"y": season}).scalar() or 0
+            """
+                    ),
+                    {"y": season},
+                ).scalar()
+                or 0
+            )
             week_to_announce = max(2, last_week)  # never below 2 for season totals rule
         else:
             week_to_announce = max(2, int(upcoming["week_number"]) - 1)
 
         # Dedupe table (separate from sendweek)
-        db.session.execute(_text("""
+        db.session.execute(
+            _text(
+                """
             CREATE TABLE IF NOT EXISTS week_announcements (
                 season_year INTEGER NOT NULL,
                 week_number INTEGER NOT NULL,
                 sent_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (season_year, week_number)
             )
-        """))
+        """
+            )
+        )
         db.session.commit()
 
         # Try to claim this announcement first (prevents double sends)
-        claimed = db.session.execute(_text("""
+        claimed = db.session.execute(
+            _text(
+                """
             INSERT INTO week_announcements (season_year, week_number)
             VALUES (:y, :w)
             ON CONFLICT (season_year, week_number) DO NOTHING
             RETURNING 1
-        """), {"y": season, "w": week_to_announce}).first()
+        """
+            ),
+            {"y": season, "w": week_to_announce},
+        ).first()
         if not claimed:
             db.session.commit()
-            logger.info("cron_announce_weekly_winners: already sent for %s W%s; skipping", season, week_to_announce)
-            return {"status": "skipped_duplicate", "season_year": season, "week": week_to_announce}
+            logger.info(
+                "cron_announce_weekly_winners: already sent for %s W%s; skipping",
+                season,
+                week_to_announce,
+            )
+            return {
+                "status": "skipped_duplicate",
+                "season_year": season,
+                "week": week_to_announce,
+            }
 
         # Compute results
         weekly = _compute_week_results(season, week_to_announce)
@@ -401,11 +507,19 @@ def cron_announce_weekly_winners() -> dict:
         text_msg = _format_winners_and_totals(week_to_announce, weekly, season_totals)
 
         # Broadcast
-        participants = db.session.execute(_text("""
+        participants = (
+            db.session.execute(
+                _text(
+                    """
             SELECT id, COALESCE(display_name, name, CONCAT('P', id::text)) AS name, telegram_chat_id
             FROM participants
             WHERE telegram_chat_id IS NOT NULL
-        """)).mappings().all()
+        """
+                )
+            )
+            .mappings()
+            .all()
+        )
 
         token = os.getenv("TELEGRAM_BOT_TOKEN")
         if not token:
@@ -434,21 +548,26 @@ def cron_announce_weekly_winners() -> dict:
             "participants_ranked": len(season_totals),
         }
 
+
 def cron_import_upcoming_week() -> dict:
     """
     On Tuesday (America/Los_Angeles), import the NEXT upcoming week (first_kick > now)
     from ESPN into the DB so the 9am sender has data. Safe to run daily (Tue-guarded).
     """
-    from sqlalchemy import text as _text
     from datetime import datetime, timezone
     from zoneinfo import ZoneInfo
+
+    from sqlalchemy import text as _text
 
     app = create_app()
     with app.app_context():
         # Tuesday guard (PT)
         now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
         if now_pt.weekday() != 1:  # Monday=0, Tuesday=1
-            logger.info("cron_import_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
+            logger.info(
+                "cron_import_upcoming_week: skipping (not Tuesday PT). now_pt=%s",
+                now_pt,
+            )
             return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -457,22 +576,39 @@ def cron_import_upcoming_week() -> dict:
             return {"error": "no season_year in weeks"}
 
         # Find the next week with kickoff in the future
-        rows = db.session.execute(_text("""
+        rows = (
+            db.session.execute(
+                _text(
+                    """
             SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
             FROM weeks w
             LEFT JOIN games g ON g.week_id = w.id
             WHERE w.season_year = :y
             GROUP BY w.week_number
             ORDER BY w.week_number
-        """), {"y": season}).mappings().all()
+        """
+                ),
+                {"y": season},
+            )
+            .mappings()
+            .all()
+        )
 
         upcoming = next((r for r in rows if r["first_kick"] and r["first_kick"] > now), None)
         # If no week has future kickoff (or week exists but has 0 games), try to infer by +1
         if not upcoming:
             # fall back to max week in season + 1
-            max_week = db.session.execute(_text("""
+            max_week = (
+                db.session.execute(
+                    _text(
+                        """
                 SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y
-            """), {"y": season}).scalar() or 0
+            """
+                    ),
+                    {"y": season},
+                ).scalar()
+                or 0
+            )
             target_week = max_week + 1
         else:
             target_week = int(upcoming["week_number"])
@@ -481,15 +617,31 @@ def cron_import_upcoming_week() -> dict:
         result = import_week_from_espn(season, target_week)
 
         # Recount games for logging
-        count_after = db.session.execute(_text("""
+        count_after = db.session.execute(
+            _text(
+                """
             SELECT COUNT(*) FROM games g
             JOIN weeks w ON w.id = g.week_id
             WHERE w.season_year=:y AND w.week_number=:w
-        """), {"y": season, "w": target_week}).scalar()
+        """
+            ),
+            {"y": season, "w": target_week},
+        ).scalar()
 
-        logger.info("cron_import_upcoming_week: imported Week %s %s, games now=%s",
-                    target_week, season, count_after)
-        return {"status": "imported", "season_year": season, "week": target_week, "games": count_after, **result}
+        logger.info(
+            "cron_import_upcoming_week: imported Week %s %s, games now=%s",
+            target_week,
+            season,
+            count_after,
+        )
+        return {
+            "status": "imported",
+            "season_year": season,
+            "week": target_week,
+            "games": count_after,
+            **result,
+        }
+
 
 def cron_send_upcoming_week() -> dict:
     """
@@ -498,10 +650,11 @@ def cron_send_upcoming_week() -> dict:
     Runs ONLY on Tuesday (America/Los_Angeles) unless ALLOW_ANYDAY=1.
     Skips if this season/week was already broadcast (dedupe).
     """
-    from sqlalchemy import text as _text
+    import os
     from datetime import datetime, timezone
     from zoneinfo import ZoneInfo
-    import os
+
+    from sqlalchemy import text as _text
 
     app = create_app()
     with app.app_context():
@@ -515,18 +668,25 @@ def cron_send_upcoming_week() -> dict:
         if os.getenv("ALLOW_ANYDAY") not in ("1", "true", "TRUE"):
             now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
             if now_pt.weekday() != 1:  # Monday=0, Tuesday=1
-                logger.info("cron_send_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
+                logger.info(
+                    "cron_send_upcoming_week: skipping (not Tuesday PT). now_pt=%s",
+                    now_pt,
+                )
                 return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
 
         # ---- Ensure a dedupe table exists ----
-        db.session.execute(_text("""
+        db.session.execute(
+            _text(
+                """
             CREATE TABLE IF NOT EXISTS week_broadcasts (
                 season_year INTEGER NOT NULL,
                 week_number INTEGER NOT NULL,
                 sent_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (season_year, week_number)
             )
-        """))
+        """
+            )
+        )
         db.session.commit()
 
         # ---- Choose upcoming week ----
@@ -536,14 +696,23 @@ def cron_send_upcoming_week() -> dict:
             logger.warning("cron_send_upcoming_week: no season_year in weeks")
             return {"error": "no season_year in weeks"}
 
-        rows = db.session.execute(_text("""
+        rows = (
+            db.session.execute(
+                _text(
+                    """
             SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
             FROM weeks w
             JOIN games g ON g.week_id = w.id
             WHERE w.season_year = :y
             GROUP BY w.week_number
             ORDER BY w.week_number
-        """), {"y": season}).mappings().all()
+        """
+                ),
+                {"y": season},
+            )
+            .mappings()
+            .all()
+        )
 
         upcoming = next((r for r in rows if r["first_kick"] and r["first_kick"] > now), None)
         if not upcoming:
@@ -559,16 +728,26 @@ def cron_send_upcoming_week() -> dict:
             {"y": season, "w": week},
         ).scalar()
         if already:
-            logger.info("cron_send_upcoming_week: already sent for season=%s week=%s, skipping", season, week)
+            logger.info(
+                "cron_send_upcoming_week: already sent for season=%s week=%s, skipping",
+                season,
+                week,
+            )
             return {"status": "skipped_duplicate", "season_year": season, "week": week}
 
-        parts_count = db.session.execute(_text(
-            "SELECT COUNT(*) FROM participants WHERE telegram_chat_id IS NOT NULL"
-        )).scalar() or 0
+        parts_count = (
+            db.session.execute(
+                _text("SELECT COUNT(*) FROM participants WHERE telegram_chat_id IS NOT NULL")
+            ).scalar()
+            or 0
+        )
 
         logger.info(
             "Broadcasting Week %s %s to %s participants (%s games)",
-            week, season, parts_count, games_count
+            week,
+            season,
+            parts_count,
+            games_count,
         )
 
         # ---- Send ----
@@ -576,7 +755,9 @@ def cron_send_upcoming_week() -> dict:
 
         # ---- Record the send ----
         db.session.execute(
-            _text("INSERT INTO week_broadcasts (season_year, week_number) VALUES (:y, :w) ON CONFLICT DO NOTHING"),
+            _text(
+                "INSERT INTO week_broadcasts (season_year, week_number) VALUES (:y, :w) ON CONFLICT DO NOTHING"
+            ),
             {"y": season, "w": week},
         )
         db.session.commit()
@@ -588,6 +769,7 @@ def cron_send_upcoming_week() -> dict:
             "games": games_count,
             "status": "sent",
         }
+
 
 def detect_current_context(timeout: float = 15.0):
     """
@@ -603,6 +785,7 @@ def detect_current_context(timeout: float = 15.0):
     week = int(j["week"]["number"])
     return year, int(st), week
 
+
 def fetch_espn_scoreboard(week: int, season_year: int):
     """
     Returns a list of dicts like:
@@ -617,11 +800,12 @@ def fetch_espn_scoreboard(week: int, season_year: int):
     Does not touch the database.
     """
     import httpx
+
     with httpx.Client(timeout=15.0, headers={"User-Agent": "nfl-picks-bot/1.0"}) as client:
-    # Try both parameter styles ESPN uses. First that succeeds wins.
+        # Try both parameter styles ESPN uses. First that succeeds wins.
         urls = [
-        f"{ESPN_SCOREBOARD_URL}?week={week}&dates={season_year}&seasontype=2",
-        f"{ESPN_SCOREBOARD_URL}?week={week}&year={season_year}&seasontype=2",
+            f"{ESPN_SCOREBOARD_URL}?week={week}&dates={season_year}&seasontype=2",
+            f"{ESPN_SCOREBOARD_URL}?week={week}&year={season_year}&seasontype=2",
         ]
         resp = None
         for u in urls:
@@ -630,7 +814,7 @@ def fetch_espn_scoreboard(week: int, season_year: int):
                 resp = r
                 break
         if resp is None:
-        # propagate the last error for visibility
+            # propagate the last error for visibility
             r.raise_for_status()
         data = resp.json()
         try:
@@ -670,18 +854,22 @@ def fetch_espn_scoreboard(week: int, season_year: int):
             elif hs is not None and as_ is not None and hs != as_ and state == "post":
                 winner = home_name if hs > as_ else away_name
 
-            out.append({
-                "away_team": away_name,
-                "home_team": home_name,
-                "away_score": as_,
-                "home_score": hs,
-                "state": state,      # "pre", "in", "post"
-                "winner": winner,    # may be None if not final yet or tie
-            })
+            out.append(
+                {
+                    "away_team": away_name,
+                    "home_team": home_name,
+                    "away_score": as_,
+                    "home_score": hs,
+                    "state": state,  # "pre", "in", "post"
+                    "winner": winner,  # may be None if not final yet or tie
+                }
+            )
         except Exception:
             # Be resilient to any weird ESPN edge cases
             continue
     return out
+
+
 def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
     """
     Pull ESPN events for (season_year, week), match to DB games by team names,
@@ -704,50 +892,67 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
 
     # Do we have a 'winner' column? (Postgres information_schema)
     try:
-        has_winner_col = db.session.execute(
-            _text("""
+        has_winner_col = (
+            db.session.execute(
+                _text(
+                    """
                 SELECT 1
                 FROM information_schema.columns
                 WHERE table_name = 'games' AND column_name = 'winner'
                 LIMIT 1
-            """)
-        ).scalar() is not None
+            """
+                )
+            ).scalar()
+            is not None
+        )
     except Exception:
         has_winner_col = False
 
     # Pull DB games for the target week
     if has_winner_col:
-        rows = db.session.execute(
-            _text("""
+        rows = (
+            db.session.execute(
+                _text(
+                    """
                 SELECT g.id, g.away_team, g.home_team,
                        g.status, g.home_score, g.away_score, g.winner
                 FROM games g
                 JOIN weeks wk ON wk.id = g.week_id
                 WHERE wk.season_year = :y AND wk.week_number = :w
                 ORDER BY g.game_time
-            """),
-            {"y": season_year, "w": week},
-        ).mappings().all()
+            """
+                ),
+                {"y": season_year, "w": week},
+            )
+            .mappings()
+            .all()
+        )
     else:
-        rows = db.session.execute(
-            _text("""
+        rows = (
+            db.session.execute(
+                _text(
+                    """
                 SELECT g.id, g.away_team, g.home_team,
                        g.status, g.home_score, g.away_score
                 FROM games g
                 JOIN weeks wk ON wk.id = g.week_id
                 WHERE wk.season_year = :y AND wk.week_number = :w
                 ORDER BY g.game_time
-            """),
-            {"y": season_year, "w": week},
-        ).mappings().all()
+            """
+                ),
+                {"y": season_year, "w": week},
+            )
+            .mappings()
+            .all()
+        )
 
-    linkable = 0      # how many DB games had a corresponding ESPN event
-    changed = 0       # how many DB rows we actually modified this run
+    linkable = 0  # how many DB games had a corresponding ESPN event
+    changed = 0  # how many DB rows we actually modified this run
     updated_scores = 0
     updated_status = 0
     updated_winner = 0
 
-    missing_in_espn = []   # DB games we couldn't find on ESPN
+    missing_in_espn = []  # DB games we couldn't find on ESPN
     matched_keys = set()
 
     # Map ESPN state -> our DB status
@@ -784,7 +989,11 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
 
         # Determine winner from ESPN scores (if present)
         new_winner = None
-        if isinstance(es_home_score, int) and isinstance(es_away_score, int) and es_home_score != es_away_score:
+        if (
+            isinstance(es_home_score, int)
+            and isinstance(es_away_score, int)
+            and es_home_score != es_away_score
+        ):
             new_winner = db_home if es_home_score > es_away_score else db_away
 
         # Build updates
@@ -833,14 +1042,15 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         "season_year": season_year,
         "week": week,
         "total_games": len(rows),
-        "linkable": linkable,           # NEW: how many DB games were matchable by names
-        "matched": changed,             # kept semantics: rows actually changed this run
+        "linkable": linkable,  # NEW: how many DB games were matchable by names
+        "matched": changed,  # kept semantics: rows actually changed this run
         "updated_scores": updated_scores,
         "updated_winner": updated_winner if has_winner_col else 0,
         "updated_status": updated_status,
         "missing_in_espn": missing_in_espn,
         "unmatched_espn": unmatched_espn,
     }
+
 
 def cron_syncscores() -> dict:
     """
@@ -900,9 +1110,10 @@ def cron_syncscores() -> dict:
 
         for w in scan_weeks:
             # DB signals
-            stats = db.session.execute(
-                _text(
-                    """
+            stats = (
+                db.session.execute(
+                    _text(
+                        """
                     SELECT
                       SUM(
                         CASE
@@ -916,9 +1127,12 @@ def cron_syncscores() -> dict:
                     JOIN weeks wk ON wk.id = g.week_id
                     WHERE wk.season_year=:y AND wk.week_number=:w
                     """
-                ),
-                {"y": season, "w": w},
-            ).mappings().first()
+                    ),
+                    {"y": season, "w": w},
+                )
+                .mappings()
+                .first()
+            )
 
             db_active = False
             if stats:
@@ -951,9 +1165,11 @@ def cron_syncscores() -> dict:
         logger.info("cron_syncscores summary: %s", summary)
         return summary
 
+
 def _now_utc_naive():
     """UTC 'now' as naive datetime to match 'timestamp without time zone' columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 def _pt(dt_utc):
     """Format a UTC datetime in a friendly way (US/Eastern as example)."""
@@ -965,13 +1181,16 @@ def _pt(dt_utc):
     except Exception:
         return str(dt_utc)
 
+
 async def start(update: "Update", context: "ContextTypes.DEFAULT_TYPE"):
     user = update.effective_user
     chat_id = str(update.effective_chat.id)
     username = (user.username or "").strip()
     full_name = (getattr(user, "full_name", None) or "").strip()
     first_name = (user.first_name or "").strip()
-    logger.info(f"📩 /start from {username or full_name or first_name or 'unknown'} (chat_id={chat_id})")
+    logger.info(
+        f"📩 /start from {username or full_name or first_name or 'unknown'} (chat_id={chat_id})"
+    )
 
     app = create_app()
     with app.app_context():
@@ -1010,6 +1229,7 @@ async def start(update: "Update", context: "ContextTypes.DEFAULT_TYPE"):
 
     await update.message.reply_text(f"✅ Registered as {linked.name}. You're ready to make picks!")
 
+
 async def handle_pick(update: "Update", context: "ContextTypes.DEFAULT_TYPE"):
     query = update.callback_query
     if not query:
@@ -1042,6 +1262,7 @@ async def handle_pick(update: "Update", context: "ContextTypes.DEFAULT_TYPE"):
 
     await query.edit_message_text(f"✅ You picked {team}")
 
+
 async def deletepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     chat_id = str(update.effective_chat.id)
@@ -1066,38 +1287,57 @@ async def deletepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Work inside app context
     from sqlalchemy import text as _text
-    from flask_app import create_app, db as _db
+
+    from flask_app import create_app
+    from flask_app import db as _db
+
     app = create_app()
     with app.app_context():
         # Simple admin check: only allow Tony's Telegram to run this
-        is_admin = _db.session.execute(_text("""
+        is_admin = (
+            _db.session.execute(
+                _text(
+                    """
             SELECT 1
             FROM participants
             WHERE lower(name)='tony' AND telegram_chat_id = :c
-        """), {"c": chat_id}).scalar() is not None
+        """
+                ),
+                {"c": chat_id},
+            ).scalar()
+            is not None
+        )
         if not is_admin:
             return await m.reply_text("Sorry, this command is restricted.")
 
         # Find participant by name (case-insensitive)
-        pid = _db.session.execute(_text(
-            "SELECT id FROM participants WHERE lower(name)=lower(:n)"
-        ), {"n": name}).scalar()
+        pid = _db.session.execute(
+            _text("SELECT id FROM participants WHERE lower(name)=lower(:n)"),
+            {"n": name},
+        ).scalar()
         if not pid:
             return await m.reply_text(f'No participant named "{name}" found.')
 
         # Resolve season for the requested week (latest season containing that week)
-        season = _db.session.execute(_text("""
+        season = _db.session.execute(
+            _text(
+                """
             SELECT season_year
             FROM weeks
             WHERE week_number = :w
             ORDER BY season_year DESC
             LIMIT 1
-        """), {"w": week}).scalar()
+        """
+            ),
+            {"w": week},
+        ).scalar()
         if not season:
             return await m.reply_text(f"Week {week} not found in table weeks.")
 
         # Count existing picks first (for report)
-        existing = _db.session.execute(_text("""
+        existing = _db.session.execute(
+            _text(
+                """
             SELECT COUNT(*)
             FROM picks p
             JOIN games g ON g.id = p.game_id
@@ -1105,10 +1345,15 @@ async def deletepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             WHERE p.participant_id = :pid
               AND w.week_number   = :w
               AND w.season_year   = :y
-        """), {"pid": pid, "w": week, "y": season}).scalar()
+        """
+            ),
+            {"pid": pid, "w": week, "y": season},
+        ).scalar()
 
         # Delete picks and report how many were removed
-        res = _db.session.execute(_text("""
+        res = _db.session.execute(
+            _text(
+                """
             DELETE FROM picks p
             USING games g, weeks w
             WHERE p.game_id = g.id
@@ -1117,14 +1362,19 @@ async def deletepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE
               AND w.week_number    = :w
               AND w.season_year    = :y
             RETURNING p.id
-        """), {"pid": pid, "w": week, "y": season})
+        """
+            ),
+            {"pid": pid, "w": week, "y": season},
+        )
         deleted = len(res.fetchall())
         _db.session.commit()
 
     await m.reply_text(
         f'🧹 Deleted {deleted} pick(s) for "{name}" in Week {week} ({season}). '
-        f'Previously existed: {existing}.'
+        f"Previously existed: {existing}."
     )
+
+
 async def syncscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
@@ -1153,22 +1403,36 @@ async def syncscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return await m.reply_text("Season year must be an integer, e.g. 2025")
 
     from flask_app import create_app
+
     app = create_app()
     with app.app_context():
         # Admin guard: only Tony's chat ID can invoke
-        is_admin = db.session.execute(_text("""
+        is_admin = (
+            db.session.execute(
+                _text(
+                    """
             SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
-        """), {"c": chat_id}).scalar() is not None
+        """
+                ),
+                {"c": chat_id},
+            ).scalar()
+            is not None
+        )
         if not is_admin:
             return await m.reply_text("Sorry, this command is restricted.")
 
         # Resolve season if not passed
         if season_year is None:
-            season_year = db.session.execute(_text("""
+            season_year = db.session.execute(
+                _text(
+                    """
                 SELECT season_year FROM weeks
                 WHERE week_number=:w
                 ORDER BY season_year DESC LIMIT 1
-            """), {"w": week}).scalar()
+            """
+                ),
+                {"w": week},
+            ).scalar()
             if not season_year:
                 return await m.reply_text(f"Week {week} not found in weeks.")
 
@@ -1182,12 +1446,17 @@ async def syncscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ]
     if summary["missing_in_espn"]:
         samp = ", ".join(summary["missing_in_espn"][:3])
-        lines.append(f"Missing in ESPN ({len(summary['missing_in_espn'])}): {samp}{' …' if len(summary['missing_in_espn'])>3 else ''}")
+        lines.append(
+            f"Missing in ESPN ({len(summary['missing_in_espn'])}): {samp}{' …' if len(summary['missing_in_espn'])>3 else ''}"
+        )
     if summary["unmatched_espn"]:
         samp = ", ".join(summary["unmatched_espn"][:3])
-        lines.append(f"Extra on ESPN ({len(summary['unmatched_espn'])}): {samp}{' …' if len(summary['unmatched_espn'])>3 else ''}")
+        lines.append(
+            f"Extra on ESPN ({len(summary['unmatched_espn'])}): {samp}{' …' if len(summary['unmatched_espn'])>3 else ''}"
+        )
 
     await m.reply_text("\n".join(lines))
+
 
 async def whoisleft_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
@@ -1202,31 +1471,54 @@ async def whoisleft_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await m.reply_text("Week must be an integer, e.g. /whoisleft 2")
 
     # DB work
-    from flask_app import create_app, db as _db
+    from flask_app import create_app
+    from flask_app import db as _db
+
     app = create_app()
     with app.app_context():
         # Admin guard: only Tony’s Telegram
-        is_admin = _db.session.execute(_text("""
+        is_admin = (
+            _db.session.execute(
+                _text(
+                    """
             SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
-        """), {"c": chat_id}).scalar() is not None
+        """
+                ),
+                {"c": chat_id},
+            ).scalar()
+            is not None
+        )
         if not is_admin:
             return await m.reply_text("Sorry, this command is restricted.")
 
         # Resolve season for that week (latest available)
-        season = _db.session.execute(_text("""
+        season = _db.session.execute(
+            _text(
+                """
             SELECT season_year FROM weeks WHERE week_number=:w ORDER BY season_year DESC LIMIT 1
-        """), {"w": week}).scalar()
+        """
+            ),
+            {"w": week},
+        ).scalar()
         if not season:
             return await m.reply_text(f"Week {week} not found in table weeks.")
 
         # Total games in that week
-        total_games = _db.session.execute(_text("""
+        total_games = _db.session.execute(
+            _text(
+                """
             SELECT COUNT(*) FROM games g JOIN weeks w ON w.id=g.week_id
             WHERE w.season_year=:y AND w.week_number=:w
-        """), {"y": season, "w": week}).scalar()
+        """
+            ),
+            {"y": season, "w": week},
+        ).scalar()
 
         # Per-user picked count
-        rows = _db.session.execute(_text("""
+        rows = (
+            _db.session.execute(
+                _text(
+                    """
             WITH wg AS (
               SELECT g.id
               FROM games g JOIN weeks w ON w.id=g.week_id
@@ -1239,67 +1531,109 @@ async def whoisleft_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
               ON p.participant_id=u.id AND p.game_id IN (SELECT id FROM wg) AND p.selected_team IS NOT NULL
             GROUP BY u.id, u.name, u.telegram_chat_id
             ORDER BY u.id
-        """), {"y": season, "w": week}).mappings().all()
+        """
+                ),
+                {"y": season, "w": week},
+            )
+            .mappings()
+            .all()
+        )
 
     # Build summary
     lines = [f"Week {week} ({season}) — total games: {total_games}"]
     for r in rows:
         remaining = (total_games or 0) - int(r["picked"] or 0)
-        lines.append(f"• {r['name']}: picked {int(r['picked'] or 0)}/{total_games} — remaining {remaining}")
+        lines.append(
+            f"• {r['name']}: picked {int(r['picked'] or 0)}/{total_games} — remaining {remaining}"
+        )
     await m.reply_text("\n".join(lines))
+
+
 # /remindweek <week> [participant name...]
 # If no name is supplied, nudges everyone with remaining picks.
 # Only sends games with g.game_time > now (future), and where no pick exists.
+
 
 async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     chat_id = str(update.effective_chat.id)
 
     if not context.args:
-        return await m.reply_text('Usage: /remindweek <week_number> [participant name]\n'
-                                  'Examples:\n'
-                                  '  /remindweek 2\n'
-                                  '  /remindweek 2 Kevin\n'
-                                  '  /remindweek 2 "Wil Eddie Cano"')
+        return await m.reply_text(
+            "Usage: /remindweek <week_number> [participant name]\n"
+            "Examples:\n"
+            "  /remindweek 2\n"
+            "  /remindweek 2 Kevin\n"
+            '  /remindweek 2 "Wil Eddie Cano"'
+        )
 
     try:
         week = int(context.args[0])
     except ValueError:
         return await m.reply_text("Week must be an integer, e.g. /remindweek 2")
 
-    name = " ".join(context.args[1:]).strip().strip('"').strip("'") if len(context.args) > 1 else None
+    name = (
+        " ".join(context.args[1:]).strip().strip('"').strip("'") if len(context.args) > 1 else None
+    )
 
-    from flask_app import create_app, db as _db
+    from flask_app import create_app
+    from flask_app import db as _db
+
     app = create_app()
     now_cutoff = _now_utc_naive()
 
     with app.app_context():
         # Admin guard
-        is_admin = _db.session.execute(_text("""
+        is_admin = (
+            _db.session.execute(
+                _text(
+                    """
             SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
-        """), {"c": chat_id}).scalar() is not None
+        """
+                ),
+                {"c": chat_id},
+            ).scalar()
+            is not None
+        )
         if not is_admin:
             return await m.reply_text("Sorry, this command is restricted.")
 
         # Resolve season
-        season = _db.session.execute(_text("""
+        season = _db.session.execute(
+            _text(
+                """
             SELECT season_year FROM weeks WHERE week_number=:w ORDER BY season_year DESC LIMIT 1
-        """), {"w": week}).scalar()
+        """
+            ),
+            {"w": week},
+        ).scalar()
         if not season:
             return await m.reply_text(f"Week {week} not found in table weeks.")
 
         # Decide target participants
         if name:
-            targets = _db.session.execute(_text("""
+            targets = (
+                _db.session.execute(
+                    _text(
+                        """
                 SELECT id, name, telegram_chat_id
                 FROM participants
                 WHERE lower(name)=lower(:n)
-            """), {"n": name}).mappings().all()
+            """
+                    ),
+                    {"n": name},
+                )
+                .mappings()
+                .all()
+            )
             if not targets:
                 return await m.reply_text(f'No participant named "{name}" found.')
         else:
             # Everyone with remaining unpicked games
-            targets = _db.session.execute(_text("""
+            targets = (
+                _db.session.execute(
+                    _text(
+                        """
               WITH wg AS (
                 SELECT g.id
                 FROM games g JOIN weeks w ON w.id=g.week_id
@@ -1314,7 +1648,13 @@ async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
               GROUP BY u.id, u.name, u.telegram_chat_id
               HAVING ((SELECT COUNT(*) FROM wg) - COALESCE(COUNT(p.selected_team),0)) > 0
               ORDER BY u.id
-            """), {"y": season, "w": week}).mappings().all()
+            """
+                    ),
+                    {"y": season, "w": week},
+                )
+                .mappings()
+                .all()
+            )
 
         sent_total = 0
         for u in targets:
@@ -1322,7 +1662,10 @@ async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 continue  # cannot DM
 
             # Unpicked, future games only
-            rows = _db.session.execute(_text("""
+            rows = (
+                _db.session.execute(
+                    _text(
+                        """
                 SELECT g.id AS game_id, g.away_team, g.home_team, g.game_time
                 FROM games g
                 JOIN weeks w ON w.id=g.week_id
@@ -1331,25 +1674,50 @@ async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                   AND (p.id IS NULL OR p.selected_team IS NULL)
                   AND (g.game_time IS NULL OR g.game_time > :now)  -- future only
                 ORDER BY g.game_time NULLS LAST, g.id
-            """), {"pid": u["id"], "y": season, "w": week, "now": now_cutoff}).mappings().all()
+            """
+                    ),
+                    {"pid": u["id"], "y": season, "w": week, "now": now_cutoff},
+                )
+                .mappings()
+                .all()
+            )
 
             if not rows:
                 # Optionally let them know they’re all set / or only past games remain
-                _send_message(u["telegram_chat_id"], f"✅ {u['name']}: you’re all set for Week {week} ({season}).")
+                _send_message(
+                    u["telegram_chat_id"],
+                    f"✅ {u['name']}: you’re all set for Week {week} ({season}).",
+                )
                 continue
 
             # Send one message per game with two buttons
             for r in rows:
                 kb = {
                     "inline_keyboard": [
-                        [{"text": r["away_team"], "callback_data": f"pick:{r['game_id']}:{r['away_team']}"}],
-                        [{"text": r["home_team"], "callback_data": f"pick:{r['game_id']}:{r['home_team']}"}],
+                        [
+                            {
+                                "text": r["away_team"],
+                                "callback_data": f"pick:{r['game_id']}:{r['away_team']}",
+                            }
+                        ],
+                        [
+                            {
+                                "text": r["home_team"],
+                                "callback_data": f"pick:{r['game_id']}:{r['home_team']}",
+                            }
+                        ],
                     ]
                 }
-                _send_message(u["telegram_chat_id"], f"{r['away_team']} @ {r['home_team']}", reply_markup=kb)
+                _send_message(
+                    u["telegram_chat_id"],
+                    f"{r['away_team']} @ {r['home_team']}",
+                    reply_markup=kb,
+                )
                 sent_total += 1
 
     await m.reply_text(f"📨 Reminders sent: {sent_total} game messages.")
+
+
 async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
@@ -1372,30 +1740,48 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         return await m.reply_text("Week must be an integer, e.g. /getscores 2")
 
-    broadcast = (len(args) > 1 and args[1].lower() == "all")
+    broadcast = len(args) > 1 and args[1].lower() == "all"
 
-    from flask_app import create_app, db as _db
+    from flask_app import create_app
+    from flask_app import db as _db
+
     app = create_app()
     with app.app_context():
         # Admin guard (only Tony's Telegram chat may invoke)
-        is_admin = _db.session.execute(_text("""
+        is_admin = (
+            _db.session.execute(
+                _text(
+                    """
             SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
-        """), {"c": chat_id}).scalar() is not None
+        """
+                ),
+                {"c": chat_id},
+            ).scalar()
+            is not None
+        )
         if not is_admin:
             return await m.reply_text("Sorry, this command is restricted.")
 
         # Resolve season for this week (latest)
-        season = _db.session.execute(_text("""
+        season = _db.session.execute(
+            _text(
+                """
             SELECT season_year FROM weeks
             WHERE week_number=:w
             ORDER BY season_year DESC
             LIMIT 1
-        """), {"w": week}).scalar()
+        """
+            ),
+            {"w": week},
+        ).scalar()
         if not season:
             return await m.reply_text(f"Week {week} not found in table weeks.")
 
-                # Completed games in this week (explicit winner OR both scores set and not a tie)
-        total_completed = _db.session.execute(_text("""
+            # Completed games in this week (explicit winner OR both scores set and not a tie)
+        total_completed = (
+            _db.session.execute(
+                _text(
+                    """
             SELECT COUNT(*)
             FROM games g
             JOIN weeks w ON w.id = g.week_id
@@ -1405,13 +1791,21 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     g.winner IS NOT NULL
                  OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score <> g.away_score)
               )
-        """), {"y": season, "w": week}).scalar() or 0
+        """
+                ),
+                {"y": season, "w": week},
+            ).scalar()
+            or 0
+        )
 
         if total_completed == 0:
             return await m.reply_text(f"No games completed yet for Week {week} ({season}).")
 
         # Per-participant wins/losses for completed games
-        rows = _db.session.execute(_text("""
+        rows = (
+            _db.session.execute(
+                _text(
+                    """
             WITH wg AS (
               SELECT
                 g.id,
@@ -1440,7 +1834,13 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             LEFT JOIN wg ON wg.id = p.game_id
             GROUP BY u.id, u.name, u.telegram_chat_id
             ORDER BY wins DESC, u.name
-        """), {"y": season, "w": week}).mappings().all()
+        """
+                ),
+                {"y": season, "w": week},
+            )
+            .mappings()
+            .all()
+        )
 
         title = f"📈 Scoreboard — Week {week} ({season})  [completed games: {total_completed}]"
         body_lines = [title, ""]
@@ -1463,6 +1863,7 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         logger.exception("Failed sending /getscores to %s", r["name"])
             await m.reply_text(f"✅ Sent scoreboard to {sent} participant(s).")
 
+
 async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
@@ -1475,15 +1876,25 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     m = update.effective_message
     chat_id = str(update.effective_chat.id)
     args = context.args or []
-    broadcast = (len(args) >= 1 and args[0].lower() == "all")
+    broadcast = len(args) >= 1 and args[0].lower() == "all"
 
-    from flask_app import create_app, db as _db
+    from flask_app import create_app
+    from flask_app import db as _db
+
     app = create_app()
     with app.app_context():
         # Admin guard (adjust if you want broader access)
-        is_admin = _db.session.execute(_text("""
+        is_admin = (
+            _db.session.execute(
+                _text(
+                    """
             SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
-        """), {"c": chat_id}).scalar() is not None
+        """
+                ),
+                {"c": chat_id},
+            ).scalar()
+            is not None
+        )
         if not is_admin:
             return await m.reply_text("Sorry, this command is restricted.")
 
@@ -1493,17 +1904,28 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             return await m.reply_text("No season data found in weeks table.")
 
         # All weeks present for that season (ordered)
-        weeks = [int(r[0]) for r in _db.session.execute(_text("""
+        weeks = [
+            int(r[0])
+            for r in _db.session.execute(
+                _text(
+                    """
             SELECT DISTINCT week_number
             FROM weeks
             WHERE season_year=:y
             ORDER BY week_number
-        """), {"y": season}).fetchall()]
+        """
+                ),
+                {"y": season},
+            ).fetchall()
+        ]
         if not weeks:
             return await m.reply_text(f"No weeks found for season {season}.")
 
         # Compute wins per participant per week for completed games
-        rows = _db.session.execute(_text("""
+        rows = (
+            _db.session.execute(
+                _text(
+                    """
             WITH wg AS (
               SELECT
                 w.week_number,
@@ -1532,7 +1954,13 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             LEFT JOIN wg ON wg.id = p.game_id
             GROUP BY u.id, u.name, u.telegram_chat_id, wg.week_number
             ORDER BY u.name, wg.week_number
-        """), {"y": season}).mappings().all()
+        """
+                ),
+                {"y": season},
+            )
+            .mappings()
+            .all()
+        )
 
         # Organize: name -> {week_number: wins}, and collect chat ids
         pdata: dict[str, dict[int, int]] = {}
@@ -1541,18 +1969,20 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         for r in rows:
             name = r["name"] or "?"
             wk = r["week_number"]
-            if wk is None:                 # <-- guard against NULL week rows
+            if wk is None:  # <-- guard against NULL week rows
                 # This happens for participants with zero completed picks
                 # because of the LEFT JOIN on wg; just skip.
                 continue
-            wins_i = int(r["wins"] or 0)   # tolerate None just in case
+            wins_i = int(r["wins"] or 0)  # tolerate None just in case
             pdata.setdefault(name, {})[int(wk)] = wins_i
             chat_ids.setdefault(name, r["telegram_chat_id"])
 
         # Ensure all participants appear even if they have no completed wins yet
-        for rp in _db.session.execute(_text(
-            "SELECT id, name, telegram_chat_id FROM participants"
-        )).mappings().all():
+        for rp in (
+            _db.session.execute(_text("SELECT id, name, telegram_chat_id FROM participants"))
+            .mappings()
+            .all()
+        ):
             pdata.setdefault(rp["name"], {})
             chat_ids.setdefault(rp["name"], rp["telegram_chat_id"])
 
@@ -1592,6 +2022,7 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
                         logger.exception("Failed sending /seasonboard to %s", n)
             await m.reply_text(f"✅ Sent season board to {sent} participant(s).")
 
+
 async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
@@ -1609,7 +2040,9 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Validate args
     if len(args) < 2:
-        return await m.reply_text("Usage: /seepicks <week_number> <participant|all>\nExample: /seepicks 3 all")
+        return await m.reply_text(
+            "Usage: /seepicks <week_number> <participant|all>\nExample: /seepicks 3 all"
+        )
 
     # Parse week
     try:
@@ -1620,48 +2053,89 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = " ".join(args[1:]).strip().strip('"').strip("'")  # allow spaces/quotes in names
     is_all = target.lower() == "all"
 
-    from flask_app import create_app, db as _db
+    from flask_app import create_app
+    from flask_app import db as _db
+
     app = create_app()
     with app.app_context():
         # Admin guard (only Tony's Telegram can run this)
-        is_admin = _db.session.execute(_text("""
+        is_admin = (
+            _db.session.execute(
+                _text(
+                    """
             SELECT 1 FROM participants WHERE lower(name)='tony' AND telegram_chat_id=:c
-        """), {"c": chat_id}).scalar() is not None
+        """
+                ),
+                {"c": chat_id},
+            ).scalar()
+            is not None
+        )
         if not is_admin:
             return await m.reply_text("Sorry, this command is restricted.")
 
         # Latest season that has this week
-        season = _db.session.execute(_text("""
+        season = _db.session.execute(
+            _text(
+                """
             SELECT season_year FROM weeks WHERE week_number=:w ORDER BY season_year DESC LIMIT 1
-        """), {"w": week}).scalar()
+        """
+            ),
+            {"w": week},
+        ).scalar()
         if not season:
             return await m.reply_text(f"Week {week} not found in table weeks.")
 
         # Games in the week
-        games = _db.session.execute(_text("""
+        games = (
+            _db.session.execute(
+                _text(
+                    """
             SELECT g.id, g.away_team, g.home_team
             FROM games g
             JOIN weeks w ON w.id = g.week_id
             WHERE w.season_year=:y AND w.week_number=:w
             ORDER BY g.game_time NULLS LAST, g.id
-        """), {"y": season, "w": week}).mappings().all()
+        """
+                ),
+                {"y": season, "w": week},
+            )
+            .mappings()
+            .all()
+        )
         if not games:
             return await m.reply_text(f"No games found for Week {week} ({season}).")
 
         # Participants scope
         if is_all:
-            participants = _db.session.execute(_text("""
+            participants = (
+                _db.session.execute(
+                    _text(
+                        """
                 SELECT id, name, telegram_chat_id
                 FROM participants
                 ORDER BY name
-            """)).mappings().all()
+            """
+                    )
+                )
+                .mappings()
+                .all()
+            )
         else:
-            row = _db.session.execute(_text("""
+            row = (
+                _db.session.execute(
+                    _text(
+                        """
                 SELECT id, name, telegram_chat_id
                 FROM participants
                 WHERE lower(name)=lower(:name)
                 LIMIT 1
-            """), {"name": target}).mappings().first()
+            """
+                    ),
+                    {"name": target},
+                )
+                .mappings()
+                .first()
+            )
             if not row:
                 return await m.reply_text(f'Participant "{target}" not found.')
             participants = [row]
@@ -1670,7 +2144,10 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await m.reply_text("No participants found.")
 
         # Picks map (participant_id, game_id) -> selected_team
-        picks = _db.session.execute(_text("""
+        picks = (
+            _db.session.execute(
+                _text(
+                    """
             SELECT p.participant_id, p.game_id, p.selected_team
             FROM picks p
             WHERE p.game_id IN (
@@ -1678,7 +2155,13 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 FROM games g JOIN weeks w ON w.id=g.week_id
                 WHERE w.season_year=:y AND w.week_number=:w
             )
-        """), {"y": season, "w": week}).mappings().all()
+        """
+                ),
+                {"y": season, "w": week},
+            )
+            .mappings()
+            .all()
+        )
 
         pick_map = {}
         for r in picks:
@@ -1719,13 +2202,19 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     logger.exception("Failed sending /seepicks to %s", p["name"])
 
+
 def run_telegram_listener():
     """Run polling listener so /start and button taps are processed."""
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
-    from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes  # local import to avoid import-time failures
     from telegram import Update
+    from telegram.ext import (  # local import to avoid import-time failures
+        Application,
+        CallbackQueryHandler,
+        CommandHandler,
+        ContextTypes,
+    )
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
@@ -1739,6 +2228,8 @@ def run_telegram_listener():
     application.add_handler(CommandHandler("seepicks", seepicks_command))
     application.add_handler(CommandHandler("remindweek", remindweek_command))
     application.run_polling()
+
+
 def _send_message(
     chat_id: str,
     text: str,
@@ -1756,7 +2247,10 @@ def _send_message(
     When parse_mode is provided, we also disable link previews so score tables
     wrapped in <pre> blocks stay clean.
     """
-    import json, httpx, os
+    import json
+    import os
+
+    import httpx
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -1779,6 +2273,7 @@ def _send_message(
         resp = client.post(url, data=data)
         resp.raise_for_status()
 
+
 def send_week_games(week_number: int, season_year: int):
     """Send Week games with inline buttons to all participants who have telegram_chat_id."""
     app = create_app()
@@ -1799,8 +2294,18 @@ def send_week_games(week_number: int, season_year: int):
             for g in games:
                 kb = {
                     "inline_keyboard": [
-                        [{"text": g.away_team, "callback_data": f"pick:{g.id}:{g.away_team}"}],
-                        [{"text": g.home_team, "callback_data": f"pick:{g.id}:{g.home_team}"}],
+                        [
+                            {
+                                "text": g.away_team,
+                                "callback_data": f"pick:{g.id}:{g.away_team}",
+                            }
+                        ],
+                        [
+                            {
+                                "text": g.home_team,
+                                "callback_data": f"pick:{g.id}:{g.home_team}",
+                            }
+                        ],
                     ]
                 }
                 text = f"{g.away_team} @ {g.home_team}\n{_pt(g.game_time)}"
@@ -1809,6 +2314,7 @@ def send_week_games(week_number: int, season_year: int):
                     logger.info(f"✅ Sent game to {part.name}: {g.away_team} @ {g.home_team}")
                 except Exception as e:
                     logger.exception("❌ Failed to send game message: %s", e)
+
 
 # --- /sendweek admin command (additive, with DRY and ME) ---
 async def sendweek_command(update, context):
@@ -1820,6 +2326,7 @@ async def sendweek_command(update, context):
       /sendweek <week> <name...>  -> send ONLY to that participant by name
     """
     import asyncio
+
     from sqlalchemy import text
 
     user = update.effective_user
@@ -1831,7 +2338,9 @@ async def sendweek_command(update, context):
     args = context.args or []
     if not args or not args[0].isdigit():
         if update.message:
-            await update.message.reply_text("Usage: /sendweek <week_number> [dry|me|<participant name>]")
+            await update.message.reply_text(
+                "Usage: /sendweek <week_number> [dry|me|<participant name>]"
+            )
         return
     week_number = int(args[0])
     target = "all" if len(args) == 1 else " ".join(args[1:]).strip()
@@ -1839,7 +2348,10 @@ async def sendweek_command(update, context):
     # Helper: send to a single participant id/chat, only unpicked for that week
     def _send_to_one(participant_id: int, chat_id: str, season_year: int):
         # get only unpicked games for this participant
-        rows = db.session.execute(text("""
+        rows = (
+            db.session.execute(
+                text(
+                    """
             select g.id, g.away_team, g.home_team
             from games g
             join weeks w on w.id=g.week_id
@@ -1847,14 +2359,30 @@ async def sendweek_command(update, context):
             where w.season_year=:y and w.week_number=:w
               and (p.id is null or p.selected_team is null)
             order by g.game_time nulls last, g.id
-        """), {"pid": participant_id, "y": season_year, "w": week_number}).mappings().all()
+        """
+                ),
+                {"pid": participant_id, "y": season_year, "w": week_number},
+            )
+            .mappings()
+            .all()
+        )
 
         sent = 0
         for g in rows:
             kb = {
                 "inline_keyboard": [
-                    [{"text": g["away_team"], "callback_data": f"pick:{g['id']}:{g['away_team']}"}],
-                    [{"text": g["home_team"], "callback_data": f"pick:{g['id']}:{g['home_team']}"}],
+                    [
+                        {
+                            "text": g["away_team"],
+                            "callback_data": f"pick:{g['id']}:{g['away_team']}",
+                        }
+                    ],
+                    [
+                        {
+                            "text": g["home_team"],
+                            "callback_data": f"pick:{g['id']}:{g['home_team']}",
+                        }
+                    ],
                 ]
             }
             _send_message(str(chat_id), f"{g['away_team']} @ {g['home_team']}", reply_markup=kb)
@@ -1863,7 +2391,9 @@ async def sendweek_command(update, context):
 
     # Targeted modes (dry/me/name) should NOT auto-create weeks; only use existing week.
     def _find_existing_week():
-        return Week.query.filter_by(week_number=week_number).order_by(Week.season_year.desc()).first()
+        return (
+            Week.query.filter_by(week_number=week_number).order_by(Week.season_year.desc()).first()
+        )
 
     # Handle targeted modes inline; keep broadcast in a background thread
     if target.lower() in ("dry", "me") or target.lower() not in ("all",):
@@ -1872,27 +2402,42 @@ async def sendweek_command(update, context):
             wk = _find_existing_week()
             if not wk:
                 if update.message:
-                    await update.message.reply_text(f"Week {week_number} not found yet. (Dry/me/name modes do not auto-create.)")
+                    await update.message.reply_text(
+                        f"Week {week_number} not found yet. (Dry/me/name modes do not auto-create.)"
+                    )
                 return
             season_year = wk.season_year
 
             if target.lower() == "dry":
                 # Count how many messages would be sent to all registered participants
-                people = db.session.execute(text("""
+                people = (
+                    db.session.execute(
+                        text(
+                            """
                     select id, name, telegram_chat_id
                     from participants
                     where telegram_chat_id is not null
-                """)).mappings().all()
+                """
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
                 total_msgs = 0
                 for u in people:
-                    cnt = db.session.execute(text("""
+                    cnt = db.session.execute(
+                        text(
+                            """
                         select count(*)
                         from games g
                         join weeks w on w.id=g.week_id
                         left join picks p on p.game_id=g.id and p.participant_id=:pid
                         where w.season_year=:y and w.week_number=:w
                           and (p.id is null or p.selected_team is null)
-                    """), {"pid": u["id"], "y": season_year, "w": week_number}).scalar()
+                    """
+                        ),
+                        {"pid": u["id"], "y": season_year, "w": week_number},
+                    ).scalar()
                     total_msgs += int(cnt or 0)
                 await update.message.reply_text(
                     f"DRY RUN: would send {total_msgs} button message(s) to {len(people)} participant(s) for Week {week_number} ({season_year})."
@@ -1901,56 +2446,94 @@ async def sendweek_command(update, context):
 
             if target.lower() == "me":
                 me_chat = str(update.effective_chat.id)
-                person = db.session.execute(text("""
+                person = (
+                    db.session.execute(
+                        text(
+                            """
                     select id, telegram_chat_id from participants
                     where telegram_chat_id = :c
-                """), {"c": me_chat}).mappings().first()
+                """
+                        ),
+                        {"c": me_chat},
+                    )
+                    .mappings()
+                    .first()
+                )
                 if not person:
                     await update.message.reply_text("You're not linked yet. Send /start first.")
                     return
                 sent = _send_to_one(person["id"], person["telegram_chat_id"], season_year)
-                await update.message.reply_text(f"✅ Sent {sent} unpicked game(s) for Week {week_number} to you.")
+                await update.message.reply_text(
+                    f"✅ Sent {sent} unpicked game(s) for Week {week_number} to you."
+                )
                 return
 
             # Otherwise: treat target as a participant name
             name = target
-            person = db.session.execute(text("""
+            person = (
+                db.session.execute(
+                    text(
+                        """
                 select id, name, telegram_chat_id from participants
                 where lower(name)=lower(:n)
-            """), {"n": name}).mappings().first()
+            """
+                    ),
+                    {"n": name},
+                )
+                .mappings()
+                .first()
+            )
             if not person:
                 await update.message.reply_text(f"Participant '{name}' not found.")
                 return
             if not person["telegram_chat_id"]:
-                await update.message.reply_text(f"Participant '{name}' has no Telegram chat linked. Ask them to /start.")
+                await update.message.reply_text(
+                    f"Participant '{name}' has no Telegram chat linked. Ask them to /start."
+                )
                 return
             sent = _send_to_one(person["id"], person["telegram_chat_id"], season_year)
-            await update.message.reply_text(f"✅ Sent {sent} unpicked game(s) for Week {week_number} to {person['name']}.")
+            await update.message.reply_text(
+                f"✅ Sent {sent} unpicked game(s) for Week {week_number} to {person['name']}."
+            )
             return
 
     # Default: broadcast to ALL (unchanged behavior; may create the week if missing)
     async def _do_broadcast():
         app = create_app()
         with app.app_context():
-            wk = Week.query.filter_by(week_number=week_number).order_by(Week.season_year.desc()).first()
+            wk = (
+                Week.query.filter_by(week_number=week_number)
+                .order_by(Week.season_year.desc())
+                .first()
+            )
             if not wk:
                 # best-effort create if missing
                 import datetime as dt
+
                 from nfl_data import fetch_and_create_week
+
                 season_year = dt.datetime.utcnow().year
                 fetch_and_create_week(week_number, season_year)
-                wk = Week.query.filter_by(week_number=week_number).order_by(Week.season_year.desc()).first()
+                wk = (
+                    Week.query.filter_by(week_number=week_number)
+                    .order_by(Week.season_year.desc())
+                    .first()
+                )
             season_year = wk.season_year
             send_week_games(week_number=week_number, season_year=season_year)
 
     if update.message:
-        await update.message.reply_text(f"Sending Week {week_number} to all registered participants…")
+        await update.message.reply_text(
+            f"Sending Week {week_number} to all registered participants…"
+        )
     await asyncio.to_thread(_do_broadcast)
     if update.message:
         await update.message.reply_text("✅ Done.")
 
+
 if __name__ == "__main__":
-    import sys, json
+    import json
+    import sys
 
     cmd = sys.argv[1] if len(sys.argv) >= 2 else None
 
@@ -1974,15 +2557,19 @@ if __name__ == "__main__":
                 season_year = int(sys.argv[3])
             else:
                 from sqlalchemy import text as _text
+
                 from models import db
+
                 season_year = db.session.execute(
-                    _text("""
+                    _text(
+                        """
                         SELECT season_year
                         FROM weeks
                         WHERE week_number = :w
                         ORDER BY season_year DESC
                         LIMIT 1
-                    """),
+                    """
+                    ),
                     {"w": week},
                 ).scalar()
                 if not season_year:
@@ -2013,11 +2600,14 @@ if __name__ == "__main__":
 
     elif cmd == "announce-winners-now":
         # FORCE an immediate announcement (bypasses Tuesday guard) — will SEND
+        import os
+        from datetime import datetime, timezone
+
+        import httpx
+        from sqlalchemy import text as _text
+
         from flask_app import create_app
         from models import db
-        from sqlalchemy import text as _text
-        from datetime import datetime, timezone
-        import os, httpx
 
         app = create_app()
         with app.app_context():
@@ -2030,30 +2620,52 @@ if __name__ == "__main__":
             if upcoming:
                 week_to_announce = max(2, int(upcoming["week_number"]) - 1)
             else:
-                last_week = db.session.execute(
-                    _text("SELECT COALESCE(MAX(week_number),0) FROM weeks WHERE season_year=:y"),
-                    {"y": season},
-                ).scalar() or 0
+                last_week = (
+                    db.session.execute(
+                        _text(
+                            "SELECT COALESCE(MAX(week_number),0) FROM weeks WHERE season_year=:y"
+                        ),
+                        {"y": season},
+                    ).scalar()
+                    or 0
+                )
                 week_to_announce = max(2, last_week)
 
             # Ensure dedupe table, then try to claim this week
-            db.session.execute(_text("""
+            db.session.execute(
+                _text(
+                    """
                 CREATE TABLE IF NOT EXISTS week_announcements (
                     season_year INTEGER NOT NULL,
                     week_number INTEGER NOT NULL,
                     sent_at TIMESTAMPTZ DEFAULT NOW(),
                     PRIMARY KEY (season_year, week_number)
                 )
-            """))
-            claimed = db.session.execute(_text("""
+            """
+                )
+            )
+            claimed = db.session.execute(
+                _text(
+                    """
                 INSERT INTO week_announcements (season_year, week_number)
                 VALUES (:y, :w)
                 ON CONFLICT (season_year, week_number) DO NOTHING
                 RETURNING 1
-            """), {"y": season, "w": week_to_announce}).first()
+            """
+                ),
+                {"y": season, "w": week_to_announce},
+            ).first()
             if not claimed:
                 db.session.commit()
-                print(json.dumps({"status": "skipped_duplicate", "season_year": season, "week": week_to_announce}))
+                print(
+                    json.dumps(
+                        {
+                            "status": "skipped_duplicate",
+                            "season_year": season,
+                            "week": week_to_announce,
+                        }
+                    )
+                )
                 raise SystemExit(0)
 
             weekly = _compute_week_results(season, week_to_announce)
@@ -2065,11 +2677,19 @@ if __name__ == "__main__":
                 raise SystemExit("TELEGRAM_BOT_TOKEN not set.")
             url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-            participants = db.session.execute(_text("""
+            participants = (
+                db.session.execute(
+                    _text(
+                        """
                 SELECT id, COALESCE(display_name, name, CONCAT('P', id::text)) AS name, telegram_chat_id
                 FROM participants
                 WHERE telegram_chat_id IS NOT NULL
-            """)).mappings().all()
+            """
+                    )
+                )
+                .mappings()
+                .all()
+            )
 
             sent = 0
             with httpx.Client(timeout=20) as client:
@@ -2079,14 +2699,18 @@ if __name__ == "__main__":
                     sent += 1
 
             db.session.commit()
-            print(json.dumps({
-                "status": "sent",
-                "season_year": season,
-                "week": week_to_announce,
-                "recipients": sent,
-                "weekly_top": (weekly[0]["wins"] if weekly else 0),
-                "participants_ranked": len(season_totals),
-            }))
+            print(
+                json.dumps(
+                    {
+                        "status": "sent",
+                        "season_year": season,
+                        "week": week_to_announce,
+                        "recipients": sent,
+                        "weekly_top": (weekly[0]["wins"] if weekly else 0),
+                        "participants_ranked": len(season_totals),
+                    }
+                )
+            )
 
     else:
         raise SystemExit(
@@ -2099,4 +2723,3 @@ if __name__ == "__main__":
             "  python jobs.py announce-winners\n"
             "  python jobs.py announce-winners-now\n"
         )
-

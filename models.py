@@ -1,5 +1,6 @@
 # models.py
 from datetime import datetime
+
 from flask_sqlalchemy import SQLAlchemy
 
 # Initialized in app.create_app()
@@ -25,9 +26,7 @@ class Week(db.Model):
         passive_deletes=True,
     )
 
-    __table_args__ = (
-        db.UniqueConstraint("week_number", "season_year", name="uq_week_season"),
-    )
+    __table_args__ = (db.UniqueConstraint("week_number", "season_year", name="uq_week_season"),)
 
     def __repr__(self) -> str:
         return f"<Week {self.season_year}-W{self.week_number} deadline={self.picks_deadline}>"
@@ -38,7 +37,10 @@ class Game(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     week_id = db.Column(
-        db.Integer, db.ForeignKey("weeks.id", ondelete="CASCADE"), nullable=False, index=True
+        db.Integer,
+        db.ForeignKey("weeks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     espn_game_id = db.Column(db.String(32), unique=True, index=True)
     home_team = db.Column(db.String(64), nullable=False)
@@ -93,10 +95,16 @@ class Pick(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     participant_id = db.Column(
-        db.Integer, db.ForeignKey("participants.id", ondelete="CASCADE"), nullable=False, index=True
+        db.Integer,
+        db.ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     game_id = db.Column(
-        db.Integer, db.ForeignKey("games.id", ondelete="CASCADE"), nullable=False, index=True
+        db.Integer,
+        db.ForeignKey("games.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     selected_team = db.Column(db.String(64), nullable=False)  # must match home/away team
 
@@ -115,29 +123,37 @@ class Reminder(db.Model):
     Lightweight log so jobs.py can track that a reminder/launch message was sent.
     Safe to keep even if you switch from SMS to Telegram; 'channel' covers both.
     """
+
     __tablename__ = "reminders"
 
     id = db.Column(db.Integer, primary_key=True)
     week_id = db.Column(
-        db.Integer, db.ForeignKey("weeks.id", ondelete="CASCADE"), nullable=False, index=True
+        db.Integer,
+        db.ForeignKey("weeks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     participant_id = db.Column(
-        db.Integer, db.ForeignKey("participants.id", ondelete="CASCADE"), nullable=True, index=True
+        db.Integer,
+        db.ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
     )
-    kind = db.Column(db.String(32), nullable=False)      # e.g., 'launch', 'deadline', 'nudge'
-    channel = db.Column(db.String(32), nullable=False, default="telegram")  # 'sms' | 'telegram' | 'email'
-    message_sid = db.Column(db.String(128))              # SMS SID or Telegram message id (optional)
-    status = db.Column(db.String(32), default="sent")    # 'sent', 'failed', etc.
-    details = db.Column(db.Text)                         # error text or extra info
+    kind = db.Column(db.String(32), nullable=False)  # e.g., 'launch', 'deadline', 'nudge'
+    channel = db.Column(
+        db.String(32), nullable=False, default="telegram"
+    )  # 'sms' | 'telegram' | 'email'
+    message_sid = db.Column(db.String(128))  # SMS SID or Telegram message id (optional)
+    status = db.Column(db.String(32), default="sent")  # 'sent', 'failed', etc.
+    details = db.Column(db.Text)  # error text or extra info
     sent_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
     week = db.relationship("Week", lazy=True)
     participant = db.relationship("Participant", lazy=True)
 
-    __table_args__ = (
-        db.Index("ix_reminders_week_kind_part", "week_id", "kind", "participant_id"),
-    )
+    __table_args__ = (db.Index("ix_reminders_week_kind_part", "week_id", "kind", "participant_id"),)
 
     def __repr__(self) -> str:
-        return f"<Reminder week={self.week_id} part={self.participant_id} {self.kind}/{self.channel}>"
-
+        return (
+            f"<Reminder week={self.week_id} part={self.participant_id} {self.kind}/{self.channel}>"
+        )

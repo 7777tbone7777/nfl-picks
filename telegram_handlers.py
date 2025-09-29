@@ -1,10 +1,13 @@
-
 import logging
+
 from sqlalchemy import text as _text
-from models import db, Participant, Game, Week, Pick
+
+from models import Game, Participant, Pick, Week, db
+
 from .time_utils import now_utc, to_naive_utc
 
 log = logging.getLogger("telegram_handlers")
+
 
 async def start(update, context):
     chat = update.effective_chat
@@ -28,6 +31,7 @@ async def start(update, context):
     db.session.commit()
 
     await update.message.reply_text(f"✅ Registered as {p.name}. Use /sendweek to get your picks.")
+
 
 async def handle_pick(update, context):
     query = update.callback_query
@@ -65,14 +69,15 @@ async def handle_pick(update, context):
 
     db.session.commit()
 
-    kickoff_str = (game.game_time.isoformat(' ') + ' UTC') if game.game_time else 'TBD'
+    kickoff_str = (game.game_time.isoformat(" ") + " UTC") if game.game_time else "TBD"
     await query.edit_message_text(
         f"✅ Your pick for {game.away_team} @ {game.home_team} is <b>{team}</b>.\nKickoff: {kickoff_str}",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
+
 async def mypicks(update, context):
-    args = (context.args or [])
+    args = context.args or []
     week = None
     if args:
         try:
@@ -81,7 +86,9 @@ async def mypicks(update, context):
             pass
 
     if week is None:
-        row = db.session.execute(_text('''
+        row = db.session.execute(
+            _text(
+                """
             SELECT w.week_number
             FROM weeks w
             JOIN games g ON g.week_id=w.id
@@ -89,11 +96,13 @@ async def mypicks(update, context):
             HAVING MIN(g.game_time) > NOW() AT TIME ZONE 'UTC'
             ORDER BY w.season_year DESC, w.week_number ASC
             LIMIT 1
-        ''')).first()
+        """
+            )
+        ).first()
         if row:
             week = int(row[0])
         else:
-            row = db.session.execute(_text('SELECT MAX(week_number) FROM weeks')).first()
+            row = db.session.execute(_text("SELECT MAX(week_number) FROM weeks")).first()
             week = int(row[0] or 1)
 
     chat_id = update.effective_chat.id
@@ -102,14 +111,23 @@ async def mypicks(update, context):
         await update.message.reply_text("❌ Please /start first to register.")
         return
 
-    rows = db.session.execute(_text('''
+    rows = (
+        db.session.execute(
+            _text(
+                """
         SELECT g.id, g.away_team, g.home_team, g.game_time,
                (SELECT selected_team FROM picks WHERE participant_id=:pid AND game_id=g.id) AS selected_team
         FROM games g
         JOIN weeks w ON w.id=g.week_id
         WHERE w.week_number=:w
         ORDER BY g.game_time NULLS LAST, g.id
-    '''), {"pid": p.id, "w": week}).mappings().all()
+    """
+            ),
+            {"pid": p.id, "w": week},
+        )
+        .mappings()
+        .all()
+    )
 
     if not rows:
         await update.message.reply_text(f"No games found for Week {week}.")

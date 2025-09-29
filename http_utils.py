@@ -1,10 +1,11 @@
-
 import asyncio
-import httpx
 import logging
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
+
+import httpx
 
 log = logging.getLogger("http_utils")
+
 
 async def get_json_with_retry(
     url: str,
