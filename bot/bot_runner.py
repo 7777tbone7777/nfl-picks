@@ -1,3 +1,4 @@
+from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 
 from .config import load_config
@@ -16,7 +17,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_pick, pattern=r"^pick:"))
     app.add_handler(CommandHandler("mypicks", mypicks))
 
-    app.run_polling(allowed_updates=Application.ALL_UPDATE_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
