@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from extensions import db  # your Flask-SQLAlchemy db instance
 from flask import current_app
 from sqlalchemy import text
 from telegram import Update
@@ -12,6 +11,7 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 from models import Participant  # your Flask-SQLAlchemy model
+from models import db
 
 log = logging.getLogger(__name__)
 
