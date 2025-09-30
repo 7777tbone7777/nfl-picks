@@ -191,3 +191,11 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+
+# --- simple health handler ---------------------------------------------------
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    await context.bot.send_message(chat_id=chat.id, text="pong")
