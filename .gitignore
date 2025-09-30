@@ -8,3 +8,12 @@ __pycache__/
 .cache/
 
 !.env.example
+
+# Git internals (safety)
+FETCH_HEAD
+
+# Git internals (safety)
+FETCH_HEAD
+
+# Git internals (safety)
+FETCH_HEAD
