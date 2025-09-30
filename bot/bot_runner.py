@@ -47,7 +47,7 @@ def build_application() -> Application:
         application.add_handler(CommandHandler("ping", in_app_context(th.ping)))
     if hasattr(th, "unknown_command"):
         # Non-blocking so it doesn't swallow real commands
-        application.add_handler(MessageHandler(filters.COMMAND, th.unknown_command), block=False)
+        application.add_handler(MessageHandler(filters.COMMAND, th.unknown_command, block=False))
     elif hasattr(th, "fallback"):
         application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, in_app_context(th.fallback))
