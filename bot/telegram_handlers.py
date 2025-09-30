@@ -11,8 +11,6 @@ from telegram.ext import ContextTypes
 # (Heroku logs confirmed importing from db fails; models is correct)
 from models import db
 
-from models import db
-
 # ---------- helpers ----------
 
 
