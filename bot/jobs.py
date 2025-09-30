@@ -287,32 +287,35 @@ def _find_last_completed_week_number(season_year: int) -> int | None:
     ).scalar()
     return int(row) if row is not None else None
 
-
-def _find_upcoming_week_row(season_year, now_naive_utc):
+def _find_upcoming_week_row(season_year: int, now_naive_utc):
+    """
+    Return the first week that clearly has a future kickoff time AND at least one game.
+    If all game_time values are NULL for the next week, this will return None and the caller
+    should fall back to last_completed + 1.
+    """
     from sqlalchemy import text as _text
 
     rows = (
         db.session.execute(
-            _text(
-                """
-        SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
-        FROM weeks w
-        LEFT JOIN games g ON g.week_id = w.id
-        WHERE w.season_year = :y
-        GROUP BY w.week_number
-        ORDER BY w.week_number
-    """
-            ),
+            _text("""
+                SELECT w.week_number,
+                       MIN(g.game_time) AS first_kick,
+                       COUNT(g.id)      AS games
+                FROM weeks w
+                LEFT JOIN games g ON g.week_id = w.id
+                WHERE w.season_year = :y
+                GROUP BY w.week_number
+                ORDER BY w.week_number
+            """),
             {"y": season_year},
-        )
-        .mappings()
-        .all()
+        ).mappings().all()
     )
+
+    # IMPORTANT: require at least 1 game AND a real (non-NULL) future kickoff
     for r in rows:
-        if r["first_kick"] and r["first_kick"] > now_naive_utc:
+        if r["games"] and r["first_kick"] and r["first_kick"] > now_naive_utc:
             return r
     return None
-
 
 def _compute_week_results(season_year: int, week: int):
     """
@@ -444,33 +447,71 @@ def _format_winners_and_totals(week: int, weekly_rows, season_rows):
         rank += 1
     return weekly_line + "\n" + "\n".join(lines)
 
-def cron_send_upcoming_week():
+def cron_send_upcoming_week() -> dict:
     """
-    Find the next (upcoming) NFL week and broadcast the matchups
-    to all participants with a telegram_chat_id.
-    Returns a JSON-serializable dict with what happened.
+    Post the matchups for the next week so participants can make picks.
+    Strategy:
+      1) Try the strict finder (needs first_kick > now and games > 0).
+      2) If none found (e.g., first_kick is NULL), fall back to last_completed + 1.
+      3) Ensure that week exists in DB (import once if empty).
+      4) Announce/sent the matchups for target_week.
     """
+    from datetime import datetime, timezone
+    from sqlalchemy import text as _text
 
     app = create_app()
     with app.app_context():
+        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+        if not season:
+            return {"ok": False, "reason": "no season"}
 
-    # latest season + current time (naive UTC to match the rest of the file)
-     season_year = _get_latest_season_year()
-     now_naive_utc = _now_utc_naive()
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    # Figure out the upcoming week row (first kickoff > now)
-     wk = _find_upcoming_week_row(season_year, now_naive_utc)
-     if not wk:
-         return {"ok": False, "reason": "no upcoming week found", "season_year": season_year}
+        # 1) Try to find an upcoming week with a real future kickoff
+        wk = _find_upcoming_week_row(season, now_utc)
 
-    # Depending on your helper’s return shape, wk might be a dict or row.
-    # The existing helpers in this file expect (week_number, season_year).
-     week_number = wk["week_number"] if isinstance(wk, dict) else wk.week_number
+        if not wk:
+            # 2) Fallback when MIN(game_time) is NULL or not future:
+            last_completed = _find_last_completed_week_number(season) or 0
+            target_week = last_completed + 1
+        else:
+            target_week = int(wk["week_number"])
 
-    # Send to everyone
-     send_week_games(week_number, season_year)
+        # 3) Ensure the week has games; import if necessary (idempotent)
+        cnt = db.session.execute(
+            _text("""
+                SELECT COUNT(*) FROM games g
+                JOIN weeks w ON w.id = g.week_id
+                WHERE w.season_year = :y AND w.week_number = :w
+            """),
+            {"y": season, "w": target_week},
+        ).scalar()
 
-    return {"ok": True, "action": "sendweek_upcoming", "season_year": season_year, "week_number": week_number}
+        if not cnt:
+            import_week_from_espn(season, target_week)
+            cnt = db.session.execute(
+                _text("""
+                    SELECT COUNT(*) FROM games g
+                    JOIN weeks w ON w.id = g.week_id
+                    WHERE w.season_year = :y AND w.week_number = :w
+                """),
+                {"y": season, "w": target_week},
+            ).scalar()
+
+        if not cnt:
+            return {
+                "ok": False,
+                "reason": "no upcoming week found after fallback",
+                "season_year": int(season),
+                "week": int(target_week),
+            }
+
+        # 4) Send the actual matchups post (use your existing announcer)
+        # If your function name differs (e.g., send_week_games), swap it here:
+        res = announce_matchups_for_week(season, target_week)
+
+        return {"ok": True, "season_year": int(season), "week": int(target_week), **(res or {})}
+
 
 def cron_announce_weekly_winners() -> dict:
     """
