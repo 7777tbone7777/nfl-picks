@@ -322,7 +322,10 @@ def _compute_week_results(season_year: int, week: int):
         scores AS (
           SELECT pp.participant_id,
                  pp.name,
-                 COUNT(*) FILTER (WHERE pk.pick::text ILIKE wg.winner::text) AS wins
+                 COUNT(*) FILTER (
+                   WHERE pk.selected_team IS NOT NULL
+                     AND lower(pk.selected_team) = lower(wg.winner)
+                 ) AS wins
           FROM per_participant pp
           LEFT JOIN picks pk ON pk.participant_id = pp.participant_id
           LEFT JOIN week_games wg ON wg.game_id = pk.game_id
@@ -374,7 +377,10 @@ def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
         scores AS (
           SELECT pp.participant_id,
                  pp.name,
-                 COUNT(*) FILTER (WHERE lower(pk.pick) = lower(sg.winner)) AS wins
+                 COUNT(*) FILTER (
+                   WHERE pk.selected_team IS NOT NULL
+                     AND lower(pk.selected_team) = lower(wg.winner)
+                 ) AS wins
           FROM per_participant pp
           LEFT JOIN picks pk ON pk.participant_id = pp.participant_id
           LEFT JOIN season_games sg ON sg.game_id = pk.game_id
