@@ -5,21 +5,31 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import text
 from telegram import Update
 from telegram.ext import ContextTypes
 
-# Re-export your existing handlers from jobs.py (now under the bot/ package)
-from bot.jobs import handle_pick, seepicks_command, sendweek_command, start  # noqa: F401
+# Re-export command handlers that live in jobs.py
+from bot.jobs import (
+    handle_pick,
+    start,
+    sendweek_command,
+    syncscores_command,
+    getscores_command,
+    seasonboard_command,
+    deletepicks_command,
+    whoisleft_command,
+    seepicks_command,
+    remindweek_command,
+)
 
-# DB access (Flask-SQLAlchemy style)
+# DB access for /mypicks
 from models import db  # type: ignore
+from sqlalchemy import text
 
 log = logging.getLogger(__name__)
 
 
-# ---------- helpers ----------
-
+# ---------- helpers for /mypicks ----------
 
 def _format_user_picks(picks: List[Dict[str, Any]]) -> str:
     """Format a user's picks into a readable message."""
@@ -116,8 +126,7 @@ async def _load_user_picks(
     return await asyncio.to_thread(_fetch_picks_sync, user_id)
 
 
-# ---------- additional command: /mypicks ----------
-
+# ---------- /mypicks (lives here) ----------
 
 async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -151,19 +160,3 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
-
-# ---------- optional small extras ----------
-
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Optional /ping, only used if the runner wires it."""
-    msg = update.effective_message or update.message
-    if msg:
-        await msg.reply_text("pong")
-
-
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Optional catch-all for unknown /commands (wire as non-blocking)."""
-    msg = update.effective_message or update.message
-    if msg:
-        await msg.reply_text("Sorry, I don’t recognize that command.")
