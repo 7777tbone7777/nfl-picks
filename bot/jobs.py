@@ -451,10 +451,10 @@ def cron_send_upcoming_week() -> dict:
     """
     Post the matchups for the next week so participants can make picks.
     Strategy:
-      1) Try the strict finder (needs first_kick > now and games > 0).
-      2) If none found (e.g., first_kick is NULL), fall back to last_completed + 1.
-      3) Ensure that week exists in DB (import once if empty).
-      4) Announce/sent the matchups for target_week.
+      1) Try strict finder (needs first_kick > now and games > 0).
+      2) If none (e.g., first_kick is NULL), fall back to last_completed + 1.
+      3) Ensure week exists in DB (import once if empty).
+      4) Send using send_week_games(...).
     """
     from datetime import datetime, timezone
     from sqlalchemy import text as _text
@@ -471,7 +471,7 @@ def cron_send_upcoming_week() -> dict:
         wk = _find_upcoming_week_row(season, now_utc)
 
         if not wk:
-            # 2) Fallback when MIN(game_time) is NULL or not future:
+            # 2) Fallback when MIN(game_time) is NULL or not future
             last_completed = _find_last_completed_week_number(season) or 0
             target_week = last_completed + 1
         else:
@@ -506,13 +506,16 @@ def cron_send_upcoming_week() -> dict:
                 "week": int(target_week),
             }
 
-        # 4) Send the actual matchups post (use your existing announcer)
-        # If your function name differs (e.g., send_week_games), swap it here:
-        from importlib import import_module
-        th = import_module("bot.telegram_handlers")
-        res = th.announce_matchups_for_week(season, target_week)
+        # 4) Send using the same helper your /sendweek command uses
+        # If your helper is positional (season, week) instead of keywords, swap accordingly.
+        res = send_week_games(week_number=target_week, season_year=season)
 
-        return {"ok": True, "season_year": int(season), "week": int(target_week), **(res or {})}
+        return {
+            "ok": True,
+            "season_year": int(season),
+            "week": int(target_week),
+            **(res or {}),
+        }
 
 
 def cron_announce_weekly_winners() -> dict:
