@@ -1,184 +1,193 @@
-from __future__ import annotations
-
-import asyncio
+import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Optional, Sequence
 
 from sqlalchemy import text
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
-from utils.time_utils import now_utc  # helper already in repo (returns aware UTC datetime)
 
+# Your \] exposes SQLAlchemy session/engine from models.py
+# (Heroku logs confirmed importing from db fails; models is correct)
 from models import db
 
 # ---------- helpers ----------
 
 
-def _get_or_create_participant(telegram_chat_id: str, name: Optional[str]) -> int:
-    """
-    Returns participant.id for this telegram_chat_id, creating one if missing.
-    """
-    # name can be None; DB requires name NOT NULL, so default to the chat id string
-    fallback_name = name or f"tg_{telegram_chat_id}"
+log = logging.getLogger(__name__)
+
+
+# --- small helpers -----------------------------------------------------------
+
+
+def now_utc() -> datetime:
+    """Return an aware UTC datetime without relying on any project utils."""
+    return datetime.now(timezone.utc)
+
+
+def _display_name(first_name: Optional[str], username: Optional[str]) -> str:
+    if first_name:
+        return first_name
+    if username:
+        return f"@{username}"
+    return "Friend"
+
+
+# --- participant bootstrap ---------------------------------------------------
+
+
+def _get_participant_by_chat_id(chat_id: int) -> Optional[int]:
+    """Returns participant.id for this telegram_chat_id, or None."""
     row = db.session.execute(
         text(
             """
-            SELECT id FROM participants
-            WHERE telegram_chat_id = :chat_id
-            LIMIT 1
+            select id
+            from participants
+            where telegram_chat_id = :chat_id
+            limit 1
             """
         ),
-        {"chat_id": str(telegram_chat_id)},
+        {"chat_id": str(chat_id)},  # column is text/varchar in your schema
     ).first()
-
-    if row:
-        return row[0]
-
-    # create participant
-    created = db.session.execute(
-        text(
-            """
-            INSERT INTO participants (name, telegram_chat_id, created_at)
-            VALUES (:name, :chat_id, :created_at)
-            RETURNING id
-            """
-        ),
-        {
-            "name": fallback_name,
-            "chat_id": str(telegram_chat_id),
-            "created_at": now_utc().replace(tzinfo=None),
-        },
-    ).first()
-    db.session.commit()
-    return int(created[0])
+    return row[0] if row else None
 
 
-def _get_latest_week_number() -> Optional[int]:
-    row = db.session.execute(
-        text(
-            """
-            SELECT week_number
-            FROM weeks
-            ORDER BY season_year DESC, week_number DESC
-            LIMIT 1
-            """
-        )
-    ).first()
-    return int(row[0]) if row else None
-
-
-def _get_week_id(week_number: int) -> Optional[int]:
-    row = db.session.execute(
-        text(
-            """
-            SELECT id
-            FROM weeks
-            WHERE week_number = :w
-            ORDER BY season_year DESC
-            LIMIT 1
-            """
-        ),
-        {"w": int(week_number)},
-    ).first()
-    return int(row[0]) if row else None
-
-
-def _load_week_games_with_user_pick(week_id: int, participant_id: int) -> List[Tuple]:
-    """
-    Returns list of tuples:
-    (game_id, game_time, away_team, home_team, selected_team)
-    selected_team may be None if not picked yet.
-    """
+def _insert_participant(chat_id: int, name: str) -> int:
+    """Create a participant and return its id."""
     result = db.session.execute(
         text(
             """
-            SELECT g.id AS game_id,
-                   g.game_time,
-                   g.away_team,
-                   g.home_team,
-                   p.selected_team
-            FROM games g
-            LEFT JOIN picks p
-              ON p.game_id = g.id
-             AND p.participant_id = :pid
-            WHERE g.week_id = :week_id
-            ORDER BY g.game_time NULLS LAST, g.id
+            insert into participants (name, telegram_chat_id, created_at)
+            values (:name, :chat_id, :created_at)
+            returning id
             """
         ),
-        {"pid": participant_id, "week_id": week_id},
-    ).fetchall()
-    return list(result)
+        {
+            "name": name[:80] if name else "Friend",
+            "chat_id": str(chat_id),
+            "created_at": now_utc().replace(tzinfo=None),  # table is 'without time zone'
+        },
+    )
+    pid = result.scalar_one()
+    db.session.commit()
+    return pid
 
 
-# ---------- handlers ----------
+def ensure_participant(chat_id: int, name_hint: str) -> int:
+    """Fetch or create a participant row for this Telegram chat."""
+    pid = _get_participant_by_chat_id(chat_id)
+    if pid:
+        return pid
+    return _insert_participant(chat_id, name_hint)
+
+
+# --- command handlers --------------------------------------------------------
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /start — register user if necessary and explain commands.
-    """
+    """Registers the user (if new) and says hello."""
     chat = update.effective_chat
     user = update.effective_user
     if not chat or not user:
         return
 
-    participant_id = _get_or_create_participant(str(chat.id), user.first_name)
+    display = _display_name(user.first_name, user.username)
+    pid = ensure_participant(chat.id, display)
 
-    msg = [
-        f"Hi {user.first_name or 'there'}! You're set up (participant #{participant_id}).",
-        "",
-        "Commands:",
-        "• /mypicks — show your picks for the latest week",
-        "• /mypicks <week> — show your picks for a specific week number (e.g., /mypicks 4)",
-    ]
-    await update.message.reply_text("\n".join(msg))
+    msg = (
+        f"Hey {display}! 👋\n\n"
+        "You’re set up for picks. Use:\n"
+        "• /mypicks — see all the picks we have on record\n"
+        "• /help — list commands\n"
+    )
+    log.info("start: chat_id=%s participant_id=%s", chat.id, pid)
+    await context.bot.send_message(chat_id=chat.id, text=msg)
+
+
+async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text="Commands:\n" "• /start — register & info\n" "• /mypicks — list your picks",
+    )
 
 
 async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /mypicks [week_number]
-    Shows the user's picks for the specified (or latest) week by reading existing tables:
-    weeks, games, picks, participants.
-    """
+    """List this chat's picks across weeks using the real schema."""
     chat = update.effective_chat
     user = update.effective_user
     if not chat or not user:
         return
 
-    # ensure participant exists
-    participant_id = _get_or_create_participant(str(chat.id), user.first_name)
+    display = _display_name(user.first_name, user.username)
+    pid = ensure_participant(chat.id, display)
 
-    # which week?
-    week_arg = context.args[0] if context.args else None
-    if week_arg and week_arg.isdigit():
-        week_number = int(week_arg)
-    else:
-        week_number = _get_latest_week_number()
+    # Pull picks joined to games & weeks
+    rows: Sequence = db.session.execute(
+        text(
+            """
+            select
+                w.season_year,
+                w.week_number,
+                g.home_team,
+                g.away_team,
+                p.selected_team,
+                g.status,
+                g.home_score,
+                g.away_score
+            from picks p
+            join games g on g.id = p.game_id
+            join weeks w on w.id = g.week_id
+            where p.participant_id = :pid
+            order by w.week_number, g.id
+            """
+        ),
+        {"pid": pid},
+    ).fetchall()
 
-    if week_number is None:
-        await update.message.reply_text("No weeks found in the database yet.")
+    if not rows:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                f"I don’t have any picks on file for you yet, {display}.\n"
+                "Make a pick and try again with /mypicks."
+            ),
+        )
         return
 
-    week_id = _get_week_id(week_number)
-    if week_id is None:
-        await update.message.reply_text(f"I couldn't find week {week_number} in the database.")
-        return
+    # Group by week and render
+    lines: list[str] = []
+    current_week = None
+    for (
+        season_year,
+        week_number,
+        home_team,
+        away_team,
+        selected_team,
+        status,
+        home_score,
+        away_score,
+    ) in rows:
+        if week_number != current_week:
+            current_week = week_number
+            lines.append(f"\n<b>Week {week_number} ({season_year})</b>")
+        maybe_score = ""
+        if status and status.lower() in {"final", "in_progress", "post", "completed"}:
+            if home_score is not None and away_score is not None:
+                maybe_score = f"  —  {away_team} {away_score} @ {home_team} {home_score}"
+        lines.append(
+            f"• {away_team} at {home_team}  —  <b>you picked: {selected_team}</b>{maybe_score}"
+        )
 
-    games = _load_week_games_with_user_pick(week_id, participant_id)
-    if not games:
-        await update.message.reply_text(f"No games found for week {week_number}.")
-        return
+    header = f"{display}, here are your picks:"
+    body = "\n".join(lines).lstrip()
+    text_out = f"{header}\n{body}"
 
-    lines = [f"*Week {week_number} — Your Picks*"]
-    for idx, (game_id, game_time, away, home, selected) in enumerate(games, start=1):
-        when = game_time.strftime("%a %m/%d %H:%M") if game_time else "TBD"
-        pick_str = selected if selected else "—"
-        lines.append(f"{idx}. {away} @ {home} — *{pick_str}* ({when})")
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
-# Optional: simple health handler used by the webhook or scheduler
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("pong")
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text=text_out,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
