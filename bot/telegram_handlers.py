@@ -1,3 +1,5 @@
+# bot/telegram_handlers.py
+
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Sequence
@@ -7,21 +9,19 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-# Your \] exposes SQLAlchemy session/engine from models.py
-# (Heroku logs confirmed importing from db fails; models is correct)
+# Import your SQLAlchemy session from models (Heroku logs showed this is correct)
 from models import db
-
-# ---------- helpers ----------
-
 
 log = logging.getLogger(__name__)
 
 
-# --- small helpers -----------------------------------------------------------
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
 
 
 def now_utc() -> datetime:
-    """Return an aware UTC datetime without relying on any project utils."""
+    """Return an aware UTC datetime without relying on project utils."""
     return datetime.now(timezone.utc)
 
 
@@ -33,18 +33,20 @@ def _display_name(first_name: Optional[str], username: Optional[str]) -> str:
     return "Friend"
 
 
-# --- participant bootstrap ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# participant bootstrap
+# ---------------------------------------------------------------------------
 
 
 def _get_participant_by_chat_id(chat_id: int) -> Optional[int]:
-    """Returns participant.id for this telegram_chat_id, or None."""
+    """Return participant.id for this telegram_chat_id, or None if missing."""
     row = db.session.execute(
         text(
             """
-            select id
-            from participants
-            where telegram_chat_id = :chat_id
-            limit 1
+            SELECT id
+            FROM participants
+            WHERE telegram_chat_id = :chat_id
+            LIMIT 1
             """
         ),
         {"chat_id": str(chat_id)},  # column is text/varchar in your schema
@@ -57,31 +59,34 @@ def _insert_participant(chat_id: int, name: str) -> int:
     result = db.session.execute(
         text(
             """
-            insert into participants (name, telegram_chat_id, created_at)
-            values (:name, :chat_id, :created_at)
-            returning id
+            INSERT INTO participants (name, telegram_chat_id, created_at)
+            VALUES (:name, :chat_id, :created_at)
+            RETURNING id
             """
         ),
         {
-            "name": name[:80] if name else "Friend",
+            "name": (name or "Friend")[:80],
             "chat_id": str(chat_id),
-            "created_at": now_utc().replace(tzinfo=None),  # table is 'without time zone'
+            # your column is 'timestamp without time zone', so pass naive UTC
+            "created_at": now_utc().replace(tzinfo=None),
         },
     )
     pid = result.scalar_one()
     db.session.commit()
-    return pid
+    return int(pid)
 
 
 def ensure_participant(chat_id: int, name_hint: str) -> int:
     """Fetch or create a participant row for this Telegram chat."""
     pid = _get_participant_by_chat_id(chat_id)
     if pid:
-        return pid
+        return int(pid)
     return _insert_participant(chat_id, name_hint)
 
 
-# --- command handlers --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# command handlers
+# ---------------------------------------------------------------------------
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -105,17 +110,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show basic command list."""
     chat = update.effective_chat
     if not chat:
         return
     await context.bot.send_message(
         chat_id=chat.id,
-        text="Commands:\n" "• /start — register & info\n" "• /mypicks — list your picks",
+        text="Commands:\n"
+        "• /start — register & info\n"
+        "• /mypicks — list your picks\n"
+        "• /ping — quick health check",
     )
 
 
 async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List this chat's picks across weeks using the real schema."""
+    """List this chat's picks across weeks using the actual schema."""
     chat = update.effective_chat
     user = update.effective_user
     if not chat or not user:
@@ -128,7 +137,7 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows: Sequence = db.session.execute(
         text(
             """
-            select
+            SELECT
                 w.season_year,
                 w.week_number,
                 g.home_team,
@@ -137,11 +146,11 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 g.status,
                 g.home_score,
                 g.away_score
-            from picks p
-            join games g on g.id = p.game_id
-            join weeks w on w.id = g.week_id
-            where p.participant_id = :pid
-            order by w.week_number, g.id
+            FROM picks p
+            JOIN games g ON g.id = p.game_id
+            JOIN weeks w ON w.id = g.week_id
+            WHERE p.participant_id = :pid
+            ORDER BY w.week_number, g.id
             """
         ),
         {"pid": pid},
@@ -193,8 +202,8 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-# --- simple health handler ---------------------------------------------------
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lightweight sanity check used by the worker."""
     chat = update.effective_chat
     if not chat:
         return
