@@ -267,6 +267,26 @@ def _get_latest_season_year():
 
     return db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
 
+def _find_last_completed_week_number(season_year: int) -> int | None:
+    """
+    Return the highest week_number where ALL games are final (completed).
+    """
+    from sqlalchemy import text as _text
+    row = db.session.execute(
+        _text("""
+            SELECT w.week_number
+            FROM weeks w
+            JOIN games g ON g.week_id = w.id
+            WHERE w.season_year = :y
+            GROUP BY w.week_number
+            HAVING SUM(CASE WHEN COALESCE(g.status,'') <> 'final' THEN 1 ELSE 0 END) = 0
+            ORDER BY w.week_number DESC
+            LIMIT 1
+        """),
+        {"y": season_year},
+    ).scalar()
+    return int(row) if row is not None else None
+
 
 def _find_upcoming_week_row(season_year, now_naive_utc):
     from sqlalchemy import text as _text
@@ -477,18 +497,11 @@ def cron_announce_weekly_winners() -> dict:
         upcoming = _find_upcoming_week_row(season, now_utc_naive)
         if not upcoming:
             # If no upcoming, assume max existing week and announce that-1
-            last_week = (
-                db.session.execute(
-                    _text(
-                        """
-                SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y
-            """
-                    ),
-                    {"y": season},
-                ).scalar()
-                or 0
-            )
-            week_to_announce = max(2, last_week)  # never below 2 for season totals rule
+            last_completed = _find_last_week_number(season)
+            if not last_completed:
+                logger.info("cron_announce_weekly_winners: no completed week yet")
+                return {"status": "noop", "reason": "no completed week"}
+            week_to_announce = max(2, last_completed)
         else:
             week_to_announce = max(2, int(upcoming["week_number"]) - 1)
 
