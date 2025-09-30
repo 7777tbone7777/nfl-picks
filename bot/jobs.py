@@ -497,7 +497,7 @@ def cron_announce_weekly_winners() -> dict:
         upcoming = _find_upcoming_week_row(season, now_utc_naive)
         if not upcoming:
             # If no upcoming, assume max existing week and announce that-1
-            last_completed = _find_last_week_number(season)
+            last_completed = _find_last_completed_week_number(season)
             if not last_completed:
                 logger.info("cron_announce_weekly_winners: no completed week yet")
                 return {"status": "noop", "reason": "no completed week"}
