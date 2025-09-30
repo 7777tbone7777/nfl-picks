@@ -452,7 +452,7 @@ def cron_send_upcoming_week():
     """
 
     app = create_app()
-    with app.app_context()
+    with app.app_context():
 
     # latest season + current time (naive UTC to match the rest of the file)
     season_year = _get_latest_season_year()
