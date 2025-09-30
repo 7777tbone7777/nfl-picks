@@ -11,6 +11,8 @@ from sqlalchemy import text as _text
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes
 
+from bot.telegram_handlers import announce_matchups_for_week
+
 from flask_app import create_app
 from models import Game, Participant, Pick, Week, db
 
