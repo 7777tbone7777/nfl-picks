@@ -1263,7 +1263,7 @@ async def deletepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     from sqlalchemy import text as _text
 
     from flask_app import create_app
-    from flask_app import db as _db
+    from models import db as _db
 
     app = create_app()
     with app.app_context():
@@ -1446,7 +1446,7 @@ async def whoisleft_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # DB work
     from flask_app import create_app
-    from flask_app import db as _db
+    from models import db as _db
 
     app = create_app()
     with app.app_context():
@@ -1551,7 +1551,7 @@ async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     from flask_app import create_app
-    from flask_app import db as _db
+    from models import db as _db
 
     app = create_app()
     now_cutoff = _now_utc_naive()
@@ -1717,7 +1717,7 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     broadcast = len(args) > 1 and args[1].lower() == "all"
 
     from flask_app import create_app
-    from flask_app import db as _db
+    from models import db as _db
 
     app = create_app()
     with app.app_context():
@@ -1853,7 +1853,7 @@ async def seasonboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     broadcast = len(args) >= 1 and args[0].lower() == "all"
 
     from flask_app import create_app
-    from flask_app import db as _db
+    from models import db as _db
 
     app = create_app()
     with app.app_context():
@@ -2028,7 +2028,7 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_all = target.lower() == "all"
 
     from flask_app import create_app
-    from flask_app import db as _db
+    from models import db as _db
 
     app = create_app()
     with app.app_context():
