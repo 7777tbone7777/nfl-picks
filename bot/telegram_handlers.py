@@ -15,13 +15,11 @@ from models import db
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# small helpers
-# ---------------------------------------------------------------------------
+# --- small helpers -----------------------------------------------------------
 
 
 def now_utc() -> datetime:
-    """Return an aware UTC datetime without relying on project utils."""
+    """Return an aware UTC datetime without relying on any project utils."""
     return datetime.now(timezone.utc)
 
 
@@ -33,23 +31,21 @@ def _display_name(first_name: Optional[str], username: Optional[str]) -> str:
     return "Friend"
 
 
-# ---------------------------------------------------------------------------
-# participant bootstrap
-# ---------------------------------------------------------------------------
+# --- participant bootstrap ---------------------------------------------------
 
 
 def _get_participant_by_chat_id(chat_id: int) -> Optional[int]:
-    """Return participant.id for this telegram_chat_id, or None if missing."""
+    """Returns participant.id for this telegram_chat_id, or None."""
     row = db.session.execute(
         text(
             """
-            SELECT id
-            FROM participants
-            WHERE telegram_chat_id = :chat_id
-            LIMIT 1
+            select id
+            from participants
+            where telegram_chat_id = :chat_id
+            limit 1
             """
         ),
-        {"chat_id": str(chat_id)},  # column is text/varchar in your schema
+        {"chat_id": str(chat_id)},  # column is likely text/varchar in your schema
     ).first()
     return row[0] if row else None
 
@@ -59,34 +55,32 @@ def _insert_participant(chat_id: int, name: str) -> int:
     result = db.session.execute(
         text(
             """
-            INSERT INTO participants (name, telegram_chat_id, created_at)
-            VALUES (:name, :chat_id, :created_at)
-            RETURNING id
+            insert into participants (name, telegram_chat_id, created_at)
+            values (:name, :chat_id, :created_at)
+            returning id
             """
         ),
         {
             "name": (name or "Friend")[:80],
             "chat_id": str(chat_id),
-            # your column is 'timestamp without time zone', so pass naive UTC
+            # if column is TIMESTAMP WITHOUT TIME ZONE, store naive UTC:
             "created_at": now_utc().replace(tzinfo=None),
         },
     )
     pid = result.scalar_one()
     db.session.commit()
-    return int(pid)
+    return pid
 
 
 def ensure_participant(chat_id: int, name_hint: str) -> int:
     """Fetch or create a participant row for this Telegram chat."""
     pid = _get_participant_by_chat_id(chat_id)
     if pid:
-        return int(pid)
+        return pid
     return _insert_participant(chat_id, name_hint)
 
 
-# ---------------------------------------------------------------------------
-# command handlers
-# ---------------------------------------------------------------------------
+# --- command handlers --------------------------------------------------------
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -110,7 +104,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show basic command list."""
     chat = update.effective_chat
     if not chat:
         return
@@ -124,7 +117,7 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List this chat's picks across weeks using the actual schema."""
+    """List this chat's picks across weeks using the real schema."""
     chat = update.effective_chat
     user = update.effective_user
     if not chat or not user:
@@ -137,7 +130,7 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows: Sequence = db.session.execute(
         text(
             """
-            SELECT
+            select
                 w.season_year,
                 w.week_number,
                 g.home_team,
@@ -146,11 +139,11 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 g.status,
                 g.home_score,
                 g.away_score
-            FROM picks p
-            JOIN games g ON g.id = p.game_id
-            JOIN weeks w ON w.id = g.week_id
-            WHERE p.participant_id = :pid
-            ORDER BY w.week_number, g.id
+            from picks p
+            join games g on g.id = p.game_id
+            join weeks w on w.id = g.week_id
+            where p.participant_id = :pid
+            order by w.week_number, g.id
             """
         ),
         {"pid": pid},
