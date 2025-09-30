@@ -4,12 +4,13 @@ import asyncio
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
-from db import db  # SQLAlchemy session scoped in your project
 from sqlalchemy import text
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 from utils.time_utils import now_utc  # helper already in repo (returns aware UTC datetime)
+
+from models import db
 
 # ---------- helpers ----------
 
