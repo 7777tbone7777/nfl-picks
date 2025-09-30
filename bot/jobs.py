@@ -455,20 +455,20 @@ def cron_send_upcoming_week():
     with app.app_context():
 
     # latest season + current time (naive UTC to match the rest of the file)
-    season_year = _get_latest_season_year()
-    now_naive_utc = _now_utc_naive()
+     season_year = _get_latest_season_year()
+     now_naive_utc = _now_utc_naive()
 
     # Figure out the upcoming week row (first kickoff > now)
-    wk = _find_upcoming_week_row(season_year, now_naive_utc)
-    if not wk:
-        return {"ok": False, "reason": "no upcoming week found", "season_year": season_year}
+     wk = _find_upcoming_week_row(season_year, now_naive_utc)
+     if not wk:
+         return {"ok": False, "reason": "no upcoming week found", "season_year": season_year}
 
     # Depending on your helper’s return shape, wk might be a dict or row.
     # The existing helpers in this file expect (week_number, season_year).
-    week_number = wk["week_number"] if isinstance(wk, dict) else wk.week_number
+     week_number = wk["week_number"] if isinstance(wk, dict) else wk.week_number
 
     # Send to everyone
-    send_week_games(week_number, season_year)
+     send_week_games(week_number, season_year)
 
     return {"ok": True, "action": "sendweek_upcoming", "season_year": season_year, "week_number": week_number}
 
