@@ -450,6 +450,10 @@ def cron_send_upcoming_week():
     to all participants with a telegram_chat_id.
     Returns a JSON-serializable dict with what happened.
     """
+
+    app = create_app()
+    with app.app_context()
+
     # latest season + current time (naive UTC to match the rest of the file)
     season_year = _get_latest_season_year()
     now_naive_utc = _now_utc_naive()
