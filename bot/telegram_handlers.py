@@ -7,9 +7,14 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-# Your project exposes SQLAlchemy session/engine from models.py
+
+# Your \] exposes SQLAlchemy session/engine from models.py
 # (Heroku logs confirmed importing from db fails; models is correct)
 from models import db
+
+
+# ---------- helpers ----------
+
 
 log = logging.getLogger(__name__)
 
