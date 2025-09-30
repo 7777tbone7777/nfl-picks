@@ -195,6 +195,20 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all for non-command text messages."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    # Optional: peek at the text for debugging
+    # txt = (update.message.text or "").strip() if update.message else ""
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text="Sorry, I didn’t get that. Try /help or /mypicks.",
+        disable_web_page_preview=True,
+    )
+
+
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Lightweight sanity check used by the worker."""
     chat = update.effective_chat
