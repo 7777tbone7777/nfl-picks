@@ -322,7 +322,7 @@ def _compute_week_results(season_year: int, week: int):
         scores AS (
           SELECT pp.participant_id,
                  pp.name,
-                 COUNT(*) FILTER (WHERE lower(pk.pick) = lower(wg.winner)) AS wins
+                 COUNT(*) FILTER (WHERE pk.pick::text ILIKE wg.winner::text) AS wins
           FROM per_participant pp
           LEFT JOIN picks pk ON pk.participant_id = pp.participant_id
           LEFT JOIN week_games wg ON wg.game_id = pk.game_id
