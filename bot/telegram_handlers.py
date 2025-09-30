@@ -1,3 +1,5 @@
+# bot/telegram_handlers.py
+
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Sequence
@@ -7,12 +9,8 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-# Your \] exposes SQLAlchemy session/engine from models.py
-# (Heroku logs confirmed importing from db fails; models is correct)
+# Import your SQLAlchemy session from models (Heroku logs showed this is correct)
 from models import db
-
-# ---------- helpers ----------
-
 
 log = logging.getLogger(__name__)
 
@@ -47,7 +45,7 @@ def _get_participant_by_chat_id(chat_id: int) -> Optional[int]:
             limit 1
             """
         ),
-        {"chat_id": str(chat_id)},  # column is text/varchar in your schema
+        {"chat_id": str(chat_id)},  # column is likely text/varchar in your schema
     ).first()
     return row[0] if row else None
 
@@ -63,9 +61,10 @@ def _insert_participant(chat_id: int, name: str) -> int:
             """
         ),
         {
-            "name": name[:80] if name else "Friend",
+            "name": (name or "Friend")[:80],
             "chat_id": str(chat_id),
-            "created_at": now_utc().replace(tzinfo=None),  # table is 'without time zone'
+            # if column is TIMESTAMP WITHOUT TIME ZONE, store naive UTC:
+            "created_at": now_utc().replace(tzinfo=None),
         },
     )
     pid = result.scalar_one()
@@ -110,7 +109,10 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await context.bot.send_message(
         chat_id=chat.id,
-        text="Commands:\n" "• /start — register & info\n" "• /mypicks — list your picks",
+        text="Commands:\n"
+        "• /start — register & info\n"
+        "• /mypicks — list your picks\n"
+        "• /ping — quick health check",
     )
 
 
@@ -191,3 +193,11 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lightweight sanity check used by the worker."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    await context.bot.send_message(chat_id=chat.id, text="pong")
