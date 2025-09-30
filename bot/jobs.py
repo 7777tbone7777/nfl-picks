@@ -11,8 +11,6 @@ from sqlalchemy import text as _text
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes
 
-from bot.telegram_handlers import announce_matchups_for_week
-
 from flask_app import create_app
 from models import Game, Participant, Pick, Week, db
 
@@ -510,7 +508,9 @@ def cron_send_upcoming_week() -> dict:
 
         # 4) Send the actual matchups post (use your existing announcer)
         # If your function name differs (e.g., send_week_games), swap it here:
-        res = announce_matchups_for_week(season, target_week)
+        from importlib import import_module
+        th = import_module("bot.telegram_handlers")
+        res = th.announce_matchups_for_week(season, target_week)
 
         return {"ok": True, "season_year": int(season), "week": int(target_week), **(res or {})}
 
