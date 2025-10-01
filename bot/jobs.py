@@ -450,34 +450,52 @@ def _format_winners_and_totals(week: int, weekly_rows, season_rows):
 def cron_send_upcoming_week() -> dict:
     """
     Post the matchups for the next week so participants can make picks.
+
+    Guardrails:
+      - Runs only on TUESDAY in America/Los_Angeles unless ALLOW_ANYDAY is set
+        to one of: 1, true, yes, on (case-insensitive).
+
     Strategy:
-      1) Try strict finder (needs first_kick > now and games > 0).
+      1) Try strict finder (needs first_kick > now_utc AND games > 0).
       2) If none (e.g., first_kick is NULL), fall back to last_completed + 1.
-      3) Ensure week exists in DB (import once if empty).
+      3) Ensure the target week exists in DB (import once if empty).
       4) Send using send_week_games(...).
     """
     from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
     from sqlalchemy import text as _text
+    import os
 
     app = create_app()
     with app.app_context():
+        # --- Tuesday guard (PT) with ALLOW_ANYDAY override ---
+        now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+        allow_anyday = os.getenv("ALLOW_ANYDAY", "").strip().lower() in {"1", "true", "yes", "on"}
+        if not allow_anyday and now_pt.weekday() != 1:  # Monday=0, Tuesday=1
+            try:
+                logger.info("cron_send_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
+            except NameError:
+                pass
+            return {"ok": False, "reason": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
+
+        # --- Season & time base ---
         season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
         if not season:
             return {"ok": False, "reason": "no season"}
 
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
 
-        # 1) Try to find an upcoming week with a real future kickoff
+        # --- 1) Try to find an upcoming week with a real future kickoff ---
         wk = _find_upcoming_week_row(season, now_utc)
 
         if not wk:
-            # 2) Fallback when MIN(game_time) is NULL or not future
+            # --- 2) Fallback when MIN(game_time) is NULL or not future ---
             last_completed = _find_last_completed_week_number(season) or 0
             target_week = last_completed + 1
         else:
             target_week = int(wk["week_number"])
 
-        # 3) Ensure the week has games; import if necessary (idempotent)
+        # --- 3) Ensure the week has games; import if necessary (idempotent) ---
         cnt = db.session.execute(
             _text("""
                 SELECT COUNT(*) FROM games g
@@ -506,8 +524,8 @@ def cron_send_upcoming_week() -> dict:
                 "week": int(target_week),
             }
 
-        # 4) Send using the same helper your /sendweek command uses
-        # If your helper is positional (season, week) instead of keywords, swap accordingly.
+        # --- 4) Send using the same helper your /sendweek command uses ---
+        # If your helper is positional (season, week), use: send_week_games(season, target_week)
         res = send_week_games(week_number=target_week, season_year=season)
 
         return {
@@ -640,100 +658,6 @@ def cron_announce_weekly_winners() -> dict:
             "recipients": sent,
             "weekly_top": weekly[0]["wins"] if weekly else 0,
             "participants_ranked": len(season_totals),
-        }
-
-
-def cron_import_upcoming_week() -> dict:
-    """
-    On Tuesday (America/Los_Angeles), import the NEXT upcoming week (first_kick > now)
-    from ESPN into the DB so the 9am sender has data. Safe to run daily (Tue-guarded).
-    """
-    from datetime import datetime, timezone
-    from zoneinfo import ZoneInfo
-
-    from sqlalchemy import text as _text
-
-    app = create_app()
-    with app.app_context():
-        # Tuesday guard (PT)
-        now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
-        if now_pt.weekday() != 1:  # Monday=0, Tuesday=1
-            logger.info(
-                "cron_import_upcoming_week: skipping (not Tuesday PT). now_pt=%s",
-                now_pt,
-            )
-            return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
-
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
-        if not season:
-            return {"error": "no season_year in weeks"}
-
-        # Find the next week with kickoff in the future
-        rows = (
-            db.session.execute(
-                _text(
-                    """
-            SELECT w.week_number, MIN(g.game_time) AS first_kick, COUNT(g.id) AS games
-            FROM weeks w
-            LEFT JOIN games g ON g.week_id = w.id
-            WHERE w.season_year = :y
-            GROUP BY w.week_number
-            ORDER BY w.week_number
-        """
-                ),
-                {"y": season},
-            )
-            .mappings()
-            .all()
-        )
-
-        upcoming = next((r for r in rows if r["first_kick"] and r["first_kick"] > now), None)
-        # If no week has future kickoff (or week exists but has 0 games), try to infer by +1
-        if not upcoming:
-            # fall back to max week in season + 1
-            max_week = (
-                db.session.execute(
-                    _text(
-                        """
-                SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y
-            """
-                    ),
-                    {"y": season},
-                ).scalar()
-                or 0
-            )
-            target_week = max_week + 1
-        else:
-            target_week = int(upcoming["week_number"])
-
-        # Import (idempotent)
-        result = import_week_from_espn(season, target_week)
-
-        # Recount games for logging
-        count_after = db.session.execute(
-            _text(
-                """
-            SELECT COUNT(*) FROM games g
-            JOIN weeks w ON w.id = g.week_id
-            WHERE w.season_year=:y AND w.week_number=:w
-        """
-            ),
-            {"y": season, "w": target_week},
-        ).scalar()
-
-        logger.info(
-            "cron_import_upcoming_week: imported Week %s %s, games now=%s",
-            target_week,
-            season,
-            count_after,
-        )
-        return {
-            "status": "imported",
-            "season_year": season,
-            "week": target_week,
-            "games": count_after,
-            **result,
         }
 
 
