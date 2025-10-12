@@ -241,7 +241,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("announce-winners:\n" + json.dumps(res, default=str, indent=2))
         return
 
-    await update.message.reply_text("Usage: /admin <participants|remove|sendweek upcoming|import upcoming|winners>")
+    await update.message.reply_text("Usage: /admin <participants|remove|deletepicks|sendweek upcoming|import upcoming|winners>")
 
 # ---------- helpers for /mypicks ----------
 
