@@ -63,7 +63,7 @@ def main() -> None:
     )
     app = build_application()
     logging.getLogger(__name__).info("Starting bot polling…")
-    app.run_polling(close_loop=False)v
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
