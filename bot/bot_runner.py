@@ -47,6 +47,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("deletepicks", in_app_context(th.deletepicks_command)))
     application.add_handler(CommandHandler("whoisleft", in_app_context(th.whoisleft_command)))
     application.add_handler(CommandHandler("seepicks", in_app_context(th.seepicks_command)))
+    application.add_handler(CommandHandler("admin", in_app_context(th.admin_command)))
     application.add_handler(CommandHandler("remindweek", in_app_context(th.remindweek_command)))
 
     # Our local command (defined in telegram_handlers.py)
@@ -62,7 +63,7 @@ def main() -> None:
     )
     app = build_application()
     logging.getLogger(__name__).info("Starting bot polling…")
-    app.run_polling(close_loop=False)
+    app.run_polling(close_loop=False)v
 
 
 if __name__ == "__main__":

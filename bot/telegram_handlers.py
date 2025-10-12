@@ -1,6 +1,8 @@
 # bot/telegram_handlers.py
 from __future__ import annotations
 
+import os
+import json
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional
@@ -28,6 +30,113 @@ from sqlalchemy import text
 
 log = logging.getLogger(__name__)
 
+# --- /admin command with subcommands ----------------------------------------
+
+# ADMIN_IDS already used elsewhere in your app; re-derive here from env
+ADMIN_IDS = {int(x) for x in (os.getenv("ADMIN_IDS") or "").split(",") if x.strip().isdigit()}
+
+def _is_admin(user) -> bool:
+    try:
+        return bool(ADMIN_IDS) and user and (user.id in ADMIN_IDS)
+    except Exception:
+        return False
+
+def _parse_admin_args(text: str):
+    # "/admin <subcommand> [args...]"
+    parts = (text or "").strip().split()
+    sub = parts[1].lower() if len(parts) >= 2 else ""
+    rest = parts[2:] if len(parts) >= 3 else []
+    return sub, rest
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /admin participants
+    /admin remove <id|name...>
+    /admin sendweek upcoming
+    /admin import upcoming
+    /admin winners
+    """
+    user = update.effective_user
+    if not _is_admin(user):
+        if update.message:
+            await update.message.reply_text("Sorry, admin only.")
+        return
+
+    if not update.message or not update.message.text:
+        await update.message.reply_text("Usage: /admin <participants|remove|sendweek|import|winners> [...]")
+        return
+
+    sub, rest = _parse_admin_args(update.message.text)
+
+    if sub == "participants":
+        # List id | name | chat
+        from bot.jobs import create_app, db  # lazy import avoids cycles
+        from sqlalchemy import text as T
+        app = create_app()
+        with app.app_context():
+            rows = db.session.execute(
+                T("SELECT id, name, COALESCE(telegram_chat_id,'') AS chat FROM participants ORDER BY id")
+            ).mappings().all()
+        lines = [f"{r['id']:>4} | {r['name']} | chat={r['chat']}" for r in rows]
+        await update.message.reply_text("Participants:\n" + ("\n".join(lines) if lines else "(none)"))
+        return
+
+    if sub == "remove":
+        if not rest:
+            await update.message.reply_text("Usage: /admin remove <id|name...>")
+            return
+        target = " ".join(rest).strip()
+        from bot.jobs import create_app, db
+        from sqlalchemy import text as T
+        app = create_app()
+        with app.app_context():
+            if target.isdigit():
+                pid = int(target)
+                row = db.session.execute(T("SELECT id,name FROM participants WHERE id=:pid"), {"pid": pid}).mappings().first()
+                if not row:
+                    await update.message.reply_text(f"ID {pid} not found.")
+                    return
+                db.session.execute(T("DELETE FROM picks WHERE participant_id=:pid"), {"pid": pid})
+                db.session.execute(T("DELETE FROM participants WHERE id=:pid"), {"pid": pid})
+                db.session.commit()
+                await update.message.reply_text(f"Deleted {row['name']} (id={pid}) and their picks.")
+            else:
+                row = db.session.execute(
+                    T("SELECT id,name FROM participants WHERE lower(name)=lower(:n)"),
+                    {"n": target}
+                ).mappings().first()
+                if not row:
+                    await update.message.reply_text(f"Participant '{target}' not found.")
+                    return
+                pid = int(row["id"])
+                db.session.execute(T("DELETE FROM picks WHERE participant_id=:pid"), {"pid": pid})
+                db.session.execute(T("DELETE FROM participants WHERE id=:pid"), {"pid": pid})
+                db.session.commit()
+                await update.message.reply_text(f"Deleted {row['name']} (id={pid}) and their picks.")
+        return
+
+    if sub == "sendweek" and rest[:1] == ["upcoming"]:
+        from importlib import import_module
+        jobs = import_module("bot.jobs")
+        res = jobs.cron_send_upcoming_week()
+        await update.message.reply_text("sendweek_upcoming:\n" + json.dumps(res, default=str, indent=2))
+        return
+
+    if sub == "import" and rest[:1] == ["upcoming"]:
+        from importlib import import_module
+        jobs = import_module("bot.jobs")
+        res = jobs.cron_import_upcoming_week()
+        await update.message.reply_text("import-week-upcoming:\n" + json.dumps(res, default=str, indent=2))
+        return
+
+    if sub == "winners":
+        from importlib import import_module
+        jobs = import_module("bot.jobs")
+        res = jobs.cron_announce_weekly_winners()
+        await update.message.reply_text("announce-winners:\n" + json.dumps(res, default=str, indent=2))
+        return
+
+    await update.message.reply_text("Usage: /admin <participants|remove|sendweek upcoming|import upcoming|winners>")
 
 # ---------- helpers for /mypicks ----------
 
