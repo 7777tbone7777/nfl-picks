@@ -115,6 +115,111 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Deleted {row['name']} (id={pid}) and their picks.")
         return
 
+    if sub == "deletepicks":
+        # Usage: /admin deletepicks <id|name...> <week_number> [season_year] [dry]
+        if len(rest) < 2:
+            await update.message.reply_text(
+                "Usage: /admin deletepicks <id|name...> <week_number> [season_year] [dry]"
+            )
+            return
+
+        # Parse arguments
+        # Everything up to the last 1–2 tokens is the name/id; the last numeric(s) are week[/season]
+        tail = rest[-2:]  # could be [week, season] or [week, 'dry'] etc.
+        head = rest[:-2] if len(rest) > 2 else rest[:-1]  # name/id pieces
+
+        # Find numeric tokens at the end
+        nums = [x for x in tail if x.isdigit()]
+        flags = [x for x in tail if not x.isdigit()]
+        dry = any(x.lower() == "dry" for x in flags)
+
+        # If only one number was provided, it's the week; season is None (we'll default to latest)
+        if not nums:
+            await update.message.reply_text(
+                "Missing week number. Usage: /admin deletepicks <id|name...> <week_number> [season_year] [dry]"
+            )
+            return
+        if len(nums) == 1:
+            week_number = int(nums[0])
+            target_name_or_id = " ".join(head + ([x for x in tail if x == nums[0]] and [])) or rest[0]
+            season_year = None
+        else:
+            # two numbers: week then season (order-agnostic if you want, but we’ll assume week first)
+            week_number = int(nums[0])
+            season_year = int(nums[1])
+            # target is everything before those two numbers
+            target_name_or_id = " ".join(head).strip() or rest[0]
+
+        from bot.jobs import create_app, db
+        from sqlalchemy import text as T
+        app = create_app()
+        with app.app_context():
+            # Resolve participant id
+            pid = None
+            if target_name_or_id.isdigit():
+                pid = db.session.execute(
+                    T("SELECT id FROM participants WHERE id=:pid"), {"pid": int(target_name_or_id)}
+                ).scalar()
+                pname = db.session.execute(
+                    T("SELECT name FROM participants WHERE id=:pid"), {"pid": int(target_name_or_id)}
+                ).scalar()
+            else:
+                row = db.session.execute(
+                    T("SELECT id, name FROM participants WHERE lower(name)=lower(:n)"),
+                    {"n": target_name_or_id},
+                ).mappings().first()
+                pid = row["id"] if row else None
+                pname = row["name"] if row else None
+
+            if not pid:
+                await update.message.reply_text(f"Participant '{target_name_or_id}' not found.")
+                return
+
+            # Resolve season if not provided
+            if season_year is None:
+                season_year = db.session.execute(
+                    T("SELECT MAX(season_year) FROM weeks")
+                ).scalar()
+
+            # Count picks for that participant & week
+            cnt = db.session.execute(
+                T("""
+                   SELECT COUNT(*) FROM picks p
+                   JOIN games g ON g.id = p.game_id
+                   JOIN weeks w ON w.id = g.week_id
+                   WHERE p.participant_id = :pid
+                     AND w.season_year = :y
+                     AND w.week_number = :w
+                """),
+                {"pid": int(pid), "y": int(season_year), "w": int(week_number)},
+            ).scalar() or 0
+
+            if dry:
+                await update.message.reply_text(
+                    f"[DRY RUN] {pname or pid}: would delete {cnt} pick(s) for Week {week_number} ({season_year})."
+                )
+                return
+
+            # Delete them
+            db.session.execute(
+                T("""
+                   DELETE FROM picks
+                   USING games g, weeks w
+                   WHERE picks.game_id = g.id
+                     AND w.id = g.week_id
+                     AND picks.participant_id = :pid
+                     AND w.season_year = :y
+                     AND w.week_number = :w
+                """),
+                {"pid": int(pid), "y": int(season_year), "w": int(week_number)},
+            )
+            db.session.commit()
+
+        await update.message.reply_text(
+            f"Deleted {cnt} pick(s) for {pname or pid} in Week {week_number} ({season_year})."
+        )
+        return
+
     if sub == "sendweek" and rest[:1] == ["upcoming"]:
         from importlib import import_module
         jobs = import_module("bot.jobs")
