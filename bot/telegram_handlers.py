@@ -341,14 +341,26 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- setspread ----
     if sub == "setspread":
         # /admin setspread <game_id> <favorite_team> <points|clear>
-        if len(rest) < 3:
+        if len(rest) < 2:
             await update.message.reply_text("Usage: /admin setspread <game_id> <favorite_team> <points|clear>")
             return
-        gid_text, fav, pts_raw = rest[0], rest[1], rest[2].lower()
+
+        gid_text = rest[0]
         if not gid_text.isdigit():
             await update.message.reply_text("game_id must be an integer.")
             return
         gid = int(gid_text)
+
+        # everything after game_id: last token is points|clear, the rest is the favorite name (can be multi-word)
+        if len(rest) < 3:
+            await update.message.reply_text("Usage: /admin setspread <game_id> <favorite_team> <points|clear>")
+            return
+
+        pts_raw = rest[-1].lower()
+        fav = " ".join(rest[1:-1]).strip()
+        if not fav:
+            await update.message.reply_text("Favorite team name is required.")
+            return
 
         from bot.jobs import create_app, db
         from sqlalchemy import text as T
