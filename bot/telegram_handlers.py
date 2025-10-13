@@ -52,25 +52,34 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /admin participants
     /admin remove <id|name...>
+    /admin deletepicks <id|name...> <week> [season_year] [dry]
+    /admin gameids <week> [season_year]
+    /admin setspread <game_id> <favorite_team> <points|clear>
     /admin sendweek upcoming
     /admin import upcoming
     /admin winners
     """
     user = update.effective_user
+    # ---- admin check ----
     if not _is_admin(user):
         if update.message:
             await update.message.reply_text("Sorry, admin only.")
         return
 
     if not update.message or not update.message.text:
-        await update.message.reply_text("Usage: /admin <participants|remove|sendweek|import|winners> [...]")
+        await update.message.reply_text(
+            "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners>"
+        )
         return
 
-    sub, rest = _parse_admin_args(update.message.text)
+    # ---- parse ----
+    parts = update.message.text.strip().split()
+    sub = parts[1].lower() if len(parts) >= 2 else ""
+    rest = parts[2:] if len(parts) >= 3 else []
 
+    # ---- participants ----
     if sub == "participants":
-        # List id | name | chat
-        from bot.jobs import create_app, db  # lazy import avoids cycles
+        from bot.jobs import create_app, db
         from sqlalchemy import text as T
         app = create_app()
         with app.app_context():
@@ -81,6 +90,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Participants:\n" + ("\n".join(lines) if lines else "(none)"))
         return
 
+    # ---- remove ----
     if sub == "remove":
         if not rest:
             await update.message.reply_text("Usage: /admin remove <id|name...>")
@@ -115,47 +125,34 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Deleted {row['name']} (id={pid}) and their picks.")
         return
 
+    # ---- deletepicks ----
     if sub == "deletepicks":
-        # Usage: /admin deletepicks <id|name...> <week_number> [season_year] [dry]
         if len(rest) < 2:
             await update.message.reply_text(
                 "Usage: /admin deletepicks <id|name...> <week_number> [season_year] [dry]"
             )
             return
 
-        # Parse arguments
-        # Everything up to the last 1–2 tokens is the name/id; the last numeric(s) are week[/season]
-        tail = rest[-2:]  # could be [week, season] or [week, 'dry'] etc.
-        head = rest[:-2] if len(rest) > 2 else rest[:-1]  # name/id pieces
-
-        # Find numeric tokens at the end
-        nums = [x for x in tail if x.isdigit()]
-        flags = [x for x in tail if not x.isdigit()]
-        dry = any(x.lower() == "dry" for x in flags)
-
-        # If only one number was provided, it's the week; season is None (we'll default to latest)
+        # identify numeric tokens at end
+        nums = [x for x in rest if x.isdigit()]
+        dry = any(x.lower() == "dry" for x in rest)
         if not nums:
             await update.message.reply_text(
                 "Missing week number. Usage: /admin deletepicks <id|name...> <week_number> [season_year] [dry]"
             )
             return
-        if len(nums) == 1:
-            week_number = int(nums[0])
-            target_name_or_id = " ".join(head + ([x for x in tail if x == nums[0]] and [])) or rest[0]
-            season_year = None
-        else:
-            # two numbers: week then season (order-agnostic if you want, but we’ll assume week first)
-            week_number = int(nums[0])
-            season_year = int(nums[1])
-            # target is everything before those two numbers
-            target_name_or_id = " ".join(head).strip() or rest[0]
+        week_number = int(nums[0])
+        season_year = int(nums[1]) if len(nums) >= 2 else None
+
+        # target is everything before those numbers/flags
+        cut = rest.index(nums[0])
+        target_name_or_id = " ".join(rest[:cut]).strip() or rest[0]
 
         from bot.jobs import create_app, db
         from sqlalchemy import text as T
         app = create_app()
         with app.app_context():
-            # Resolve participant id
-            pid = None
+            # resolve participant
             if target_name_or_id.isdigit():
                 pid = db.session.execute(
                     T("SELECT id FROM participants WHERE id=:pid"), {"pid": int(target_name_or_id)}
@@ -165,7 +162,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ).scalar()
             else:
                 row = db.session.execute(
-                    T("SELECT id, name FROM participants WHERE lower(name)=lower(:n)"),
+                    T("SELECT id,name FROM participants WHERE lower(name)=lower(:n)"),
                     {"n": target_name_or_id},
                 ).mappings().first()
                 pid = row["id"] if row else None
@@ -175,13 +172,9 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Participant '{target_name_or_id}' not found.")
                 return
 
-            # Resolve season if not provided
             if season_year is None:
-                season_year = db.session.execute(
-                    T("SELECT MAX(season_year) FROM weeks")
-                ).scalar()
+                season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
 
-            # Count picks for that participant & week
             cnt = db.session.execute(
                 T("""
                    SELECT COUNT(*) FROM picks p
@@ -200,7 +193,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            # Delete them
             db.session.execute(
                 T("""
                    DELETE FROM picks
@@ -220,37 +212,13 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if sub == "sendweek" and rest[:1] == ["upcoming"]:
-        from importlib import import_module
-        jobs = import_module("bot.jobs")
-        res = jobs.cron_send_upcoming_week()
-        await update.message.reply_text("sendweek_upcoming:\n" + json.dumps(res, default=str, indent=2))
-        return
-
-    if sub == "import" and rest[:1] == ["upcoming"]:
-        from importlib import import_module
-        jobs = import_module("bot.jobs")
-        res = jobs.cron_import_upcoming_week()
-        await update.message.reply_text("import-week-upcoming:\n" + json.dumps(res, default=str, indent=2))
-        return
-
-    if sub == "winners":
-        from importlib import import_module
-        jobs = import_module("bot.jobs")
-        res = jobs.cron_announce_weekly_winners()
-        await update.message.reply_text("announce-winners:\n" + json.dumps(res, default=str, indent=2))
-        return
-
+    # ---- gameids ----
     if sub == "gameids":
-        # Usage: /admin gameids <week_number> [season_year]
         if not rest or not rest[0].isdigit():
             await update.message.reply_text("Usage: /admin gameids <week_number> [season_year]")
             return
-
         week_number = int(rest[0])
-        season_year = None
-        if len(rest) >= 2 and rest[1].isdigit():
-            season_year = int(rest[1])
+        season_year = int(rest[1]) if len(rest) >= 2 and rest[1].isdigit() else None
 
         from bot.jobs import create_app, db
         from sqlalchemy import text as T
@@ -258,7 +226,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with app.app_context():
             if season_year is None:
                 season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
-
             rows = db.session.execute(
                 T("""
                    SELECT g.id, g.away_team, g.home_team, g.game_time,
@@ -282,13 +249,72 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kt = r["game_time"].isoformat(" ", "minutes") if r["game_time"] else "TBD"
             return f"{r['id']:>4} | {r['away_team']} @ {r['home_team']}{odds} | {kt}"
 
-        lines = [fmt(r) for r in rows]
         await update.message.reply_text(
-            f"Week {week_number} ({season_year}) game IDs:\n" + "\n".join(lines)
+            f"Week {week_number} ({season_year}) game IDs:\n" + "\n".join(fmt(r) for r in rows)
         )
         return
 
-    await update.message.reply_text("Usage: /admin <participants|remove|deletepicks|sendweek upcoming|import upcoming|winners>")
+    # ---- setspread ----
+    if sub == "setspread":
+        # /admin setspread <game_id> <favorite_team> <points|clear>
+        if len(rest) < 3:
+            await update.message.reply_text("Usage: /admin setspread <game_id> <favorite_team> <points|clear>")
+            return
+        gid_text, fav, pts_raw = rest[0], rest[1], rest[2].lower()
+        if not gid_text.isdigit():
+            await update.message.reply_text("game_id must be an integer.")
+            return
+        gid = int(gid_text)
+
+        from bot.jobs import create_app, db
+        from sqlalchemy import text as T
+        app = create_app()
+        with app.app_context():
+            if pts_raw == "clear":
+                db.session.execute(T("UPDATE games SET favorite_team=NULL, spread_pts=NULL WHERE id=:gid"), {"gid": gid})
+                db.session.commit()
+                await update.message.reply_text(f"Cleared odds for game {gid}.")
+                return
+            try:
+                pts = float(pts_raw)
+            except Exception:
+                await update.message.reply_text("Spread must be a number or 'clear'.")
+                return
+
+            db.session.execute(
+                T("UPDATE games SET favorite_team=:fv, spread_pts=:sp WHERE id=:gid"),
+                {"fv": fav, "sp": pts, "gid": gid},
+            )
+            db.session.commit()
+            await update.message.reply_text(f"Set game {gid} odds: favorite={fav}, spread={pts:g}")
+        return
+
+    # ---- send/import/winners ----
+    if sub == "sendweek" and rest[:1] == ["upcoming"]:
+        from importlib import import_module
+        jobs = import_module("bot.jobs")
+        res = jobs.cron_send_upcoming_week()
+        await update.message.reply_text("sendweek_upcoming:\n" + json.dumps(res, default=str, indent=2))
+        return
+
+    if sub == "import" and rest[:1] == ["upcoming"]:
+        from importlib import import_module
+        jobs = import_module("bot.jobs")
+        res = jobs.cron_import_upcoming_week()
+        await update.message.reply_text("import-week-upcoming:\n" + json.dumps(res, default=str, indent=2))
+        return
+
+    if sub == "winners":
+        from importlib import import_module
+        jobs = import_module("bot.jobs")
+        res = jobs.cron_announce_weekly_winners()
+        await update.message.reply_text("announce-winners:\n" + json.dumps(res, default=str, indent=2))
+        return
+
+    # ---- default usage ----
+    await update.message.reply_text(
+        "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners>"
+    )
 
 # ---------- helpers for /mypicks ----------
 
