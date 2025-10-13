@@ -216,76 +216,44 @@ def ats_winners_for_week(week_number: int, season_year: int | None = None):
 
         return counts, winners_by_game, finals_count
 
-
-def _ats_winner(
-    home_team: str,
-    away_team: str,
-    home_score,
-    away_score,
-    favorite_team: str | None,
-    spread_pts,
-):
+def _ats_winner(home_team: str, away_team: str,
+                home_score: int | None, away_score: int | None,
+                favorite_team: str | None, spread_pts) -> str | None:
     """
-    Returns the ATS winner given teams, final scores, favorite & spread.
-    - If favorite/spread missing, falls back to straight-up winner.
-    - Uses strict 'cover' logic: favorite must win by > spread to cover.
-    - Returns 'PUSH' if exactly equals the spread.
+    Returns the ATS winner team name, or None for a push/unknown.
+    favorite_team is the team name (home or away) that is favored by spread_pts.
+    spread_pts > 0 means the favorite must win by > spread to cover.
     """
-    # Normalize names
-    def _norm(x): return (x or "").strip()
-    home = _norm(home_team)
-    away = _norm(away_team)
-
-    # Scores must be numeric
-    try:
-        hs = float(home_score)
-        as_ = float(away_score)
-    except (TypeError, ValueError):
+    if home_score is None or away_score is None:
         return None
 
-    # No ATS info? fall back to straight-up
-    fav = _norm(favorite_team)
-    if not fav or spread_pts is None:
-        # straight-up winner
-        if hs > as_:
-            return home
-        elif as_ > hs:
-            return away
-        else:
-            return "PUSH"
-
-    try:
+    if favorite_team and spread_pts is not None:
         spr = float(spread_pts)
-    except (TypeError, ValueError):
-        return None
+        fav = (favorite_team or "").strip().lower()
+        h = (home_team or "").strip().lower()
+        a = (away_team or "").strip().lower()
 
-    # Determine which side is the favorite; compute margin in the favorite's direction
-    fav_lower = fav.lower()
-    home_lower = home.lower()
-    away_lower = away.lower()
+        if fav == h:
+            diff = (home_score - away_score) - spr   # home favorite
+            if diff > 0:  # covered
+                return home_team
+            if diff < 0:  # underdog covers
+                return away_team
+            return None   # push
+        elif fav == a:
+            diff = (away_score - home_score) - spr   # away favorite
+            if diff > 0:
+                return away_team
+            if diff < 0:
+                return home_team
+            return None
 
-    if fav_lower == home_lower:
-        margin = hs - as_              # positive if favorite (home) won by that many
-        underdog = away
-    elif fav_lower == away_lower:
-        margin = as_ - hs              # positive if favorite (away) won by that many
-        underdog = home
-    else:
-        # Unknown favorite label (name mismatch) -> fall back to straight-up
-        if hs > as_:
-            return home
-        elif as_ > hs:
-            return away
-        else:
-            return "PUSH"
-
-    # Cover rules
-    if margin > spr:
-        return fav                      # favorite covers
-    elif margin == spr:
-        return "PUSH"                   # exact spread
-    else:
-        return underdog                 # underdog covers
+    # No spread/favorite -> straight-up
+    if home_score > away_score:
+        return home_team
+    if away_score > home_score:
+        return away_team
+    return None
 
 
 def _get_latest_season_year():
