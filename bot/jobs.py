@@ -140,6 +140,82 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             "created": created,
             "updated": updated,
         }
+def ats_winners_for_week(week_number: int, season_year: int | None = None):
+    """
+    Compute Against-The-Spread winners for the given week, then count each participant's
+    correct ATS picks. Push games are ignored (neither side gets credit).
+
+    Returns: (counts_dict, winners_by_game, finals_count)
+      - counts_dict: {participant_name: int}
+      - winners_by_game: {game_id: "TEAM" | "PUSH" | None}
+      - finals_count: number of FINAL games considered
+    """
+    from sqlalchemy import text as T
+    app = create_app()
+    with app.app_context():
+        # Resolve season if not provided
+        if season_year is None:
+            season_year = db.session.execute(
+                T("""
+                    SELECT MAX(season_year)
+                    FROM weeks
+                    WHERE week_number = :w
+                """),
+                {"w": week_number},
+            ).scalar()
+
+        # Pull FINAL games with favorite/spread (may be NULL)
+        games = db.session.execute(
+            T("""
+                SELECT g.id, w.season_year, w.week_number,
+                       g.home_team, g.away_team, g.home_score, g.away_score,
+                       g.status, g.favorite_team, g.spread_pts
+                FROM games g
+                JOIN weeks w ON w.id = g.week_id
+                WHERE w.season_year = :y
+                  AND w.week_number = :w
+                  AND lower(coalesce(g.status,'')) = 'final'
+                ORDER BY g.id
+            """),
+            {"y": season_year, "w": week_number},
+        ).mappings().all()
+
+        winners_by_game: dict[int, str | None] = {}
+        finals_count = 0
+        for g in games:
+            finals_count += 1
+            winners_by_game[g["id"]] = _ats_winner(
+                g["home_team"], g["away_team"],
+                g["home_score"], g["away_score"],
+                g["favorite_team"], g["spread_pts"],
+            )
+
+        # Count correct ATS picks (ignore PUSH/None)
+        rows = db.session.execute(
+            T("""
+                SELECT p.participant_id,
+                       (SELECT name FROM participants WHERE id = p.participant_id) AS name,
+                       p.game_id, p.selected_team
+                FROM picks p
+                JOIN games g ON g.id = p.game_id
+                JOIN weeks w ON w.id = g.week_id
+                WHERE w.season_year = :y
+                  AND w.week_number = :w
+                  AND p.selected_team IS NOT NULL
+            """),
+            {"y": season_year, "w": week_number},
+        ).mappings().all()
+
+        counts: dict[str, int] = {}
+        for r in rows:
+            ats = winners_by_game.get(r["game_id"])
+            if not ats or ats == "PUSH":
+                continue  # no credit on push/unknown
+            if (r["selected_team"] or "").strip().lower() == ats.strip().lower():
+                counts[r["name"]] = counts.get(r["name"], 0) + 1
+
+        return counts, winners_by_game, finals_count
+
 
 def _ats_winner(
     home_team: str,
