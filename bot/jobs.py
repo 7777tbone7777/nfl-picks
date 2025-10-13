@@ -2145,7 +2145,6 @@ def _send_message(
         resp = client.post(url, data=data)
         resp.raise_for_status()
 
-
 def send_week_games(week_number: int, season_year: int):
     """Send Week games with inline buttons to all participants who have telegram_chat_id."""
     app = create_app()
@@ -2164,29 +2163,42 @@ def send_week_games(week_number: int, season_year: int):
         for part in participants:
             chat_id = str(part.telegram_chat_id)
             for g in games:
+                # Build inline keyboard (unchanged)
                 kb = {
                     "inline_keyboard": [
                         [
-                            {
-                                "text": g.away_team,
-                                "callback_data": f"pick:{g.id}:{g.away_team}",
-                            }
+                            {"text": g.away_team, "callback_data": f"pick:{g.id}:{g.away_team}"}
                         ],
                         [
-                            {
-                                "text": g.home_team,
-                                "callback_data": f"pick:{g.id}:{g.home_team}",
-                            }
+                            {"text": g.home_team, "callback_data": f"pick:{g.id}:{g.home_team}"}
                         ],
                     ]
                 }
-                text = f"{g.away_team} @ {g.home_team}\n{_pt(g.game_time)}"
+
+                # Base label
+                label = f"{g.away_team} @ {g.home_team}"
+
+                # Append odds if we have them and the favorite matches one side
+                odds_suffix = ""
+                if getattr(g, "favorite_team", None) and getattr(g, "spread_pts", None) is not None:
+                    fav = (g.favorite_team or "").strip()
+                    # Only show if favorite matches one of the teams
+                    if fav.lower() in {g.home_team.strip().lower(), g.away_team.strip().lower()}:
+                        try:
+                            sp = float(g.spread_pts)
+                            # Positive number = points the favorite gives
+                            odds_suffix = f"  ({fav} -{sp:g})"
+                        except Exception:
+                            pass  # leave off if spread isn't a valid number
+
+                # Final text with kickoff time on the next line
+                text = f"{label}{odds_suffix}\n{_pt(g.game_time)}"
+
                 try:
                     _send_message(chat_id, text, reply_markup=kb)
-                    logger.info(f"✅ Sent game to {part.name}: {g.away_team} @ {g.home_team}")
+                    logger.info(f"✅ Sent game to {part.name}: {label}{odds_suffix}")
                 except Exception as e:
                     logger.exception("❌ Failed to send game message: %s", e)
-
 
 # --- /sendweek admin command (additive, with DRY and ME) ---
 async def sendweek_command(update, context):

@@ -241,6 +241,53 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("announce-winners:\n" + json.dumps(res, default=str, indent=2))
         return
 
+    if sub == "gameids":
+        # Usage: /admin gameids <week_number> [season_year]
+        if not rest or not rest[0].isdigit():
+            await update.message.reply_text("Usage: /admin gameids <week_number> [season_year]")
+            return
+
+        week_number = int(rest[0])
+        season_year = None
+        if len(rest) >= 2 and rest[1].isdigit():
+            season_year = int(rest[1])
+
+        from bot.jobs import create_app, db
+        from sqlalchemy import text as T
+        app = create_app()
+        with app.app_context():
+            if season_year is None:
+                season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
+
+            rows = db.session.execute(
+                T("""
+                   SELECT g.id, g.away_team, g.home_team, g.game_time,
+                          g.favorite_team, g.spread_pts
+                   FROM games g
+                   JOIN weeks w ON w.id = g.week_id
+                   WHERE w.season_year = :y AND w.week_number = :w
+                   ORDER BY g.game_time NULLS LAST, g.id
+                """),
+                {"y": int(season_year), "w": int(week_number)},
+            ).mappings().all()
+
+        if not rows:
+            await update.message.reply_text(f"No games for Week {week_number} ({season_year}).")
+            return
+
+        def fmt(r):
+            odds = ""
+            if r["favorite_team"] and r["spread_pts"] is not None:
+                odds = f"  ({r['favorite_team']} -{float(r['spread_pts']):g})"
+            kt = r["game_time"].isoformat(" ", "minutes") if r["game_time"] else "TBD"
+            return f"{r['id']:>4} | {r['away_team']} @ {r['home_team']}{odds} | {kt}"
+
+        lines = [fmt(r) for r in rows]
+        await update.message.reply_text(
+            f"Week {week_number} ({season_year}) game IDs:\n" + "\n".join(lines)
+        )
+        return
+
     await update.message.reply_text("Usage: /admin <participants|remove|deletepicks|sendweek upcoming|import upcoming|winners>")
 
 # ---------- helpers for /mypicks ----------
