@@ -252,12 +252,12 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
              winners = {}
              for r in games:
                  wt = _ats_winner(
-                     home_team=r["home_team"]
-                     away_team=r["away_team"]
-                     home_score=r["home_score"]
-                     away_score=r["away_score"]
-                     favorite_team=r["favorite_team"]
-                     spread_pts=r["spread_pts"]
+                     home_team=r["home_team"],
+                     away_team=r["away_team"],
+                     home_score=r["home_score"],
+                     away_score=r["away_score"],
+                     favorite_team=r["favorite_team"],
+                     spread_pts=r["spread_pts"],
                  )
                  winners[int(r["id"])] = wt
 
