@@ -212,6 +212,90 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if sub in {"winnersats", "winners-ats"}:
+        # Usage: /admin winnersats <week_number> [season_year]
+        if not rest or not rest[0].isdigit():
+            await update.message.reply_text("Usage: /admin winnersats <week_number> [season_year]")
+            return
+        week_number = int(rest[0])
+        season_year = int(rest[1]) if len(rest) >= 2 and rest[1].isdigit() else None
+
+        from bot.jobs import create_app, db, _ats_winner  # helper you just added
+        from sqlalchemy import text as T
+        app = create_app()
+        with app.app_context():
+            if season_year is None:
+                season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
+
+            # final games for the week
+            games = db.session.execute(
+                T("""
+                  SELECT g.id, g.home_team, g.away_team, g.home_score, g.away_score,
+                         g.favorite_team, g.spread_pts
+                  FROM games g
+                  JOIN weeks w ON w.id=g.week_id
+                  WHERE w.season_year=:y AND w.week_number=:w AND g.status='final'
+                """),
+                {"y": season_year, "w": week_number},
+            ).mappings().all()
+
+            if not games:
+                await update.message.reply_text(f"No FINAL games for Week {week_number} ({season_year}).")
+                return
+
+            # compute winners map (None for pushes)
+            winners = {}
+            for r in games:
+                wt = _ats_winner(
+                    r["home_team"], r["away_team"],
+                    r["home_score"], r["away_score"],
+                    r["favorite_team"], r["spread_pts"]
+                )
+                winners[int(r["id"])] = wt
+
+            # get all picks for the week
+            picks = db.session.execute(
+                T("""
+                   SELECT p.participant_id, p.selected_team, p.game_id
+                   FROM picks p
+                   JOIN games g ON g.id=p.game_id
+                   JOIN weeks w ON w.id=g.week_id
+                   WHERE w.season_year=:y AND w.week_number=:w
+                     AND p.selected_team IS NOT NULL
+                """),
+                {"y": season_year, "w": week_number},
+            ).mappings().all()
+
+            # names lookup
+            names = dict(db.session.execute(
+                T("SELECT id, name FROM participants")
+            ).fetchall())
+
+        # count wins (ignore pushes where winner is None)
+        score = {}
+        for p in picks:
+            gid = int(p["game_id"])
+            wt = winners.get(gid)
+            if not wt:
+                continue
+            if p["selected_team"] and p["selected_team"].strip().lower() == wt.strip().lower():
+                pid = int(p["participant_id"])
+                score[pid] = score.get(pid, 0) + 1
+
+        if not score:
+            await update.message.reply_text(f"No ATS wins computed for Week {week_number} ({season_year}).")
+            return
+
+        # pretty output
+        lines = [
+            f"{names.get(pid, pid)} — {wins}"
+            for pid, wins in sorted(score.items(), key=lambda x: (-x[1], names.get(x[0], "")))
+        ]
+        await update.message.reply_text(
+            f"ATS winners (dry run) — Week {week_number} ({season_year}):\n" + "\n".join(lines)
+        )
+        return
+
     # ---- gameids ----
     if sub == "gameids":
         if not rest or not rest[0].isdigit():

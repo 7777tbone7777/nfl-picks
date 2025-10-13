@@ -141,6 +141,50 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             "updated": updated,
         }
 
+def _ats_winner(home_team: str, away_team: str,
+                home_score: int | None, away_score: int | None,
+                favorite_team: str | None, spread_pts: float | None) -> str | None:
+    """
+    Winner against-the-spread, or None for push/unknown.
+    spread_pts is a positive number = points the favorite gives.
+    If odds missing or favorite doesn't match either side, falls back to straight-up.
+    """
+    if home_score is None or away_score is None:
+        return None
+
+    if not favorite_team or spread_pts is None:
+        # straight up (tie -> None)
+        if home_score == away_score:
+            return None
+        return home_team if home_score > away_score else away_team
+
+    fav = favorite_team.strip().lower()
+    sp = float(spread_pts)
+    ht = home_team.strip().lower()
+    at = away_team.strip().lower()
+
+    def _cmp(lhs, rhs):
+        if abs(lhs - rhs) < 1e-9:
+            return 0
+        return 1 if lhs > rhs else -1
+
+    if fav == ht:
+        # home is favorite: (home - spread) vs away
+        c = _cmp(home_score - sp, away_score)
+        if c == 0:
+            return None  # push
+        return home_team if c > 0 else away_team
+    if fav == at:
+        # away is favorite: (away - spread) vs home
+        c = _cmp(away_score - sp, home_score)
+        if c == 0:
+            return None
+        return away_team if c > 0 else home_team
+
+    # odds favorite doesn't match either side -> straight up
+    if home_score == away_score:
+        return None
+    return home_team if home_score > away_score else away_team
 
 def _get_latest_season_year():
     from sqlalchemy import text as _text
