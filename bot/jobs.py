@@ -217,8 +217,8 @@ def ats_winners_for_week(week_number: int, season_year: int | None = None):
         return counts, winners_by_game, finals_count
 
 def _ats_winner(home_team: str, away_team: str,
-                home_score: int | None, away_score: int | None,
-                favorite_team: str | None, spread_pts) -> str | None:
+                home_score: int, away_score: int,
+                favorite_team: str | None, spread_pts: float | None,) -> str | None:
     """
     Returns the ATS winner team name, or None for a push/unknown.
     favorite_team is the team name (home or away) that is favored by spread_pts.
