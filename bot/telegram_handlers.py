@@ -41,6 +41,20 @@ def _is_admin(user) -> bool:
     except Exception:
         return False
 
+def _spread_label_row(obj) -> str:
+    """Return 'fav: Jaguars  -3.5' or 'TBD'. Works with dict rows or ORM objects."""
+    fav = obj.get("favorite_team") if isinstance(obj, dict) else getattr(obj, "favorite_team", None)
+    spr = obj.get("spread_pts")     if isinstance(obj, dict) else getattr(obj, "spread_pts", None)
+    if fav and spr is not None:
+        try:
+            s = float(spr)
+        except Exception:
+            return "TBD"
+        sign = "-" if s > 0 else "+" if s < 0 else "±"
+        return f"fav: {fav}  {sign}{abs(s):g}"
+    return "TBD"
+
+
 def _parse_admin_args(text: str):
     # "/admin <subcommand> [args...]"
     parts = (text or "").strip().split()

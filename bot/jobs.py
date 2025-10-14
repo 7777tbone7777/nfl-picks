@@ -2438,7 +2438,8 @@ async def sendweek_command(update, context):
             db.session.execute(
                 text(
                     """
-            select g.id, g.away_team, g.home_team
+            select g.id, g.away_team, g.home_team, g.favorit_team, g.spread_pts,
+            coalesce(g.game_time, g.first_kick) as kickoff_at
             from games g
             join weeks w on w.id=g.week_id
             left join picks p on p.game_id=g.id and p.participant_id=:pid
@@ -2471,7 +2472,13 @@ async def sendweek_command(update, context):
                     ],
                 ]
             }
-            _send_message(str(chat_id), f"{g['away_team']} @ {g['home_team']}", reply_markup=kb)
+
+            text = (
+                f"{g['away_team']} @ {g['home_team']}\n"
+                f"{_pt(g['kickoff_at'])}\n"
+                f"{_spread_label_row(g)}"
+            )
+            _send_message(str(chat_id), text, reply_markup=kb)
             sent += 1
         return sent
 
