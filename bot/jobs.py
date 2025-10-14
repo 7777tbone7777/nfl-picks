@@ -2167,7 +2167,6 @@ def run_telegram_listener():
     application.add_handler(CommandHandler("sendweek", sendweek_command))
     application.add_handler(CommandHandler("syncscores", syncscores_command))
     application.add_handler(CommandHandler("getscores", getscores_command))
-    application.add_handler(CommandHandler("seasonboard", seasonboard_command))
     application.add_handler(CommandHandler("deletepicks", deletepicks_command))
     application.add_handler(CommandHandler("whoisleft", whoisleft_command))
     application.add_handler(CommandHandler("seepicks", seepicks_command))
