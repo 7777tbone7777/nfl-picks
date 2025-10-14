@@ -38,6 +38,91 @@ ESPN_SCOREBOARD = (
     "?seasontype=2&year={year}&week={week}"
 )
 
+# in bot/jobs.py
+def import_odds_upcoming():
+    """
+    Pull NFL spreads from The Odds API and update games.favorite_team/spread_pts
+    for the current (upcoming) week. Safe to run multiple times.
+    """
+    import os, datetime as dt, requests
+    from decimal import Decimal
+    from sqlalchemy import text as T
+
+    API = os.environ.get("ODDS_API_KEY")
+    if not API:
+        print("ODDS_API_KEY not set"); return
+
+    # Detect upcoming season/week from DB
+    with app.app_context():
+        # next week with future games
+        r = db.session.execute(T("""
+            SELECT w.season_year AS season, w.week_number AS week
+            FROM games g
+            JOIN weeks w ON w.id = g.week_id
+            WHERE g.game_time IS NULL OR g.game_time > NOW()
+            ORDER BY w.season_year, w.week_number
+            LIMIT 1
+        """)).mappings().first()
+        if not r:
+            print("No upcoming week found"); return
+        SEASON, WEEK = r["season"], r["week"]
+
+        # Pull DB games for that week
+        games = db.session.execute(T("""
+          SELECT g.id, g.away_team, g.home_team
+          FROM games g
+          JOIN weeks w ON w.id = g.week_id
+          WHERE w.season_year=:y AND w.week_number=:w
+        """), {"y": SEASON, "w": WEEK}).mappings().all()
+        key = {( (g["away_team"] or "").strip().casefold(),
+                 (g["home_team"] or "").strip().casefold() ): g["id"] for g in games}
+
+        # Hit OddsAPI
+        SPORT="americanfootball_nfl"
+        DATE_FROM=(dt.datetime.utcnow()-dt.timedelta(days=3)).strftime("%Y-%m-%dT00:00:00Z")
+        DATE_TO  =(dt.datetime.utcnow()+dt.timedelta(days=14)).strftime("%Y-%m-%dT00:00:00Z")
+        url=f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds"
+        params=dict(apiKey=API, regions="us", markets="spreads", oddsFormat="american",
+                    dateFormat="iso", commenceTimeFrom=DATE_FROM, commenceTimeTo=DATE_TO)
+        ev = requests.get(url, params=params, timeout=30).json()
+
+        BOOK_PRIORITY = ["DraftKings","BetMGM","FanDuel","BetOnline.ag","BetRivers","BetUS","Bovada"]
+
+        def pick_spreads(bms):
+            by = {bm["title"]: bm for bm in bms}
+            for name in BOOK_PRIORITY:
+                bm = by.get(name)
+                if not bm: continue
+                for mk in bm.get("markets",[]):
+                    if mk.get("key")=="spreads" and mk.get("outcomes"):
+                        return mk["outcomes"]
+            for bm in bms:
+                for mk in bm.get("markets",[]):
+                    if mk.get("key")=="spreads" and mk.get("outcomes"):
+                        return mk["outcomes"]
+            return None
+
+        updated = 0
+        for e in ev:
+            away = (e.get("away_team") or "").strip().casefold()
+            home = (e.get("home_team") or "").strip().casefold()
+            gid = key.get((away, home))
+            if not gid: 
+                continue
+            outs = pick_spreads(e.get("bookmakers",[]))
+            if not outs: 
+                continue
+            fav = min(outs, key=lambda o: o.get("point", 0))  # most negative = favorite
+            fav_name = fav.get("name"); pts = fav.get("point")
+            if fav_name is None or pts is None: 
+                continue
+            db.session.execute(T("""
+              UPDATE games SET favorite_team=:fav, spread_pts=:pts WHERE id=:gid
+            """), {"fav": fav_name, "pts": Decimal(str(pts)), "gid": gid})
+            updated += 1
+        db.session.commit()
+        print(f"Updated spreads for week {WEEK}/{SEASON}: {updated}")
+
 def _safe(s):
     return (s or "").strip().lower()
 
@@ -2368,33 +2453,34 @@ def _send_message(
 def _spread_label(game) -> str:
     """
     Pretty label for point spread.
-    Accepts ORM object or mapping/dict with keys:
-      favorite_team, spread_pts
-    Examples: 'fav: Jaguars  -3.5', 'TBD'
+    Accepts ORM object or mapping/dict with keys: favorite_team, spread_pts
+    Examples: 'fav: Jaguars -3.5', 'TBD'
     """
-    # work for either ORM or dict
-    fav = getattr(game, "favorite_team", None)
-    spr = getattr(game, "spread_pts", None)
+    # pull fields from ORM or dict
     if isinstance(game, dict):
-        fav = game.get("favorite_team", fav)
-        spr = game.get("spread_pts", spr)
+        fav = game.get("favorite_team")
+        spr = game.get("spread_pts")
+    else:
+        fav = getattr(game, "favorite_team", None)
+        spr = getattr(game, "spread_pts", None)
 
-    if fav and spr is not None:
-        try:
-            s = float(spr)
-        except Exception:
-            return f"fav: {fav}"
+    if not fav or spr is None:
+        return "TBD"
 
-        # If value already negative (e.g. -5.5) keep it.
-        # If positive, display as "-<s>" (favorite always shown as giving points).
-        if s > 0:
-            shown = f"-{s:g}"
-        elif s < 0:
-            shown = f"{s:g}"
-        else:
-            shown = "±0"
-        return f"fav: {fav}  {shown}"
-    return "TBD"
+    # coerce to float (Decimal/str safe)
+    try:
+        s = float(spr)
+    except Exception:
+        return "TBD"
+
+    # always display as favorite giving points (negative)
+    if s == 0:
+        shown = "PK"              # or use "±0" if you prefer
+    else:
+        shown = f"-{abs(s):g}"
+
+    return f"fav: {fav} {shown}"
+
 
 def _pt(dt_like, tzname: str = "America/Los_Angeles") -> str:
     """
@@ -2431,27 +2517,6 @@ def _pt(dt_like, tzname: str = "America/Los_Angeles") -> str:
     # Use PT as a stable label (DST becomes PDT/PST automatically, label stays PT)
     return local.strftime("%a %m/%d %I:%M %p PT")
 
-def _spread_label(game) -> str:
-    """
-    Returns: 'fav: Jaguars  -3.5' or 'TBD' if no odds.
-    Works with either ORM objects or mapping dicts.
-    """
-    if isinstance(game, dict):
-        fav = game.get("favorite_team")
-        spr = game.get("spread_pts")
-    else:
-        fav = getattr(game, "favorite_team", None)
-        spr = getattr(game, "spread_pts", None)
-
-    if fav and spr is not None:
-        try:
-            s = float(spr)
-        except Exception:
-            s = None
-        if s is not None:
-            # Always display as "-X.X" for the favorite giving points
-            return f"fav: {fav}  -{abs(s):g}"
-    return "TBD"
 
 def send_week_games(week_number: int, season_year: int):
     """
