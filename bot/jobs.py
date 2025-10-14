@@ -2056,7 +2056,7 @@ async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     _text(
                         """
                 SELECT g.id AS game_id, g.away_team, g.home_team, g.game_time,
-                       g.favorite_team, g.spreads_pts
+                       g.favorite_team AS favorite_team, g.spread_pts AS spread_pts
                 FROM games g
                 JOIN weeks w ON w.id=g.week_id
                 LEFT JOIN picks p ON p.game_id=g.id AND p.participant_id=:pid
