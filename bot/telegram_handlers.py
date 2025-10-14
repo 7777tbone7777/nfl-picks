@@ -336,7 +336,7 @@ async def sendweek_command(update, context):
         # Fetch games for the week (for each person we’ll filter out picked ones)
         base_games_sql = T("""
             SELECT g.id, g.away_team, g.home_team, g.game_time,
-                   g.favorite_team, g.spread_pts
+                   g.favorite_team AS favorite_team, g.spread_pts AS spread_pts
               FROM games g
               JOIN weeks w ON w.id = g.week_id
              WHERE w.season_year = :y AND w.week_number = :w
@@ -344,20 +344,30 @@ async def sendweek_command(update, context):
         """)
 
         # Helper: send unpicked games to one participant id/chat
+
         def _send_to_one(participant_id: int, chat_id: str) -> int:
             rows = db.session.execute(
                 T("""
-                    SELECT g.id, g.away_team, g.home_team, g.game_time,
-                           g.favorite_team, g.spread_pts
+                    SELECT
+                           g.id,
+                           g.away_team,
+                           g.home_team,
+                           g.game_time,
+                           g.favorite_team AS favorite_team,   -- ensure key exists
+                           g.spread_pts     AS spread_pts      -- ensure key exists
                       FROM games g
-                      JOIN weeks w ON w.id = g.week_id
-                 LEFT JOIN picks p ON p.game_id = g.id AND p.participant_id = :pid
-                     WHERE w.season_year = :y AND w.week_number = :w
+                      JOIN weeks w
+                        ON w.id = g.week_id
+                      LEFT JOIN picks p
+                        ON p.game_id = g.id
+                       AND p.participant_id = :pid
+                     WHERE w.season_year = :y
+                       AND w.week_number = :w
                        AND (p.id IS NULL OR p.selected_team IS NULL)
-                  ORDER BY g.game_time NULLS LAST, g.id
-                """),
-                {"pid": participant_id, "y": season_year, "w": week_number},
-            ).mappings().all()
+                     ORDER BY g.game_time NULLS LAST, g.id
+                  """),
+                  {"pid": participant_id, "y": season_year, "w": week_number},
+              ).mappings().all()  # <-- keep this
 
             sent = 0
             for g in rows:
