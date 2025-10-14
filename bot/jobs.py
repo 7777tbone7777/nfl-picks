@@ -31,23 +31,45 @@ ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nf
 # --- Import a week from ESPN, including spreads (idempotent) ------------------
 def import_week_from_espn(season_year: int, week: int) -> dict:
     """
-    Ensure (season_year, week) exists; upsert games + scores + odds (favorite & spread).
+    Ensure (season_year, week) exists in weeks; upsert all games for that week
+    from ESPN into games (home/away/time/status/scores + favorite_team/spread_pts).
+    Idempotent.
     """
     from datetime import datetime, timezone
     from sqlalchemy import text as _text
 
+    # If you added my robust fetch, great; otherwise your existing one is fine.
+    # It just needs to return dicts possibly containing: favorite_team, spread_pts.
+    events = fetch_espn_scoreboard(week, season_year) or []
+
+    def _parse_start(ts: str):
+        if not ts:
+            return None
+        s = ts.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)  # store naive UTC
+            return dt
+        except Exception:
+            return None
+
+    def _coerce_float_or_none(x):
+        try:
+            return float(x) if x is not None else None
+        except Exception:
+            return None
+
     app = create_app()
     with app.app_context():
-        # Ensure week exists; get week_id
+        # 1) Ensure the (season, week) exists and get week_id
         row = db.session.execute(
-            _text(
-                """
+            _text("""
                 INSERT INTO weeks (season_year, week_number)
                 VALUES (:y, :w)
                 ON CONFLICT (season_year, week_number) DO NOTHING
                 RETURNING id
-                """
-            ),
+            """),
             {"y": season_year, "w": week},
         ).first()
         if row:
@@ -58,21 +80,19 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
                 {"y": season_year, "w": week},
             ).scalar()
 
-        events = fetch_espn_scoreboard(week, season_year)
-        state_to_status = {"pre": "scheduled", "in": "in_progress", "post": "final"}
+        if not events:
+            # Nothing available yet—exit cleanly
+            db.session.commit()
+            return {
+                "season_year": season_year,
+                "week": week,
+                "events": 0,
+                "created": 0,
+                "updated": 0,
+                "note": "No events returned from ESPN",
+            }
 
-        def _parse_start(ts: str):
-            if not ts:
-                return None
-            s = ts.replace("Z", "+00:00")
-            try:
-                dt = datetime.fromisoformat(s)
-                if dt.tzinfo:
-                    # store as naive UTC to match your schema
-                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-                return dt
-            except Exception:
-                return None
+        state_to_status = {"pre": "scheduled", "in": "in_progress", "post": "final"}
 
         created = 0
         updated = 0
@@ -80,17 +100,19 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
         for e in events:
             away = (e.get("away_team") or "").strip()
             home = (e.get("home_team") or "").strip()
+            if not away or not home:
+                continue  # skip junk rows
+
             start_dt = _parse_start(e.get("start_time"))
             status = state_to_status.get((e.get("state") or "").lower(), "scheduled")
             home_score = e.get("home_score")
             away_score = e.get("away_score")
-            favorite_team = e.get("favorite_team")
-            spread_pts = e.get("spread_pts")
+            favorite_team = (e.get("favorite_team") or None)
+            spread_pts = _coerce_float_or_none(e.get("spread_pts"))
 
-            # Try update existing game (match by teams within the week)
+            # 2) Try UPDATE existing row matched by teams within the week
             res = db.session.execute(
-                _text(
-                    """
+                _text("""
                     UPDATE games
                     SET game_time     = COALESCE(:game_time, game_time),
                         status        = COALESCE(:status, status),
@@ -101,8 +123,7 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
                     WHERE week_id=:week_id
                       AND lower(home_team)=lower(:home)
                       AND lower(away_team)=lower(:away)
-                    """
-                ),
+                """),
                 {
                     "game_time": start_dt,
                     "status": status,
@@ -115,19 +136,18 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
                     "away": away,
                 },
             )
+
             if res.rowcount == 0:
-                # Insert new
+                # 3) INSERT new game
                 db.session.execute(
-                    _text(
-                        """
+                    _text("""
                         INSERT INTO games
                             (week_id, home_team, away_team, game_time, status,
                              home_score, away_score, favorite_team, spread_pts)
                         VALUES
                             (:week_id, :home, :away, :game_time, :status,
                              :home_score, :away_score, :favorite_team, :spread_pts)
-                        """
-                    ),
+                    """),
                     {
                         "week_id": week_id,
                         "home": home,
@@ -788,122 +808,108 @@ def detect_current_context(timeout: float = 15.0):
 # --- ESPN scoreboard: fetch + (optional) spread parsing ----------------------
 def fetch_espn_scoreboard(week: int, season_year: int) -> list[dict]:
     """
-    Returns a list of games with:
-      - away_team, home_team (full display names)
-      - start_time (ISO string or None)
-      - state ('pre'|'in'|'post')
-      - away_score, home_score (ints or None)
-      - favorite_team (full name or None)
-      - spread_pts (Decimal/float or None; positive means favorite gives points)
+    Robust fetch:
+      1) Try JSON API with year= param
+      2) Try JSON API with dates= param
+      3) Fallback: parse HTML scoreboard page's embedded JSON
+    Returns a list of dicts with: home_team, away_team, start_time, state,
+    home_score, away_score, favorite_team (if known), spread_pts (if known).
     """
-    import json
-    from decimal import Decimal
+    import httpx, json, re
+    events = []
 
-    # ESPN NFL scoreboard v2
-    url = (
-        "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
-        f"?week={week}&dates={season_year}&seasontype=2"
-    )
+    def _normalize(ev) -> dict:
+        # competition block
+        comp = (ev.get("competitions") or [None])[0] or {}
+        teams = comp.get("competitors") or []
+        home = away = None
+        for t in teams:
+            if t.get("homeAway") == "home":
+                home = t
+            elif t.get("homeAway") == "away":
+                away = t
 
-    r = httpx.get(url, timeout=20.0)
-    r.raise_for_status()
-    data = r.json()
-
-    out: list[dict] = []
-    for ev in data.get("events", []):
-        comps = ev.get("competitions", []) or [{}]
-        comp = comps[0]
-        competitors = comp.get("competitors", []) or []
-
-        # Home/away names & scores
-        home = next((c for c in competitors if c.get("homeAway") == "home"), {})
-        away = next((c for c in competitors if c.get("homeAway") == "away"), {})
-
-        home_name = (home.get("team", {}).get("displayName") or "").strip()
-        away_name = (away.get("team", {}).get("displayName") or "").strip()
-
-        def _int_or_none(x):
-            try:
-                return int(x) if x is not None and str(x).strip() != "" else None
-            except Exception:
-                return None
-
-        home_score = _int_or_none(home.get("score"))
-        away_score = _int_or_none(away.get("score"))
-
-        # Game state
-        status_raw = (ev.get("status", {}) or {}).get("type", {}) or {}
-        state = (status_raw.get("state") or "").lower()  # 'pre' | 'in' | 'post'
-
-        # Kick time (if present)
-        start_time = ev.get("date") or comp.get("date")
-
-        # -------- odds / pickcenter parsing (best-effort) --------
-        favorite_team = None
-        spread_pts = None
-
-        # ESPN puts odds either under competition['odds'] or ['pickcenter'].
-        # We try both; take the first with a numeric spread.
-        odds_blocks = comp.get("odds") or comp.get("pickcenter") or []
-        if odds_blocks:
-            # Typical shapes:
-            #   {'details': 'Jaguars -3.5', 'overUnder': 46.5, ...}
-            #   {'displayName': 'Caesars', 'spread': -3.5, 'favorite': 'Jaguars'}  (varies)
-            ob = odds_blocks[0] or {}
-            details = (ob.get("details") or "").strip()
-            # Try explicit numeric field first
-            spread_val = ob.get("spread")
-            fav_name = ob.get("favorite")
-
-            # If not present, parse 'details' like "Kansas City Chiefs -3.5"
-            if spread_val is None and details:
-                try:
-                    # split on last space to keep full team name left side
-                    # e.g. "Jacksonville Jaguars -3.5"
-                    team_part, num_part = details.rsplit(" ", 1)
-                    spread_val = float(num_part.replace("½", ".5"))
-                    fav_name = team_part.strip()
-                except Exception:
-                    pass
-
-            # Normalize favorite to one of our display names, case-insensitive
-            if fav_name:
-                if fav_name.strip().lower() == home_name.lower():
-                    favorite_team = home_name
-                elif fav_name.strip().lower() == away_name.lower():
-                    favorite_team = away_name
-                else:
-                    # Sometimes details uses nickname (e.g., "Jaguars").
-                    # Fuzzy contains check:
-                    low = fav_name.strip().lower()
-                    if low in home_name.lower():
-                        favorite_team = home_name
-                    elif low in away_name.lower():
-                        favorite_team = away_name
-
-            if spread_val is not None:
-                try:
-                    spread_pts = Decimal(str(spread_val))
-                except Exception:
+        # odds (if present)
+        fav_name, spread_pts = None, None
+        odds = (comp.get("odds") or ev.get("odds") or [])
+        if odds:
+            # ESPN often stuffs "details": "PIT -5.5"
+            det = (odds[0] or {}).get("details")
+            if isinstance(det, str) and det.strip():
+                # e.g. "PIT -5.5" or "LAR -2.5"
+                m = re.match(r"\s*([A-Za-z .'-]+)\s*([+-]?\d+(?:\.\d+)?)", det)
+                if m:
+                    fav_name = m.group(1).strip()
                     try:
-                        spread_pts = Decimal(str(float(spread_val)))
+                        spread_pts = float(m.group(2))
+                        # normalize: store positive number as magnitude the favorite lays
+                        spread_pts = abs(spread_pts)
                     except Exception:
                         spread_pts = None
 
-        out.append(
-            {
-                "away_team": away_name,
-                "home_team": home_name,
-                "start_time": start_time,
-                "state": state,  # 'pre'|'in'|'post'
-                "away_score": away_score,
-                "home_score": home_score,
-                "favorite_team": favorite_team,
-                "spread_pts": spread_pts,
-            }
-        )
+        return {
+            "home_team": (home or {}).get("team", {}).get("displayName"),
+            "away_team": (away or {}).get("team", {}).get("displayName"),
+            "start_time": comp.get("date"),
+            "state": (comp.get("status") or {}).get("type", {}).get("state"),
+            "home_score": (home or {}).get("score"),
+            "away_score": (away or {}).get("score"),
+            "favorite_team": fav_name,
+            "spread_pts": spread_pts,
+        }
 
-    return out
+    def _ingest(obj):
+        for ev in (obj or {}).get("events", []) or []:
+            try:
+                events.append(_normalize(ev))
+            except Exception:
+                continue
+
+    def _try_get(url):
+        try:
+            with httpx.Client(timeout=12.0) as c:
+                r = c.get(url)
+                if r.status_code in (404, 204):
+                    return None
+                r.raise_for_status()
+                return r.json()
+        except Exception:
+            return None
+
+    # 1) JSON API (year)
+    data = _try_get(
+        f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?week={week}&year={season_year}&seasontype=2"
+    )
+    if data:
+        _ingest(data)
+        if events:
+            return events
+
+    # 2) JSON API (dates)
+    data = _try_get(
+        f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?week={week}&dates={season_year}&seasontype=2"
+    )
+    if data:
+        _ingest(data)
+        if events:
+            return events
+
+    # 3) HTML fallback: parse embedded JSON from the page you screenshotted
+    html_url = f"https://www.espn.com/nfl/scoreboard/_/week/{week}/year/{season_year}/seasontype/2"
+    try:
+        with httpx.Client(timeout=12.0) as c:
+            r = c.get(html_url)
+            if r.status_code in (404, 204):
+                return events
+            r.raise_for_status()
+            m = re.search(r"window\.espn\.scoreboardData\s*=\s*(\{.*?\});", r.text, re.S)
+            if m:
+                data = json.loads(m.group(1))
+                _ingest(data)
+    except Exception:
+        pass
+
+    return events
 
 
 def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
