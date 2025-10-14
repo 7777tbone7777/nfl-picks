@@ -745,91 +745,40 @@ def _format_winners_and_totals(week: int, weekly_rows, season_rows):
 
 def cron_send_upcoming_week() -> dict:
     """
-    Post the matchups for the next week so participants can make picks.
-
-    Guardrails:
-      - Runs only on TUESDAY in America/Los_Angeles unless ALLOW_ANYDAY is set
-        to one of: 1, true, yes, on (case-insensitive).
-
-    Strategy:
-      1) Try strict finder (needs first_kick > now_utc AND games > 0).
-      2) If none (e.g., first_kick is NULL), fall back to last_completed + 1.
-      3) Ensure the target week exists in DB (import once if empty).
-      4) Send using send_week_games(...).
+    Detect the next week (first kickoff > now UTC) and broadcast using send_week_games().
     """
-    from datetime import datetime, timezone
-    from zoneinfo import ZoneInfo
-    from sqlalchemy import text as _text
-    import os
+    from datetime import datetime
+    from sqlalchemy import text as T
+    from models import db
+    from flask_app import create_app
 
     app = create_app()
     with app.app_context():
-        # --- Tuesday guard (PT) with ALLOW_ANYDAY override ---
-        now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
-        allow_anyday = os.getenv("ALLOW_ANYDAY", "").strip().lower() in {"1", "true", "yes", "on"}
-        if not allow_anyday and now_pt.weekday() != 1:  # Monday=0, Tuesday=1
-            try:
-                logger.info("cron_send_upcoming_week: skipping (not Tuesday PT). now_pt=%s", now_pt)
-            except NameError:
-                pass
-            return {"ok": False, "reason": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
+        now_utc_naive = datetime.utcnow()
 
-        # --- Season & time base ---
-        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
-        if not season:
-            return {"ok": False, "reason": "no season"}
-
-        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-
-        # --- 1) Try to find an upcoming week with a real future kickoff ---
-        wk = _find_upcoming_week_row(season, now_utc)
-
-        if not wk:
-            # --- 2) Fallback when MIN(game_time) is NULL or not future ---
-            last_completed = _find_last_completed_week_number(season) or 0
-            target_week = last_completed + 1
-        else:
-            target_week = int(wk["week_number"])
-
-        # --- 3) Ensure the week has games; import if necessary (idempotent) ---
-        cnt = db.session.execute(
-            _text("""
-                SELECT COUNT(*) FROM games g
-                JOIN weeks w ON w.id = g.week_id
-                WHERE w.season_year = :y AND w.week_number = :w
-            """),
-            {"y": season, "w": target_week},
-        ).scalar()
-
-        if not cnt:
-            import_week_from_espn(season, target_week)
-            cnt = db.session.execute(
-                _text("""
-                    SELECT COUNT(*) FROM games g
-                    JOIN weeks w ON w.id = g.week_id
-                    WHERE w.season_year = :y AND w.week_number = :w
+        row = (
+            db.session.execute(
+                T("""
+                  SELECT w.season_year, w.week_number, MIN(g.game_time) AS first_kick
+                    FROM weeks w
+                    JOIN games g ON g.week_id = w.id
+                   WHERE g.game_time > :now
+                GROUP BY w.season_year, w.week_number
+                ORDER BY first_kick
+                   LIMIT 1
                 """),
-                {"y": season, "w": target_week},
-            ).scalar()
+                {"now": now_utc_naive},
+            ).mappings().first()
+        )
+        if not row:
+            return {"status": "no_upcoming"}
 
-        if not cnt:
-            return {
-                "ok": False,
-                "reason": "no upcoming week found after fallback",
-                "season_year": int(season),
-                "week": int(target_week),
-            }
+        season_year = int(row["season_year"])
+        week_number = int(row["week_number"])
 
-        # --- 4) Send using the same helper your /sendweek command uses ---
-        # If your helper is positional (season, week), use: send_week_games(season, target_week)
-        res = send_week_games(week_number=target_week, season_year=season)
-
-        return {
-            "ok": True,
-            "season_year": int(season),
-            "week": int(target_week),
-            **(res or {}),
-        }
+    # call outside the inner context or inside—either is fine; function opens its own context
+    messages = send_week_games(week_number=week_number, season_year=season_year)
+    return {"status": "sent", "season_year": season_year, "week": week_number, "messages": messages}
 
 
 def cron_announce_weekly_winners() -> dict:
@@ -2522,40 +2471,78 @@ def _pt(dt_like, tzname: str = "America/Los_Angeles") -> str:
     # Use PT as a stable label (DST becomes PDT/PST automatically, label stays PT)
     return local.strftime("%a %m/%d %I:%M %p PT")
 
+def send_week_games(week_number: int, season_year: int) -> int:
+    """
+    Broadcast UNPICKED games for a week to all participants with telegram_chat_id.
+    Always includes favorite/spread (expects DB to have favorite_team, spread_pts).
+    Returns number of messages sent.
+    """
+    from sqlalchemy import text as T
+    from models import db
+    from flask_app import create_app
 
-def send_week_games(week_number: int, season_year: int):
-    """
-    Send ALL games for the week to every participant who has a telegram_chat_id.
-    Includes kickoff time in PT and the spread line if present.
-    """
+    def _build_text(g: dict) -> str:
+        when = _pt(g.get("game_time"))
+        return (
+            f"{g['away_team']} @ {g['home_team']}\n"
+            f"{when}\n"
+            f"{_spread_label(g)}"
+        )
+
+    def _kb_for(g: dict) -> dict:
+        return {
+            "inline_keyboard": [
+                [{"text": g["away_team"], "callback_data": f"pick:{g['id']}:{g['away_team']}"}],
+                [{"text": g["home_team"], "callback_data": f"pick:{g['id']}:{g['home_team']}"}],
+            ]
+        }
+
+    sent_total = 0
     app = create_app()
     with app.app_context():
-        week = Week.query.filter_by(week_number=week_number, season_year=season_year).first()
-        if not week:
-            logger.error(f"❌ No week found for {season_year} W{week_number}")
-            return
 
-        games = Game.query.filter_by(week_id=week.id).order_by(Game.game_time, Game.id).all()
-        if not games:
-            logger.error(f"❌ No games found for {season_year} W{week_number}")
-            return
+        people = (
+            db.session.execute(
+                T("""
+                   SELECT id, name, telegram_chat_id
+                     FROM participants
+                    WHERE telegram_chat_id IS NOT NULL
+                """)
+            ).mappings().all()
+        )
 
-        participants = Participant.query.filter(Participant.telegram_chat_id.isnot(None)).all()
-        for part in participants:
-            chat_id = str(part.telegram_chat_id)
-            for g in games:
-                kb = {
-                    "inline_keyboard": [
-                        [{"text": g.away_team, "callback_data": f"pick:{g.id}:{g.away_team}"}],
-                        [{"text": g.home_team, "callback_data": f"pick:{g.id}:{g.home_team}"}],
-                    ]
-                }
-                msg = f"{g.away_team} @ {g.home_team}\n{_pt(g.game_time)}\n{_spread_label(g)}"
-                try:
-                    _send_message(chat_id, msg, reply_markup=kb)
-                    logger.info(f"✅ Sent game to {part.name}: {g.away_team} @ {g.home_team}")
-                except Exception as e:
-                    logger.exception("❌ Failed to send game message: %s", e)
+        for u in people:
+            # NOTE the REQUIRED aliases below so _spread_label() works.
+            rows = (
+                db.session.execute(
+                    T("""
+                        SELECT
+                            g.id,
+                            g.away_team,
+                            g.home_team,
+                            g.game_time,
+                            g.favorite_team AS favorite_team,
+                            g.spread_pts     AS spread_pts
+                        FROM games g
+                        JOIN weeks w ON w.id = g.week_id
+                   LEFT JOIN picks p
+                          ON p.game_id = g.id
+                         AND p.participant_id = :pid
+                       WHERE w.season_year = :y
+                         AND w.week_number = :w
+                         AND (p.id IS NULL OR p.selected_team IS NULL)
+                    ORDER BY g.game_time NULLS LAST, g.id
+                    """),
+                    {"pid": u["id"], "y": season_year, "w": week_number},
+                ).mappings().all()
+            )
+
+            for g in rows:
+                _send_message(str(u["telegram_chat_id"]), _build_text(g), reply_markup=_kb_for(g))
+                sent_total += 1
+
+    return sent_total
+
 
 async def sendweek_command(update, context):
     """
