@@ -806,111 +806,144 @@ def detect_current_context(timeout: float = 15.0):
     return year, int(st), week
 
 # --- ESPN scoreboard: fetch + (optional) spread parsing ----------------------
-def fetch_espn_scoreboard(week: int, season_year: int) -> list[dict]:
+def fetch_espn_scoreboard(week: int, season_year: int):
     """
-    Robust fetch:
-      1) Try JSON API with year= param
-      2) Try JSON API with dates= param
-      3) Fallback: parse HTML scoreboard page's embedded JSON
-    Returns a list of dicts with: home_team, away_team, start_time, state,
-    home_score, away_score, favorite_team (if known), spread_pts (if known).
+    Returns a list of dicts for the given NFL week from ESPN:
+      {
+        "home_team": "...",
+        "away_team": "...",
+        "start_time": "2025-10-19T13:30Z" (ISO if present),
+        "state": "pre" | "in" | "post",
+        "home_score": 31,
+        "away_score": 28,
+        "favorite_team": "Jacksonville Jaguars" | None,
+        "spread_pts": 3.5 | None,
+      }
     """
-    import httpx, json, re
-    events = []
+    ua = {"User-Agent": "Mozilla/5.0 (nfl-picks bot)"}
+    def _get(url: str):
+        req = urllib.request.Request(url, headers=ua)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
 
-    def _normalize(ev) -> dict:
-        # competition block
-        comp = (ev.get("competitions") or [None])[0] or {}
-        teams = comp.get("competitors") or []
-        home = away = None
-        for t in teams:
-            if t.get("homeAway") == "home":
-                home = t
-            elif t.get("homeAway") == "away":
-                away = t
+    # Preferred (the one that worked in your test)
+    urls = [
+        f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=2&year={season_year}&week={week}",
+        # Legacy fallbacks (some weeks/years used to work here)
+        f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?seasontype=2&year={season_year}&week={week}",
+        f"https://www.espn.com/nfl/scoreboard/_/week/{week}/year/{season_year}/seasontype/2",
+    ]
 
-        # odds (if present)
-        fav_name, spread_pts = None, None
-        odds = (comp.get("odds") or ev.get("odds") or [])
-        if odds:
-            # ESPN often stuffs "details": "PIT -5.5"
-            det = (odds[0] or {}).get("details")
-            if isinstance(det, str) and det.strip():
-                # e.g. "PIT -5.5" or "LAR -2.5"
-                m = re.match(r"\s*([A-Za-z .'-]+)\s*([+-]?\d+(?:\.\d+)?)", det)
+    last_err = None
+    data = None
+    for url in urls:
+        try:
+            data = _get(url)
+            break
+        except Exception as e:
+            last_err = e
+
+    if data is None:
+        raise RuntimeError(f"ESPN fetch failed for week {week} {season_year}: {last_err}")
+
+    events = data.get("events", []) or []
+    out = []
+
+    for ev in events:
+        comp = (ev.get("competitions") or [{}])[0]
+
+        # Teams & names
+        cteams = comp.get("competitors") or []
+        if len(cteams) != 2:
+            continue
+        # ESPN flags home/away on competitors
+        home_c = next((t for t in cteams if str(t.get("homeAway")) == "home"), cteams[0])
+        away_c = next((t for t in cteams if str(t.get("homeAway")) == "away"), cteams[1])
+
+        def _team_fullname(c):
+            t = c.get("team") or {}
+            # displayName is usually "Jacksonville Jaguars"
+            return (t.get("displayName")
+                    or t.get("name")
+                    or t.get("location") or "").strip()
+
+        home_team = _team_fullname(home_c)
+        away_team = _team_fullname(away_c)
+
+        # Scores (if any)
+        def _score(c):
+            s = c.get("score")
+            try:
+                return int(s) if s is not None and s != "" else None
+            except Exception:
+                return None
+
+        home_score = _score(home_c)
+        away_score = _score(away_c)
+
+        # Game state
+        status = (ev.get("status") or {}).get("type") or {}
+        state = (status.get("state") or "").lower()  # 'pre','in','post'
+
+        # Start time
+        start_time = None
+        if ev.get("date"):
+            # already ISO with Z; keep raw string for your importer to parse
+            start_time = ev["date"]
+
+        # Odds / spread / favorite
+        favorite_team = None
+        spread_pts = None
+        odds_list = comp.get("odds") or []
+        if odds_list:
+            o = odds_list[0]  # usually first is current line
+            # Some payloads include structured fields:
+            fav_name = o.get("favorite")
+            spr_val = o.get("spread")
+            details = o.get("details")  # e.g., "PIT -5.5"
+
+            if spr_val is not None:
+                try:
+                    spread_pts = float(spr_val)
+                except Exception:
+                    spread_pts = None
+
+            if fav_name:
+                # fav_name can be abbreviation or name; try to match by suffix/prefix
+                cand = [home_team, away_team]
+                # Loose match: if token appears in full name (JAX -> Jacksonville Jaguars)
+                fav_low = fav_name.lower()
+                mtch = [t for t in cand if fav_low in t.lower() or t.lower().startswith(fav_low)]
+                favorite_team = (mtch[0] if mtch else fav_name)
+
+            # Fallback: parse details like "PIT -5.5" / "JAX -2.5"
+            if (favorite_team is None or spread_pts is None) and details:
+                m = re.search(r"([A-Za-z]{2,4})\s*([+-]?\d+(?:\.\d+)?)", details)
                 if m:
-                    fav_name = m.group(1).strip()
+                    abbr = m.group(1).lower()
                     try:
                         spread_pts = float(m.group(2))
-                        # normalize: store positive number as magnitude the favorite lays
-                        spread_pts = abs(spread_pts)
                     except Exception:
-                        spread_pts = None
+                        pass
+                    # Pick the team whose name contains that abbr (rough heuristic)
+                    picks = [home_team, away_team]
+                    favorite_team = next(
+                        (t for t in picks if abbr in t.lower() or t.lower().startswith(abbr)),
+                        favorite_team
+                    )
 
-        return {
-            "home_team": (home or {}).get("team", {}).get("displayName"),
-            "away_team": (away or {}).get("team", {}).get("displayName"),
-            "start_time": comp.get("date"),
-            "state": (comp.get("status") or {}).get("type", {}).get("state"),
-            "home_score": (home or {}).get("score"),
-            "away_score": (away or {}).get("score"),
-            "favorite_team": fav_name,
+        out.append({
+            "home_team": home_team,
+            "away_team": away_team,
+            "home_score": home_score,
+            "away_score": away_score,
+            "start_time": start_time,
+            "state": state,  # 'pre'|'in'|'post'
+            "favorite_team": favorite_team,
             "spread_pts": spread_pts,
-        }
+        })
 
-    def _ingest(obj):
-        for ev in (obj or {}).get("events", []) or []:
-            try:
-                events.append(_normalize(ev))
-            except Exception:
-                continue
-
-    def _try_get(url):
-        try:
-            with httpx.Client(timeout=12.0) as c:
-                r = c.get(url)
-                if r.status_code in (404, 204):
-                    return None
-                r.raise_for_status()
-                return r.json()
-        except Exception:
-            return None
-
-    # 1) JSON API (year)
-    data = _try_get(
-        f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?week={week}&year={season_year}&seasontype=2"
-    )
-    if data:
-        _ingest(data)
-        if events:
-            return events
-
-    # 2) JSON API (dates)
-    data = _try_get(
-        f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?week={week}&dates={season_year}&seasontype=2"
-    )
-    if data:
-        _ingest(data)
-        if events:
-            return events
-
-    # 3) HTML fallback: parse embedded JSON from the page you screenshotted
-    html_url = f"https://www.espn.com/nfl/scoreboard/_/week/{week}/year/{season_year}/seasontype/2"
-    try:
-        with httpx.Client(timeout=12.0) as c:
-            r = c.get(html_url)
-            if r.status_code in (404, 204):
-                return events
-            r.raise_for_status()
-            m = re.search(r"window\.espn\.scoreboardData\s*=\s*(\{.*?\});", r.text, re.S)
-            if m:
-                data = json.loads(m.group(1))
-                _ingest(data)
-    except Exception:
-        pass
-
-    return events
-
+    return out
 
 def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
     """
