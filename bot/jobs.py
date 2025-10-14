@@ -2509,7 +2509,11 @@ async def sendweek_command(update, context):
       /sendweek <week> <name...>  -> send ONLY to that participant by name
     """
     import asyncio
-    from sqlalchemy import text as T  # alias to avoid name collisions
+    from sqlalchemy import text as T
+
+    # >>> imports you were missing <<<
+    from bot.jobs import create_app, db, _spread_label, _pt
+    from bot.models import Week  # if your Week model lives elsewhere, import from there
 
     user = update.effective_user
     if ADMIN_IDS and (not user or user.id not in ADMIN_IDS):
@@ -2676,19 +2680,19 @@ async def sendweek_command(update, context):
                 )
             season_year = wk.season_year
 
-            participants = (
+            people = (
                 db.session.execute(
                     T("select id, telegram_chat_id from participants where telegram_chat_id is not null")
                 )
                 .mappings()
                 .all()
             )
-            for p in participants:
+            for p in people:
                 _send_to_one(p["id"], p["telegram_chat_id"], season_year)
 
     if update.message:
         await update.message.reply_text(f"Sending Week {week_number} to all registered participants…")
-    await asyncio.to_thread(_do_broadcast)  # now runs correctly because _do_broadcast is sync
+    await asyncio.to_thread(_do_broadcast)  # sync fn in background thread
     if update.message:
         await update.message.reply_text("✅ Done.")
 
