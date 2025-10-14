@@ -2413,48 +2413,23 @@ def run_telegram_listener():
     application.run_polling()
 
 
-def _send_message(
-    chat_id: str,
-    text: str,
-    reply_markup: dict | str | None = None,
-    parse_mode: str | None = None,
-):
-    """
-    Low-level helper to send a message via Telegram HTTP API (sync call).
+def _send_message(chat_id: str, text: str, reply_markup=None):
+    # DEBUG: log exactly what we're sending (single line)
+    try:
+        print("DEBUG_SEND:", text.replace("\n", " | "))
+    except Exception:
+        pass
 
-    - chat_id: Telegram chat id
-    - text: message body
-    - reply_markup: dict (will be JSON-encoded) or a pre-encoded JSON string
-    - parse_mode: e.g. "HTML" or "MarkdownV2"
-
-    When parse_mode is provided, we also disable link previews so score tables
-    wrapped in <pre> blocks stay clean.
-    """
-    import json
-    import os
-
-    import httpx
-
+    import os, httpx
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-
-    base_url = globals().get("TELEGRAM_API_URL") or f"https://api.telegram.org/bot{token}"
-    url = f"{base_url}/sendMessage"
-
-    data: dict[str, object] = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        data["parse_mode"] = parse_mode
-        data["disable_web_page_preview"] = True
-
-    if reply_markup is not None:
-        data["reply_markup"] = (
-            reply_markup if isinstance(reply_markup, str) else json.dumps(reply_markup)
-        )
-
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     with httpx.Client(timeout=20) as client:
-        resp = client.post(url, data=data)
-        resp.raise_for_status()
+        r = client.post(url, json=payload)
+        r.raise_for_status()
+
 
 def _spread_label(game) -> str:
     """
