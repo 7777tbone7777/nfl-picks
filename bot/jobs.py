@@ -2081,6 +2081,7 @@ async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 continue
 
             # Send one message per game with two buttons
+            # Send one message per game with two buttons
             for r in rows:
                 kb = {
                     "inline_keyboard": [
@@ -2098,9 +2099,15 @@ async def remindweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         ],
                     ]
                 }
+                # ✅ FIXED: Include time and spread like sendweek does
+                text = (
+                    f"{r['away_team']} @ {r['home_team']}\n"
+                    f"{_pt(r['game_time'])}\n"
+                    f"{_spread_label(r)}"
+                )
                 _send_message(
                     u["telegram_chat_id"],
-                    f"{r['away_team']} @ {r['home_team']}",
+                    text,  # <-- Now includes all 3 lines
                     reply_markup=kb,
                 )
                 sent_total += 1
