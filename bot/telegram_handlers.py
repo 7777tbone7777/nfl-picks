@@ -40,6 +40,216 @@ log = logging.getLogger(__name__)
 # ADMIN_IDS already used elsewhere in your app; re-derive here from env
 ADMIN_IDS = {int(x) for x in (os.getenv("ADMIN_IDS") or "").split(",") if x.strip().isdigit()}
 
+# --- /seasonboard (finals-only) ---
+async def seasonboard_command(update, context):
+    """
+    Shows season-to-date scoreboard for weeks that have at least one FINAL game.
+    Usage: /seasonboard [<season_year>] or /seasonboard me
+    """
+    from sqlalchemy import text as T
+    from bot.jobs import create_app, db  # uses your existing app/db
+    user = update.effective_user
+
+    # Optional args: "me" is allowed but not used to filter; kept for parity with your screenshot.
+    args = (context.args or [])
+    season_year = None
+    for a in args:
+        if a.isdigit():
+            season_year = int(a)
+
+    app = create_app()
+    with app.app_context():
+        # Resolve season if not provided
+        if season_year is None:
+            season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
+
+        # 1) Figure out which week_numbers actually have at least one FINAL game
+        weeks = [
+            r["week_number"]
+            for r in db.session.execute(
+                T("""
+                SELECT DISTINCT w.week_number
+                  FROM weeks w
+                  JOIN games g ON g.week_id = w.id
+                 WHERE w.season_year = :y
+                   AND LOWER(COALESCE(g.status,'')) = 'final'
+                 ORDER BY w.week_number
+                """),
+                {"y": season_year},
+            ).mappings()
+        ]
+
+        if not weeks:
+            await update.message.reply_text(f"No FINAL games yet for {season_year}.")
+            return
+
+        # 2) Load participant names
+        names = dict(db.session.execute(T("SELECT id, name FROM participants")).fetchall())
+
+        # 3) Pull all FINAL picks for those weeks
+        rows = db.session.execute(
+            T("""
+              SELECT p.participant_id  AS pid,
+                     w.week_number     AS wk,
+                     g.home_team, g.away_team,
+                     COALESCE(g.home_score,0) AS home_score,
+                     COALESCE(g.away_score,0) AS away_score,
+                     p.selected_team   AS pick
+                FROM picks p
+                JOIN games g  ON g.id = p.game_id
+                JOIN weeks w  ON w.id = g.week_id
+               WHERE w.season_year = :y
+                 AND w.week_number IN :weeks
+                 AND LOWER(COALESCE(g.status,'')) = 'final'
+                 AND p.selected_team IS NOT NULL
+            """).bindparams(weeks=tuple(weeks)),
+            {"y": season_year},
+        ).mappings().all()
+
+        # 4) Compute wins per participant per week
+        def _winner(home_team, away_team, hs, as_):
+            if hs > as_:  return home_team
+            if as_ > hs:  return away_team
+            return None  # tie (unlikely), no credit
+
+        wins_by_pid = {}          # pid -> total wins
+        wins_by_pid_week = {}     # pid -> {wk -> wins}
+        for r in rows:
+            wt = _winner(r["home_team"], r["away_team"], int(r["home_score"]), int(r["away_score"]))
+            if not wt:
+                continue
+            if r["pick"] and r["pick"].strip().lower() == wt.strip().lower():
+                pid = int(r["pid"]); wk = int(r["wk"])
+                wins_by_pid[pid] = wins_by_pid.get(pid, 0) + 1
+                wk_map = wins_by_pid_week.setdefault(pid, {})
+                wk_map[wk] = wk_map.get(wk, 0) + 1
+
+        # Ensure every participant shows even if zero
+        for pid in names:
+            wins_by_pid.setdefault(pid, 0)
+            wins_by_pid_week.setdefault(pid, {})
+
+        # 5) Render a compact board
+        header = "🏆 Season-to-date Scoreboard\n"
+        sub = f"Season {season_year} — completed games only"
+        week_cols = " ".join([f"W{w:>2}" if w >= 10 else f"W{w}" for w in weeks])
+
+        lines = []
+        # Sort by total desc, then name asc for stability
+        for pid, total in sorted(wins_by_pid.items(), key=lambda kv: (-kv[1], names.get(kv[0], ""))):
+            per_week = [str(wins_by_pid_week[pid].get(w, 0)) for w in weeks]
+            lines.append(f"{names.get(pid, pid):<12} | {' '.join(per_week)} | Total {total}")
+
+        body = "\n".join(lines)
+        msg = f"{header}{sub}\n\nName         | {week_cols} | Total\n{body}"
+        await update.message.reply_text(msg)
+
+
+# --- /seasonboard (finals-only) ---
+async def seasonboard_command(update, context):
+    """
+    Shows season-to-date scoreboard for weeks that have at least one FINAL game.
+    Usage: /seasonboard [<season_year>] or /seasonboard me
+    """
+    from sqlalchemy import text as T
+    from bot.jobs import create_app, db  # uses your existing app/db
+    user = update.effective_user
+
+    # Optional args: "me" is allowed but not used to filter; kept for parity with your screenshot.
+    args = (context.args or [])
+    season_year = None
+    for a in args:
+        if a.isdigit():
+            season_year = int(a)
+
+    app = create_app()
+    with app.app_context():
+        # Resolve season if not provided
+        if season_year is None:
+            season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
+
+        # 1) Figure out which week_numbers actually have at least one FINAL game
+        weeks = [
+            r["week_number"]
+            for r in db.session.execute(
+                T("""
+                SELECT DISTINCT w.week_number
+                  FROM weeks w
+                  JOIN games g ON g.week_id = w.id
+                 WHERE w.season_year = :y
+                   AND LOWER(COALESCE(g.status,'')) = 'final'
+                 ORDER BY w.week_number
+                """),
+                {"y": season_year},
+            ).mappings()
+        ]
+
+        if not weeks:
+            await update.message.reply_text(f"No FINAL games yet for {season_year}.")
+            return
+
+        # 2) Load participant names
+        names = dict(db.session.execute(T("SELECT id, name FROM participants")).fetchall())
+
+        # 3) Pull all FINAL picks for those weeks
+        rows = db.session.execute(
+            T("""
+              SELECT p.participant_id  AS pid,
+                     w.week_number     AS wk,
+                     g.home_team, g.away_team,
+                     COALESCE(g.home_score,0) AS home_score,
+                     COALESCE(g.away_score,0) AS away_score,
+                     p.selected_team   AS pick
+                FROM picks p
+                JOIN games g  ON g.id = p.game_id
+                JOIN weeks w  ON w.id = g.week_id
+               WHERE w.season_year = :y
+                 AND w.week_number IN :weeks
+                 AND LOWER(COALESCE(g.status,'')) = 'final'
+                 AND p.selected_team IS NOT NULL
+            """).bindparams(weeks=tuple(weeks)),
+            {"y": season_year},
+        ).mappings().all()
+
+        # 4) Compute wins per participant per week
+        def _winner(home_team, away_team, hs, as_):
+            if hs > as_:  return home_team
+            if as_ > hs:  return away_team
+            return None  # tie (unlikely), no credit
+
+        wins_by_pid = {}          # pid -> total wins
+        wins_by_pid_week = {}     # pid -> {wk -> wins}
+        for r in rows:
+            wt = _winner(r["home_team"], r["away_team"], int(r["home_score"]), int(r["away_score"]))
+            if not wt:
+                continue
+            if r["pick"] and r["pick"].strip().lower() == wt.strip().lower():
+                pid = int(r["pid"]); wk = int(r["wk"])
+                wins_by_pid[pid] = wins_by_pid.get(pid, 0) + 1
+                wk_map = wins_by_pid_week.setdefault(pid, {})
+                wk_map[wk] = wk_map.get(wk, 0) + 1
+
+        # Ensure every participant shows even if zero
+        for pid in names:
+            wins_by_pid.setdefault(pid, 0)
+            wins_by_pid_week.setdefault(pid, {})
+
+        # 5) Render a compact board
+        header = "🏆 Season-to-date Scoreboard\n"
+        sub = f"Season {season_year} — completed games only"
+        week_cols = " ".join([f"W{w:>2}" if w >= 10 else f"W{w}" for w in weeks])
+
+        lines = []
+        # Sort by total desc, then name asc for stability
+        for pid, total in sorted(wins_by_pid.items(), key=lambda kv: (-kv[1], names.get(kv[0], ""))):
+            per_week = [str(wins_by_pid_week[pid].get(w, 0)) for w in weeks]
+            lines.append(f"{names.get(pid, pid):<12} | {' '.join(per_week)} | Total {total}")
+
+        body = "\n".join(lines)
+        msg = f"{header}{sub}\n\nName         | {week_cols} | Total\n{body}"
+        await update.message.reply_text(msg)
+
+
 def _is_admin(user) -> bool:
     try:
         return bool(ADMIN_IDS) and user and (user.id in ADMIN_IDS)
