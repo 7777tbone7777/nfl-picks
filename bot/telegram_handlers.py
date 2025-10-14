@@ -22,7 +22,6 @@ from bot.jobs import (
     sendweek_command,
     syncscores_command,
     getscores_command,
-    seasonboard_command,
     deletepicks_command,
     whoisleft_command,
     seepicks_command,
