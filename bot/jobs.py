@@ -2420,25 +2420,20 @@ def _send_message(
 ):
     """
     Low-level helper to send a message via Telegram HTTP API (sync call).
-
-    - chat_id: Telegram chat id
-    - text: message body
-    - reply_markup: dict (will be JSON-encoded) or a pre-encoded JSON string
-    - parse_mode: e.g. "HTML" or "MarkdownV2"
-
-    When parse_mode is provided, we also disable link previews so score tables
-    wrapped in <pre> blocks stay clean.
     """
     import json
     import os
     import httpx
+    import inspect
 
-    # --- DEBUG: log exactly what we're sending (single line, safe) ---
+    # --- DEBUG: who called and what text is being sent ---
     try:
+        fr = inspect.stack()[1]
+        print(f"DEBUG_CALLER: {fr.filename}:{fr.lineno}")
         print("DEBUG_SEND:", text.replace("\n", " | "))
     except Exception:
         pass
-    # -----------------------------------------------------------------
+    # -----------------------------------------------------
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -2453,7 +2448,6 @@ def _send_message(
         data["disable_web_page_preview"] = True
 
     if reply_markup is not None:
-        # keep your original behavior (form-encoded with reply_markup as JSON string)
         data["reply_markup"] = reply_markup if isinstance(reply_markup, str) else json.dumps(reply_markup)
 
     with httpx.Client(timeout=20) as client:
