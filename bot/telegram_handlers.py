@@ -215,121 +215,109 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sub in {"winnersats", "winners-ats"}:
         # Usage: /admin winnersats <week_number> [season_year] [debug]
         if not rest or not rest[0].isdigit():
-            await update.message.reply_text("Usage: /admin winnersats <week_number> [season_year] [debug]")
+            await update.message.reply_text(
+                "Usage: /admin winnersats <week_number> [season_year] [debug]"
+            ) 
             return
 
         week_number = int(rest[0])
-        season_year = int(rest[1]) if len(rest) >= 2 and rest[1].isdigit() else None
-        debug = any(x.lower() == "debug" for x in rest[1:])
+        season_year = None
+        debug_mode = False
 
+        # optional season_year
+        if len(rest) >= 2 and rest[1].isdigit():
+            season_year = int(rest[1])
+
+        # optional "debug"
+        if len(rest) >= 3 and rest[2].lower() == "debug":
+            debug_mode = True
+        elif len(rest) >= 2 and rest[1].lower() == "debug":
+            debug_mode = True
+
+        from bot.jobs import create_app, db, _ats_winner
         from sqlalchemy import text as T
-        from bot.jobs import create_app, db
 
         app = create_app()
         with app.app_context():
             if season_year is None:
                 season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
 
-            # CTE g: compute cover_margin; CTE gw: derive ats_winner
+            # Pull FINAL games for the week
             games = db.session.execute(
                 T("""
-                WITH g AS (
-                    SELECT
-                        g.id,
-                        g.home_team,
-                        g.away_team,
-                        g.home_score,
-                        g.away_score,
-                        g.favorite_team,
-                        g.spread_pts,
-                        CASE
-                            WHEN g.favorite_team IS NULL OR g.spread_pts IS NULL THEN NULL
-                            WHEN LOWER(g.favorite_team) = LOWER(g.home_team)
-                                THEN (COALESCE(g.home_score,0) - COALESCE(g.away_score,0)) - g.spread_pts
-                            WHEN LOWER(g.favorite_team) = LOWER(g.away_team)
-                                THEN (COALESCE(g.away_score,0) - COALESCE(g.home_score,0)) - g.spread_pts
-                            ELSE NULL
-                        END AS cover_margin
-                    FROM games g
-                    JOIN weeks w ON w.id = g.week_id
-                    WHERE w.season_year = :y
-                      AND w.week_number = :w
-                      AND g.status = 'final'
-                ),
-                gw AS (
-                    SELECT
-                        id,
-                        home_team,
-                        away_team,
-                        favorite_team,
-                        spread_pts,
-                        cover_margin,
-                        CASE
-                            WHEN cover_margin IS NULL THEN NULL
-                            WHEN cover_margin > 0 THEN favorite_team
-                            WHEN cover_margin < 0 THEN
-                                CASE
-                                    WHEN LOWER(favorite_team) = LOWER(home_team) THEN away_team
-                                    ELSE home_team
-                                END
-                            ELSE NULL  -- push
-                        END AS ats_winner
-                    FROM g
-                )
-                SELECT * FROM gw ORDER BY id
+                  SELECT g.id, g.home_team, g.away_team, g.home_score, g.away_score,
+                         g.favorite_team, g.spread_pts
+                  FROM games g
+                  JOIN weeks w ON w.id = g.week_id
+                  WHERE w.season_year = :y AND w.week_number = :w AND lower(g.status) = 'final'
+                  ORDER BY g.id
                 """),
                 {"y": season_year, "w": week_number},
             ).mappings().all()
 
             if not games:
-                await update.message.reply_text(f"No FINAL games for Week {week_number} ({season_year}).")
+                await update.message.reply_text(
+                    f"No FINAL games for Week {week_number} ({season_year})."
+                )
                 return
 
-            # Map game_id -> ats_winner
-            ats_by_id = {int(r["id"]): r["ats_winner"] for r in games}
+            # Compute ATS winners per game id (None == push/unknown)
+            winners = {}
+            for g in games:
+                winners[int(g["id"])] = _ats_winner(
+                    g["home_team"], g["away_team"],
+                    g["home_score"], g["away_score"],
+                    g["favorite_team"], g["spread_pts"]
+                )  
 
-            # Count wins
+            # All picks with selections for the week
             picks = db.session.execute(
                 T("""
-                  SELECT p.participant_id, p.selected_team, p.game_id
-                  FROM picks p
-                  JOIN games g ON g.id = p.game_id
-                  JOIN weeks w ON w.id = g.week_id
-                  WHERE w.season_year = :y
-                    AND w.week_number = :w
-                    AND p.selected_team IS NOT NULL
+                   SELECT p.participant_id, p.selected_team, p.game_id
+                   FROM picks p
+                   JOIN games g ON g.id = p.game_id
+                   JOIN weeks w ON w.id = g.week_id
+                   WHERE w.season_year = :y AND w.week_number = :w
+                      AND p.selected_team IS NOT NULL
                 """),
                 {"y": season_year, "w": week_number},
             ).mappings().all()
 
+            # Name lookup
             names = dict(db.session.execute(T("SELECT id, name FROM participants")).fetchall())
 
-            wins = {}
-            debug_lines = []
-            for p in picks:
-                gid = int(p["game_id"])
-                ats = ats_by_id.get(gid)
-                if not ats:  # no spread / push
-                    continue
-                picked = (p["selected_team"] or "").strip()
-                if picked and ats and picked.lower() == ats.lower():
-                    wins[p["participant_id"]] = wins.get(p["participant_id"], 0) + 1
-                    if debug:
-                        debug_lines.append(f"+ {names.get(p['participant_id'], p['participant_id'])} ✓ ({picked}) on g{gid} [{ats}]")
-                elif debug:
-                    debug_lines.append(f"- {names.get(p['participant_id'], p['participant_id'])} × ({picked}) on g{gid} [ATS={ats}]")
+        # Tally wins (case-insensitive, ignore pushes)
+        score = {}
+        detail_lines = []
+        for p in picks:
+            gid = int(p["game_id"])
+            wt = winners.get(gid)
+            sel = (p["selected_team"] or "").strip()
+            if not wt:
+                # push or unknown—skip
+                continue
+            if sel.lower() == wt.strip().lower():
+                score[p["participant_id"]] = score.get(p["participant_id"], 0) + 1
+                if debug_mode:
+                    detail_lines.append(f"+ {names.get(p['participant_id'], p['participant_id'])} ✓ ({sel}) on g{gid} [{wt}]")
+            else:
+                if debug_mode:
+                    detail_lines.append(f"- {names.get(p['participant_id'], p['participant_id'])} × ({sel}) on g{gid} [ATS={wt}]")
 
-        if not wins:
-            await update.message.reply_text(f"No ATS wins computed for Week {week_number} ({season_year}).")
+        if not score:
+            await update.message.reply_text(
+                f"No ATS wins computed for Week {week_number} ({season_year})."
+            )
             return
 
+        # Pretty summary (sort by wins desc, then name)
         lines = [
-            f"{names.get(pid, pid)} — {cnt}"
-            for pid, cnt in sorted(wins.items(), key=lambda x: (-x[1], names.get(x[0], "")))
+            f"{names.get(pid, pid)} — {wins}"
+            for pid, wins in sorted(score.items(), key=lambda x: (-x[1], names.get(x[0], "")))
         ]
         msg = f"ATS winners (dry run) — Week {week_number} ({season_year}):\n" + "\n".join(lines)
-        if debug and debug_lines:
-            msg += "\n\nDetails:\n" + "\n".join(debug_lines)
+        if debug_mode and detail_lines:
+            msg += "\n\nDetails:\n" + "\n".join(detail_lines)
         await update.message.reply_text(msg)
         return
 
