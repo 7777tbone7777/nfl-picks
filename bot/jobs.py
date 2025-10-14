@@ -2309,55 +2309,58 @@ def _send_message(
         resp = client.post(url, data=data)
         resp.raise_for_status()
 
-# --- helper just once, near _pt(...) ---
 def _spread_label(game) -> str:
+    """
+    'fav: Jaguars  -3.5'  or 'TBD' if no odds yet.
+    Accepts ORM object or mapping.
+    """
     fav = getattr(game, "favorite_team", None)
     spr = getattr(game, "spread_pts", None)
     if fav and spr is not None:
-        s = float(spr)
+        try:
+            s = float(spr)
+        except Exception:
+            return "TBD"
         sign = "-" if s > 0 else "+" if s < 0 else "±"
         return f"fav: {fav}  {sign}{abs(s):g}"
     return "TBD"
 
-
-def send_week_games(week_number: int, season_year: int):
+def send_week_games(week_number: int, season_year: int) -> None:
     """Send Week games with inline buttons to all participants who have telegram_chat_id."""
     app = create_app()
     with app.app_context():
         week = Week.query.filter_by(week_number=week_number, season_year=season_year).first()
         if not week:
-            logger.error(f"❌ No week found for {season_year} W{week_number}")
+            logger.error("❌ No week found for %s W%s", season_year, week_number)
             return
 
         games = Game.query.filter_by(week_id=week.id).order_by(Game.game_time).all()
         if not games:
-            logger.error(f"❌ No games found for {season_year} W{week_number}")
+            logger.error("❌ No games found for %s W%s", season_year, week_number)
             return
 
         participants = Participant.query.filter(Participant.telegram_chat_id.isnot(None)).all()
+
         for part in participants:
             chat_id = str(part.telegram_chat_id)
+
             for g in games:
-                # Build inline keyboard (unchanged)
                 kb = {
-                   "inline_keyboard": [
-                    [{"text": g.away_team, "callback_data": f"pick:{g.id}:{g.away_team}"}],
-                    [{"text": g.home_team, "callback_data": f"pick:{g.id}:{g.home_team}"}],
-                   ]
+                    "inline_keyboard": [
+                        [{"text": g.away_team, "callback_data": f"pick:{g.id}:{g.away_team}"}],
+                        [{"text": g.home_team, "callback_data": f"pick:{g.id}:{g.home_team}"}],
+                    ]
                 }
 
                 # 3-line message: matchup, kickoff (PT), spread label
                 text = f"{g.away_team} @ {g.home_team}\n{_pt(g.game_time)}\n{_spread_label(g)}"
 
                 try:
-                    _send_message(str(part.telegram_chat_id), text, reply_markup=kb)
-                    logger.info(
-                        "✅ Sent game to %s: %s | %s",
-                        part.name, f"{g.away_team} @ {g.home_team}", _spread_label(g)
-                   )
-               except Exception as e:
-                   logger.exception("❌ Failed to send game message: %s", e)
-
+                    _send_message(chat_id, text, reply_markup=kb)
+                except Exception as e:
+                    logger.exception("❌ Failed to send game %s -> %s: %s", g.id, part.name, e)
+                else:
+                    logger.info("✅ Sent game %s to %s", g.id, part.name)
  
 # --- /sendweek admin command (additive, with DRY and ME) ---
 async def sendweek_command(update, context):
