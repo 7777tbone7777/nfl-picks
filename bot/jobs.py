@@ -1,4 +1,4 @@
-# flake8: noqanimport asyncio
+#flake8: noqanimport asyncio
 import json
 import logging
 import os
@@ -28,14 +28,12 @@ ADMIN_IDS = {
 # Regular season = seasontype=2. Preseason(1), Postseason(3).
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 
-
+# --- Import a week from ESPN, including spreads (idempotent) ------------------
 def import_week_from_espn(season_year: int, week: int) -> dict:
     """
-    Ensure (season_year, week) exists in weeks; upsert all games for that week
-    from ESPN into games (home/away/time/status/scores). Idempotent.
+    Ensure (season_year, week) exists; upsert games + scores + odds (favorite & spread).
     """
     from datetime import datetime, timezone
-
     from sqlalchemy import text as _text
 
     app = create_app()
@@ -48,7 +46,7 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
                 VALUES (:y, :w)
                 ON CONFLICT (season_year, week_number) DO NOTHING
                 RETURNING id
-            """
+                """
             ),
             {"y": season_year, "w": week},
         ).first()
@@ -70,13 +68,15 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             try:
                 dt = datetime.fromisoformat(s)
                 if dt.tzinfo:
-                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)  # store naive UTC
+                    # store as naive UTC to match your schema
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
                 return dt
             except Exception:
                 return None
 
         created = 0
         updated = 0
+
         for e in events:
             away = (e.get("away_team") or "").strip()
             home = (e.get("home_team") or "").strip()
@@ -84,39 +84,49 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             status = state_to_status.get((e.get("state") or "").lower(), "scheduled")
             home_score = e.get("home_score")
             away_score = e.get("away_score")
+            favorite_team = e.get("favorite_team")
+            spread_pts = e.get("spread_pts")
 
+            # Try update existing game (match by teams within the week)
             res = db.session.execute(
                 _text(
                     """
                     UPDATE games
-                    SET game_time = COALESCE(:game_time, game_time),
-                        status     = COALESCE(:status, status),
-                        home_score = COALESCE(:home_score, home_score),
-                        away_score = COALESCE(:away_score, away_score)
+                    SET game_time     = COALESCE(:game_time, game_time),
+                        status        = COALESCE(:status, status),
+                        home_score    = COALESCE(:home_score, home_score),
+                        away_score    = COALESCE(:away_score, away_score),
+                        favorite_team = COALESCE(:favorite_team, favorite_team),
+                        spread_pts    = COALESCE(:spread_pts, spread_pts)
                     WHERE week_id=:week_id
                       AND lower(home_team)=lower(:home)
                       AND lower(away_team)=lower(:away)
-                """
+                    """
                 ),
                 {
                     "game_time": start_dt,
                     "status": status,
                     "home_score": home_score,
                     "away_score": away_score,
+                    "favorite_team": favorite_team,
+                    "spread_pts": spread_pts,
                     "week_id": week_id,
                     "home": home,
                     "away": away,
                 },
             )
             if res.rowcount == 0:
+                # Insert new
                 db.session.execute(
                     _text(
                         """
                         INSERT INTO games
-                            (week_id, home_team, away_team, game_time, status, home_score, away_score)
+                            (week_id, home_team, away_team, game_time, status,
+                             home_score, away_score, favorite_team, spread_pts)
                         VALUES
-                            (:week_id, :home, :away, :game_time, :status, :home_score, :away_score)
-                    """
+                            (:week_id, :home, :away, :game_time, :status,
+                             :home_score, :away_score, :favorite_team, :spread_pts)
+                        """
                     ),
                     {
                         "week_id": week_id,
@@ -126,6 +136,8 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
                         "status": status,
                         "home_score": home_score,
                         "away_score": away_score,
+                        "favorite_team": favorite_team,
+                        "spread_pts": spread_pts,
                     },
                 )
                 created += 1
@@ -140,6 +152,8 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
             "created": created,
             "updated": updated,
         }
+
+
 def ats_winners_for_week(week_number: int, season_year: int | None = None):
     """
     Compute Against-The-Spread winners for the given week, then count each participant's
@@ -771,88 +785,124 @@ def detect_current_context(timeout: float = 15.0):
     week = int(j["week"]["number"])
     return year, int(st), week
 
-
-def fetch_espn_scoreboard(week: int, season_year: int):
+# --- ESPN scoreboard: fetch + (optional) spread parsing ----------------------
+def fetch_espn_scoreboard(week: int, season_year: int) -> list[dict]:
     """
-    Returns a list of dicts like:
-      {
-        "away_team": "Washington Commanders",
-        "home_team": "Green Bay Packers",
-        "away_score": 18 (or None),
-        "home_score": 27 (or None),
-        "state": "post" | "in" | "pre",
-        "winner": "Green Bay Packers" | None
-      }
-    Does not touch the database.
+    Returns a list of games with:
+      - away_team, home_team (full display names)
+      - start_time (ISO string or None)
+      - state ('pre'|'in'|'post')
+      - away_score, home_score (ints or None)
+      - favorite_team (full name or None)
+      - spread_pts (Decimal/float or None; positive means favorite gives points)
     """
-    import httpx
+    import json
+    from decimal import Decimal
 
-    with httpx.Client(timeout=15.0, headers={"User-Agent": "nfl-picks-bot/1.0"}) as client:
-        # Try both parameter styles ESPN uses. First that succeeds wins.
-        urls = [
-            f"{ESPN_SCOREBOARD_URL}?week={week}&dates={season_year}&seasontype=2",
-            f"{ESPN_SCOREBOARD_URL}?week={week}&year={season_year}&seasontype=2",
-        ]
-        resp = None
-        for u in urls:
-            r = client.get(u)
-            if r.status_code < 400:
-                resp = r
-                break
-        if resp is None:
-            # propagate the last error for visibility
-            r.raise_for_status()
-        data = resp.json()
-        try:
-            logger.info("ESPN scoreboard URL used: %s", str(resp.request.url))
-        except Exception:
-            pass
+    # ESPN NFL scoreboard v2
+    url = (
+        "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
+        f"?week={week}&dates={season_year}&seasontype=2"
+    )
 
-    out = []
+    r = httpx.get(url, timeout=20.0)
+    r.raise_for_status()
+    data = r.json()
+
+    out: list[dict] = []
     for ev in data.get("events", []):
-        try:
-            comp = ev["competitions"][0]
-            status = comp.get("status", {}).get("type", {})
-            state = (status.get("state") or "").lower()  # "pre" | "in" | "post"
+        comps = ev.get("competitions", []) or [{}]
+        comp = comps[0]
+        competitors = comp.get("competitors", []) or []
 
-            home = next(t for t in comp["competitors"] if t.get("homeAway") == "home")
-            away = next(t for t in comp["competitors"] if t.get("homeAway") == "away")
+        # Home/away names & scores
+        home = next((c for c in competitors if c.get("homeAway") == "home"), {})
+        away = next((c for c in competitors if c.get("homeAway") == "away"), {})
 
-            home_name = home["team"]["displayName"]
-            away_name = away["team"]["displayName"]
+        home_name = (home.get("team", {}).get("displayName") or "").strip()
+        away_name = (away.get("team", {}).get("displayName") or "").strip()
 
-            # Scores may be "", None, or a string number.
-            def _to_int(x):
+        def _int_or_none(x):
+            try:
+                return int(x) if x is not None and str(x).strip() != "" else None
+            except Exception:
+                return None
+
+        home_score = _int_or_none(home.get("score"))
+        away_score = _int_or_none(away.get("score"))
+
+        # Game state
+        status_raw = (ev.get("status", {}) or {}).get("type", {}) or {}
+        state = (status_raw.get("state") or "").lower()  # 'pre' | 'in' | 'post'
+
+        # Kick time (if present)
+        start_time = ev.get("date") or comp.get("date")
+
+        # -------- odds / pickcenter parsing (best-effort) --------
+        favorite_team = None
+        spread_pts = None
+
+        # ESPN puts odds either under competition['odds'] or ['pickcenter'].
+        # We try both; take the first with a numeric spread.
+        odds_blocks = comp.get("odds") or comp.get("pickcenter") or []
+        if odds_blocks:
+            # Typical shapes:
+            #   {'details': 'Jaguars -3.5', 'overUnder': 46.5, ...}
+            #   {'displayName': 'Caesars', 'spread': -3.5, 'favorite': 'Jaguars'}  (varies)
+            ob = odds_blocks[0] or {}
+            details = (ob.get("details") or "").strip()
+            # Try explicit numeric field first
+            spread_val = ob.get("spread")
+            fav_name = ob.get("favorite")
+
+            # If not present, parse 'details' like "Kansas City Chiefs -3.5"
+            if spread_val is None and details:
                 try:
-                    return int(x)
+                    # split on last space to keep full team name left side
+                    # e.g. "Jacksonville Jaguars -3.5"
+                    team_part, num_part = details.rsplit(" ", 1)
+                    spread_val = float(num_part.replace("½", ".5"))
+                    fav_name = team_part.strip()
                 except Exception:
-                    return None
+                    pass
 
-            hs = _to_int(home.get("score"))
-            as_ = _to_int(away.get("score"))
+            # Normalize favorite to one of our display names, case-insensitive
+            if fav_name:
+                if fav_name.strip().lower() == home_name.lower():
+                    favorite_team = home_name
+                elif fav_name.strip().lower() == away_name.lower():
+                    favorite_team = away_name
+                else:
+                    # Sometimes details uses nickname (e.g., "Jaguars").
+                    # Fuzzy contains check:
+                    low = fav_name.strip().lower()
+                    if low in home_name.lower():
+                        favorite_team = home_name
+                    elif low in away_name.lower():
+                        favorite_team = away_name
 
-            # Winner from ESPN if flagged, else derive from scores if final/non-tie
-            winner = None
-            if home.get("winner") is True:
-                winner = home_name
-            elif away.get("winner") is True:
-                winner = away_name
-            elif hs is not None and as_ is not None and hs != as_ and state == "post":
-                winner = home_name if hs > as_ else away_name
+            if spread_val is not None:
+                try:
+                    spread_pts = Decimal(str(spread_val))
+                except Exception:
+                    try:
+                        spread_pts = Decimal(str(float(spread_val)))
+                    except Exception:
+                        spread_pts = None
 
-            out.append(
-                {
-                    "away_team": away_name,
-                    "home_team": home_name,
-                    "away_score": as_,
-                    "home_score": hs,
-                    "state": state,  # "pre", "in", "post"
-                    "winner": winner,  # may be None if not final yet or tie
-                }
-            )
-        except Exception:
-            # Be resilient to any weird ESPN edge cases
-            continue
+        out.append(
+            {
+                "away_team": away_name,
+                "home_team": home_name,
+                "start_time": start_time,
+                "state": state,  # 'pre'|'in'|'post'
+                "away_score": away_score,
+                "home_score": home_score,
+                "favorite_team": favorite_team,
+                "spread_pts": spread_pts,
+            }
+        )
+
     return out
 
 
@@ -2259,6 +2309,21 @@ def _send_message(
         resp = client.post(url, data=data)
         resp.raise_for_status()
 
+def _spread_label(game) -> str:
+    """
+    Returns a short label like:
+      'fav: Jaguars  -3.5'  or 'TBD' if no odds yet.
+    Accepts either ORM object with attributes or mapping dict.
+    """
+    fav = getattr(game, "favorite_team", None)
+    spr = getattr(game, "spread_pts", None)
+    if fav and spr is not None:
+        s = float(spr)
+        sign = "-" if s > 0 else "+" if s < 0 else "±"
+        return f"fav: {fav}  {sign}{abs(s):g}"
+    return "TBD"
+
+
 def send_week_games(week_number: int, season_year: int):
     """Send Week games with inline buttons to all participants who have telegram_chat_id."""
     app = create_app()
@@ -2280,40 +2345,21 @@ def send_week_games(week_number: int, season_year: int):
                 # Build inline keyboard (unchanged)
                 kb = {
                     "inline_keyboard": [
-                        [
-                            {"text": g.away_team, "callback_data": f"pick:{g.id}:{g.away_team}"}
-                        ],
-                        [
-                            {"text": g.home_team, "callback_data": f"pick:{g.id}:{g.home_team}"}
-                        ],
+                        [{"text": g.away_team, "callback_data": f"pick:{g.id}:{g.away_team}"}],
+                        [{"text": g.home_team, "callback_data": f"pick:{g.id}:{g.home_team}"}],
                     ]
                 }
 
-                # Base label
-                label = f"{g.away_team} @ {g.home_team}"
-
-                # Append odds if we have them and the favorite matches one side
-                odds_suffix = ""
-                if getattr(g, "favorite_team", None) and getattr(g, "spread_pts", None) is not None:
-                    fav = (g.favorite_team or "").strip()
-                    # Only show if favorite matches one of the teams
-                    if fav.lower() in {g.home_team.strip().lower(), g.away_team.strip().lower()}:
-                        try:
-                            sp = float(g.spread_pts)
-                            # Positive number = points the favorite gives
-                            odds_suffix = f"  ({fav} -{sp:g})"
-                        except Exception:
-                            pass  # leave off if spread isn't a valid number
-
-                # Final text with kickoff time on the next line
-                text = f"{label}{odds_suffix}\n{_pt(g.game_time)}"
+                # 3-line message: matchup, kickoff PT, spread label
+                text = f"{g.away_team} @ {g.home_team}\n{_pt(g.game_time)}\n{_spread_label(g)}"
 
                 try:
                     _send_message(chat_id, text, reply_markup=kb)
-                    logger.info(f"✅ Sent game to {part.name}: {label}{odds_suffix}")
-                except Exception as e:
-                    logger.exception("❌ Failed to send game message: %s", e)
-
+                    logger.info(
+                        "✅ Sent game to %s: %s | %s",
+                        part.name, f"{g.away_team} @ {g.home_team}", _spread_label(g)
+                    )
+ 
 # --- /sendweek admin command (additive, with DRY and ME) ---
 async def sendweek_command(update, context):
     """
