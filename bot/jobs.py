@@ -2533,38 +2533,35 @@ async def sendweek_command(update, context):
             .order_by(Week.season_year.desc())
             .first()
         )
+     def _send_to_one(participant_id: int, chat_id: str, season_year: int):
+         rows = (
+             db.session.execute(
+                 text("""
+                     select g.id, g.away_team, g.home_team,
+                            g.game_time, g.favorite_team, g.spread_pts
+                     from games g
+                     join weeks w on w.id=g.week_id
+                     left join picks p on p.game_id=g.id and p.participant_id=:pid
+                     where w.season_year=:y and w.week_number=:w
+                       and (p.id is null or p.selected_team is null)
+                     order by g.game_time nulls last, g.id
+                 """),
+                 {"pid": participant_id, "y": season_year, "w": week_number},
+             ).mappings().all()
+         )
 
-    def _send_to_one(participant_id: int, chat_id: str, season_year: int) -> int:
-        rows = (
-            db.session.execute(
-                T("""
-                    select g.id, g.away_team, g.home_team, g.game_time,
-                           g.favorite_team, g.spread_pts
-                    from games g
-                    join weeks w on w.id = g.week_id
-                    left join picks p on p.game_id = g.id and p.participant_id = :pid
-                    where w.season_year = :y and w.week_number = :w
-                      and (p.id is null or p.selected_team is null)
-                    order by g.game_time nulls last, g.id
-                """),
-                {"pid": participant_id, "y": season_year, "w": week_number},
-            )
-            .mappings()
-            .all()
-        )
-
-        sent = 0
-        for g in rows:
-            kb = {
-                "inline_keyboard": [
-                    [{"text": g["away_team"], "callback_data": f"pick:{g['id']}:{g['away_team']}"}],
-                    [{"text": g["home_team"], "callback_data": f"pick:{g['id']}:{g['home_team']}"}],
-                ]
-            }
-            msg = f"{g['away_team']} @ {g['home_team']}\n{_pt(g['game_time'])}\n{_spread_label(g)}"
-            _send_message(str(chat_id), msg, reply_markup=kb)
-            sent += 1
-        return sent
+         sent = 0
+         for g in rows:
+             kb = {
+                 "inline_keyboard": [
+                     [{"text": g["away_team"], "callback_data": f"pick:{g['id']}:{g['away_team']}"}],
+                     [{"text": g["home_team"], "callback_data": f"pick:{g['id']}:{g['home_team']}"}],
+                 ]
+             }
+             text_msg = f"{g['away_team']} @ {g['home_team']}\n{_pt(g['game_time'])}\n{_spread_label(g)}"
+             _send_message(str(chat_id), text_msg, reply_markup=kb)
+             sent += 1
+         return sent
 
     # Targeted modes first (no auto-create)
     if target.lower() in ("dry", "me") or target.lower() not in ("all",):
