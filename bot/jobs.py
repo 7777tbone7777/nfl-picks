@@ -2794,6 +2794,12 @@ if __name__ == "__main__":
         #   python jobs.py import-week-upcoming
         print(json.dumps(cron_import_upcoming_week()))
 
+    elif cmd == "import-odds-upcoming":
+        # Refresh spreads for the upcoming week from The Odds API:
+        #   python jobs.py import-odds-upcoming
+        import_odds_upcoming()   # <-- call the function you added above
+        print(json.dumps({"status": "odds_imported"}))
+
     elif cmd == "announce-winners":
         # Tuesday-guarded: announce last week's winners + season totals
         print(json.dumps(cron_announce_weekly_winners()))
@@ -2920,6 +2926,7 @@ if __name__ == "__main__":
             "  python jobs.py sendweek <week> [season_year]\n"
             "  python jobs.py import-week <season_year> <week>\n"
             "  python jobs.py import-week-upcoming\n"
+            "  python jobs.py import-odds-upcoming\n"
             "  python jobs.py announce-winners\n"
             "  python jobs.py announce-winners-now\n"
         )
