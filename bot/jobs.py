@@ -1,6 +1,7 @@
 #flake8: noqanimport asyncio
 import json
 import logging
+import urllib.request
 import os
 import sys
 from datetime import datetime, timezone
@@ -27,6 +28,152 @@ ADMIN_IDS = {
 }
 
 PT = ZoneInfo("America/Los_Angeles")
+
+# -------- ESPN odds import (isolated helper) ---------------------------------
+
+# Public scoreboard endpoint:
+# Example: https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=2&year=2025&week=7
+ESPN_SCOREBOARD = (
+    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+    "?seasontype=2&year={year}&week={week}"
+)
+
+def _safe(s):
+    return (s or "").strip().lower()
+
+def _parse_odds_from_competition(comp: dict) -> tuple[str | None, float | None]:
+    """
+    Returns (favorite_team_display_name, spread_float) if odds are present,
+    else (None, None).
+
+    ESPN odds shape we rely on:
+      comp["odds"][0]["details"]  -> e.g. "PIT -5.5" or "DET -2.5"
+      comp["competitors"][i]["team"]["abbreviation"] / ["displayName"]
+    """
+    odds = (comp.get("odds") or [])
+    if not odds:
+        return (None, None)
+
+    first = odds[0] or {}
+    details = (first.get("details") or "").strip()
+    if not details:
+        return (None, None)
+
+    # details format like "PIT -5.5". Split on last space to be safe.
+    parts = details.rsplit(" ", 1)
+    if len(parts) != 2:
+        return (None, None)
+
+    fav_abbr, spread_txt = parts[0].strip(), parts[1].strip()
+    try:
+        spread = float(spread_txt.replace("½", ".5"))
+    except Exception:
+        return (None, None)
+
+    # map abbreviation -> displayName using the two competitors
+    fav_display = None
+    for c in comp.get("competitors", []):
+        team = c.get("team") or {}
+        if _safe(team.get("abbreviation")) == _safe(fav_abbr):
+            fav_display = team.get("displayName")
+            break
+
+    return (fav_display, spread if fav_display else None)
+
+def import_odds_from_espn(season_year: int, week: int, *, dry_run: bool = False) -> dict:
+    """
+    Fetch odds for (season_year, week) and update games.favorite_team/spread_pts.
+
+    Matching rule:
+      - We build a key "away @ home" using ESPN event competitors' displayName,
+        and match against your games rows by lowercased away/home team strings.
+
+    Returns a summary dict with counts.
+    """
+    # 1) Fetch JSON
+    url = ESPN_SCOREBOARD.format(year=season_year, week=week)
+    with urllib.request.urlopen(url, timeout=20) as r:
+        data = json.load(r)
+
+    events = data.get("events") or []
+    if not events:
+        return {"status": "no_events", "season_year": season_year, "week": week, "updated": 0, "skipped": 0}
+
+    # 2) Build a lookup from (away, home) -> (fav, spread)
+    # ESPN puts competitors in an arbitrary order; we compute who is home.
+    matchup_to_odds: dict[tuple[str, str], tuple[str, float]] = {}
+
+    for ev in events:
+        comps = ((ev.get("competitions") or [{}])[0]).get("competitors") or []
+        if len(comps) < 2:
+            continue
+        # ESPN marks home with "homeAway": "home" | "away"
+        home = next((c for c in comps if _safe(c.get("homeAway")) == "home"), None)
+        away = next((c for c in comps if _safe(c.get("homeAway")) == "away"), None)
+        if not home or not away:
+            continue
+
+        home_name = ((home.get("team") or {}).get("displayName") or "").strip()
+        away_name = ((away.get("team") or {}).get("displayName") or "").strip()
+        if not home_name or not away_name:
+            continue
+
+        fav_name, spread = _parse_odds_from_competition((ev.get("competitions") or [{}])[0])
+        if fav_name and spread is not None:
+            matchup_to_odds[(away_name.lower(), home_name.lower())] = (fav_name, float(spread))
+
+    # 3) Read your games for that week and apply updates
+    updated = 0
+    skipped = 0
+
+    rows = db.session.execute(
+        T("""
+        SELECT g.id, g.away_team, g.home_team, g.favorite_team, g.spread_pts
+        FROM games g
+        JOIN weeks w ON w.id = g.week_id
+        WHERE w.season_year = :y AND w.week_number = :w
+        ORDER BY g.id
+        """),
+        {"y": season_year, "w": week},
+    ).mappings().all()
+
+    for g in rows:
+        key = (g["away_team"].strip().lower(), g["home_team"].strip().lower())
+        if key not in matchup_to_odds:
+            skipped += 1
+            continue
+
+        fav_name, spread = matchup_to_odds[key]
+
+        # Only write if something changed or was missing
+        cur_fav = (g["favorite_team"] or "").strip()
+        cur_spr = g["spread_pts"]
+        needs = (cur_fav != fav_name) or (cur_spr is None) or (float(cur_spr) != float(spread))
+
+        if not needs:
+            skipped += 1
+            continue
+
+        if not dry_run:
+            db.session.execute(
+                T("UPDATE games SET favorite_team=:f, spread_pts=:s WHERE id=:id"),
+                {"f": fav_name, "s": spread, "id": g["id"]},
+            )
+        updated += 1
+
+    if not dry_run and updated:
+        db.session.commit()
+
+    return {
+        "status": "ok",
+        "season_year": season_year,
+        "week": week,
+        "events": len(events),
+        "updated": updated,
+        "skipped": skipped,
+    }
+# -------- end ESPN odds import ----------------------------------------------
+
 
 def _pt(dt_utc) -> str:
     """
