@@ -13,6 +13,7 @@ from telegram.ext import CommandHandler, ContextTypes
 
 from flask_app import create_app
 from models import Game, Participant, Pick, Week, db
+import json, re, urllib.request
 
 # Logging
 logging.basicConfig(level=logging.INFO)
