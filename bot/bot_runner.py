@@ -1,5 +1,6 @@
 # bot/bot_runner.py
 from __future__ import annotations
+from bot.telegram_handlers import seasonboard_command
 
 import logging
 import os
