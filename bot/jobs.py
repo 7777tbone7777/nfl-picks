@@ -61,8 +61,9 @@ def import_odds_upcoming():
             SELECT w.season_year AS season, w.week_number AS week
             FROM games g
             JOIN weeks w ON w.id = g.week_id
-            WHERE g.game_time IS NULL OR g.game_time > NOW()
-            ORDER BY w.season_year, w.week_number
+            WHERE g.game_time > NOW()
+            GROUP BY w.season_year, w.week_number
+            ORDER BY MIN(g.game_time) ASC
             LIMIT 1
         """)).mappings().first()
         if not r:
