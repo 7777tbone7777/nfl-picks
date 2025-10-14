@@ -1,4 +1,5 @@
 # bot/telegram_handlers.py
+
 from __future__ import annotations
 # add these
 
@@ -293,19 +294,6 @@ async def sendweek_command(update, context):
         return
     week_number = int(args[0])
     target = "all" if len(args) == 1 else " ".join(args[1:]).strip()
-
-    # ---- Small helpers (SQL only; no ORM classes needed) ----
-    def _spread_label(row) -> str:
-        fav = row.get("favorite_team")
-        spr = row.get("spread_pts")
-        if fav and spr is not None:
-            try:
-                s = float(spr)
-            except Exception:
-                return "TBD"
-            sign = "-" if s > 0 else "+" if s < 0 else "±"
-            return f"fav: {fav}  {sign}{abs(s):g}"
-        return "TBD"
 
     def _build_text(g):
         # g['game_time'] is a naive/UTC dt in DB; _pt will handle to local label you've set up
