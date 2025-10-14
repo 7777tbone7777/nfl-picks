@@ -38,95 +38,192 @@ ESPN_SCOREBOARD = (
     "?seasontype=2&year={year}&week={week}"
 )
 
-def import_odds_upcoming():
+def import_odds_upcoming() -> dict:
     """
-    Refresh spreads for the upcoming week from The Odds API
-    and write into games.favorite_team / games.spread_pts.
-    Safe to run multiple times.
+    Refresh spreads for the upcoming week from The Odds API and write into
+    games.favorite_team / games.spread_pts.
+
+    - Tuesday guard in PT (overridable with ALLOW_ANYDAY)
+    - Idempotent: safe to run multiple times
+    - Picks a priority book; falls back to any book that has 'spreads'
+    - Always stores the favorite's line as a NEGATIVE number
     """
-    import os, datetime as dt, requests
+    import os
+    import datetime as dt
     from decimal import Decimal
+    from zoneinfo import ZoneInfo
+    import requests
     from sqlalchemy import text as T
+
     from flask_app import create_app
     from models import db
 
+    # --------- Tuesday guard (PT), with ALLOW_ANYDAY override ----------
+    now_pt = dt.datetime.now(ZoneInfo("America/Los_Angeles"))
+    allow_anyday = os.getenv("ALLOW_ANYDAY", "").strip().lower() in {"1", "true", "yes", "on"}
+    if not allow_anyday and now_pt.weekday() != 1:  # Monday=0, Tuesday=1
+        msg = {"ok": False, "reason": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
+        print(msg)
+        return msg
+
+    # --------- API key ----------
     API = os.environ.get("ODDS_API_KEY")
     if not API:
-        print("ODDS_API_KEY not set"); return
+        msg = {"ok": False, "error": "ODDS_API_KEY not set"}
+        print(msg)
+        return msg
 
-    app = create_app()                     # <-- create app
-    with app.app_context():                # <-- now app is defined
-        # detect the next week having a future kickoff
-        r = db.session.execute(T("""
-            SELECT w.season_year AS season, w.week_number AS week
-            FROM games g
-            JOIN weeks w ON w.id = g.week_id
-            WHERE g.game_time > NOW()
+    # --------- App / DB ----------
+    app = create_app()
+    with app.app_context():
+        # 1) Find the upcoming week (first kickoff in the future)
+        wk = db.session.execute(
+            T("""
+              SELECT w.season_year AS season, w.week_number AS week, MIN(g.game_time) AS first_kick
+                FROM weeks w
+                JOIN games g ON g.week_id = w.id
+               WHERE g.game_time > NOW()
             GROUP BY w.season_year, w.week_number
-            ORDER BY MIN(g.game_time) ASC
-            LIMIT 1
-        """)).mappings().first()
-        if not r:
-            print("No upcoming week found"); return
-        SEASON, WEEK = int(r["season"]), int(r["week"])
+            ORDER BY first_kick
+               LIMIT 1
+            """)
+        ).mappings().first()
 
-        # load games for that week
-        games = db.session.execute(T("""
-          SELECT g.id, g.away_team, g.home_team
-          FROM games g
-          JOIN weeks w ON w.id = g.week_id
-          WHERE w.season_year=:y AND w.week_number=:w
-        """), {"y": SEASON, "w": WEEK}).mappings().all()
-        key = {((g["away_team"] or "").strip().casefold(),
-                (g["home_team"] or "").strip().casefold()): g["id"] for g in games}
+        if not wk:
+            msg = {"ok": False, "error": "no_upcoming_week"}
+            print(msg)
+            return msg
 
-        # fetch OddsAPI
-        SPORT="americanfootball_nfl"
-        DATE_FROM=(dt.datetime.utcnow()-dt.timedelta(days=3)).strftime("%Y-%m-%dT00:00:00Z")
-        DATE_TO  =(dt.datetime.utcnow()+dt.timedelta(days=14)).strftime("%Y-%m-%dT00:00:00Z")
-        url=f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds"
-        params=dict(apiKey=API, regions="us", markets="spreads", oddsFormat="american",
-                    dateFormat="iso", commenceTimeFrom=DATE_FROM, commenceTimeTo=DATE_TO)
-        ev = requests.get(url, params=params, timeout=30).json()
+        SEASON, WEEK = int(wk["season"]), int(wk["week"])
 
-        BOOK_PRIORITY = ["DraftKings","BetMGM","FanDuel","BetOnline.ag","BetRivers","BetUS","Bovada"]
+        # 2) Load that week's games; build a lookup by (away, home)
+        rows = db.session.execute(
+            T("""
+              SELECT g.id, g.away_team, g.home_team
+                FROM games g
+                JOIN weeks w ON w.id = g.week_id
+               WHERE w.season_year=:y AND w.week_number=:w
+            """),
+            {"y": SEASON, "w": WEEK},
+        ).mappings().all()
+
+        if not rows:
+            msg = {"ok": False, "error": "no_games_for_week", "season": SEASON, "week": WEEK}
+            print(msg)
+            return msg
+
+        # Normalize for robust matching
+        def norm(s: str) -> str:
+            return (s or "").strip().casefold()
+
+        game_id_by_teams = {
+            (norm(r["away_team"]), norm(r["home_team"])): int(r["id"]) for r in rows
+        }
+
+        # 3) Fetch OddsAPI once (3 days back → 14 days forward)
+        SPORT = "americanfootball_nfl"
+        DATE_FROM = (dt.datetime.utcnow() - dt.timedelta(days=3)).strftime("%Y-%m-%dT00:00:00Z")
+        DATE_TO   = (dt.datetime.utcnow() + dt.timedelta(days=14)).strftime("%Y-%m-%dT00:00:00Z")
+        url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds"
+
+        params = dict(
+            apiKey=API,
+            regions="us",
+            markets="spreads",
+            oddsFormat="american",
+            dateFormat="iso",
+            commenceTimeFrom=DATE_FROM,
+            commenceTimeTo=DATE_TO,
+        )
+
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            events = resp.json()
+            if not isinstance(events, list):
+                raise ValueError("Unexpected OddsAPI payload")
+        except Exception as e:
+            msg = {"ok": False, "error": f"odds_api_request_failed: {e}"}
+            print(msg)
+            return msg
+
+        # 4) Choose spreads from a priority book, else any book that has 'spreads'
+        BOOK_PRIORITY = ["DraftKings", "BetMGM", "FanDuel", "BetOnline.ag", "BetRivers", "BetUS", "Bovada"]
 
         def pick_outcomes(bookmakers):
-            by = {bm["title"]: bm for bm in bookmakers}
+            # Return outcomes list for the chosen spreads market or None
+            by_title = {bm.get("title"): bm for bm in (bookmakers or []) if isinstance(bm, dict)}
+            # Try priority order first
             for name in BOOK_PRIORITY:
-                bm = by.get(name)
-                if not bm: continue
+                bm = by_title.get(name)
+                if not bm:
+                    continue
                 for mk in bm.get("markets", []):
                     if mk.get("key") == "spreads" and mk.get("outcomes"):
-                        return mk["outcomes"]
-            for bm in bookmakers:
+                        return mk["outcomes"], name
+            # Fallback: first spreads market found
+            for bm in (bookmakers or []):
                 for mk in bm.get("markets", []):
                     if mk.get("key") == "spreads" and mk.get("outcomes"):
-                        return mk["outcomes"]
-            return None
+                        return mk["outcomes"], bm.get("title")
+            return None, None
 
         updated = 0
-        for e in ev:
-            away = (e.get("away_team") or "").strip().casefold()
-            home = (e.get("home_team") or "").strip().casefold()
-            gid = key.get((away, home))
+        with_spread = 0
+        ids_missing = []
+        books_seen = set()
+
+        for ev in events:
+            away = norm(ev.get("away_team"))
+            home = norm(ev.get("home_team"))
+            gid = game_id_by_teams.get((away, home))
             if not gid:
+                # Not in our current week (or name mismatch) — skip silently
                 continue
-            outs = pick_outcomes(e.get("bookmakers", []))
-            if not outs:
+
+            outcomes, book_used = pick_outcomes(ev.get("bookmakers"))
+            if not outcomes:
+                ids_missing.append(gid)
                 continue
-            fav = min(outs, key=lambda o: o.get("point", 0))  # most negative = favorite
-            fav_name, pts = fav.get("name"), fav.get("point")
-            if fav_name is None or pts is None:
+
+            # Determine favorite from outcomes:
+            # point is negative for favorite on most feeds; using min(point) is safest
+            try:
+                fav = min(outcomes, key=lambda o: float(o.get("point", 0)))
+                fav_name = fav.get("name")
+                pts_raw = fav.get("point")
+                if fav_name is None or pts_raw is None:
+                    ids_missing.append(gid)
+                    continue
+
+                # Store as negative favorite line (e.g., -3.5)
+                pts = -abs(Decimal(str(pts_raw)))
+
+                db.session.execute(
+                    T("UPDATE games SET favorite_team=:fav, spread_pts=:pts WHERE id=:gid"),
+                    {"fav": fav_name, "pts": pts, "gid": gid},
+                )
+                updated += 1
+                with_spread += 1
+                if book_used:
+                    books_seen.add(book_used)
+            except Exception:
+                ids_missing.append(gid)
                 continue
-            pts= -abs(Decimal(str(pts)))
-            db.session.execute(T("""
-              UPDATE games SET favorite_team=:fav, spread_pts=:pts WHERE id=:gid
-            """), {"fav": fav_name, "pts": Decimal(str(pts)), "gid": gid})
-            updated += 1
 
         db.session.commit()
-        print(f"Updated spreads for week {WEEK}/{SEASON}: {updated}")
+
+        result = {
+            "ok": True,
+            "season_year": SEASON,
+            "week": WEEK,
+            "updated": updated,
+            "with_spread": with_spread,
+            "ids_missing_spread": ids_missing,
+            "books_seen": sorted(books_seen),
+        }
+        print(result)
+        return result
 
 
 def _safe(s):
