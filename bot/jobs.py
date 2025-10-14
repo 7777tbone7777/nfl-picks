@@ -119,6 +119,7 @@ def import_odds_upcoming():
             fav_name, pts = fav.get("name"), fav.get("point")
             if fav_name is None or pts is None:
                 continue
+            pts= -abs(Decimal(str(pts)))
             db.session.execute(T("""
               UPDATE games SET favorite_team=:fav, spread_pts=:pts WHERE id=:gid
             """), {"fav": fav_name, "pts": Decimal(str(pts)), "gid": gid})
