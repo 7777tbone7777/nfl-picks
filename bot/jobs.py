@@ -2509,7 +2509,7 @@ async def sendweek_command(update, context):
       /sendweek <week> <name...>  -> send ONLY to that participant by name
     """
     import asyncio
-    from sqlalchemy import text as T  # avoid clashing with variable names
+    from sqlalchemy import text as T  # alias to avoid name collisions
 
     user = update.effective_user
     if ADMIN_IDS and (not user or user.id not in ADMIN_IDS):
@@ -2528,7 +2528,7 @@ async def sendweek_command(update, context):
     week_number = int(args[0])
     target = "all" if len(args) == 1 else " ".join(args[1:]).strip()
 
-    # ---------- helpers inside the command ----------
+    # ---------- helpers ----------
 
     def _find_existing_week():
         return (
@@ -2655,7 +2655,7 @@ async def sendweek_command(update, context):
             return
 
     # ---------- broadcast to ALL ----------
-    async def _do_broadcast():
+    def _do_broadcast():
         app = create_app()
         with app.app_context():
             wk = (
@@ -2688,7 +2688,7 @@ async def sendweek_command(update, context):
 
     if update.message:
         await update.message.reply_text(f"Sending Week {week_number} to all registered participants…")
-    await asyncio.to_thread(_do_broadcast)
+    await asyncio.to_thread(_do_broadcast)  # now runs correctly because _do_broadcast is sync
     if update.message:
         await update.message.reply_text("✅ Done.")
 
