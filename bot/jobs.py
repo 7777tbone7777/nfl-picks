@@ -38,23 +38,25 @@ ESPN_SCOREBOARD = (
     "?seasontype=2&year={year}&week={week}"
 )
 
-# in bot/jobs.py
 def import_odds_upcoming():
     """
-    Pull NFL spreads from The Odds API and update games.favorite_team/spread_pts
-    for the current (upcoming) week. Safe to run multiple times.
+    Refresh spreads for the upcoming week from The Odds API
+    and write into games.favorite_team / games.spread_pts.
+    Safe to run multiple times.
     """
     import os, datetime as dt, requests
     from decimal import Decimal
     from sqlalchemy import text as T
+    from flask_app import create_app
+    from models import db
 
     API = os.environ.get("ODDS_API_KEY")
     if not API:
         print("ODDS_API_KEY not set"); return
 
-    # Detect upcoming season/week from DB
-    with app.app_context():
-        # next week with future games
+    app = create_app()                     # <-- create app
+    with app.app_context():                # <-- now app is defined
+        # detect the next week having a future kickoff
         r = db.session.execute(T("""
             SELECT w.season_year AS season, w.week_number AS week
             FROM games g
@@ -65,19 +67,19 @@ def import_odds_upcoming():
         """)).mappings().first()
         if not r:
             print("No upcoming week found"); return
-        SEASON, WEEK = r["season"], r["week"]
+        SEASON, WEEK = int(r["season"]), int(r["week"])
 
-        # Pull DB games for that week
+        # load games for that week
         games = db.session.execute(T("""
           SELECT g.id, g.away_team, g.home_team
           FROM games g
           JOIN weeks w ON w.id = g.week_id
           WHERE w.season_year=:y AND w.week_number=:w
         """), {"y": SEASON, "w": WEEK}).mappings().all()
-        key = {( (g["away_team"] or "").strip().casefold(),
-                 (g["home_team"] or "").strip().casefold() ): g["id"] for g in games}
+        key = {((g["away_team"] or "").strip().casefold(),
+                (g["home_team"] or "").strip().casefold()): g["id"] for g in games}
 
-        # Hit OddsAPI
+        # fetch OddsAPI
         SPORT="americanfootball_nfl"
         DATE_FROM=(dt.datetime.utcnow()-dt.timedelta(days=3)).strftime("%Y-%m-%dT00:00:00Z")
         DATE_TO  =(dt.datetime.utcnow()+dt.timedelta(days=14)).strftime("%Y-%m-%dT00:00:00Z")
@@ -88,17 +90,17 @@ def import_odds_upcoming():
 
         BOOK_PRIORITY = ["DraftKings","BetMGM","FanDuel","BetOnline.ag","BetRivers","BetUS","Bovada"]
 
-        def pick_spreads(bms):
-            by = {bm["title"]: bm for bm in bms}
+        def pick_outcomes(bookmakers):
+            by = {bm["title"]: bm for bm in bookmakers}
             for name in BOOK_PRIORITY:
                 bm = by.get(name)
                 if not bm: continue
-                for mk in bm.get("markets",[]):
-                    if mk.get("key")=="spreads" and mk.get("outcomes"):
+                for mk in bm.get("markets", []):
+                    if mk.get("key") == "spreads" and mk.get("outcomes"):
                         return mk["outcomes"]
-            for bm in bms:
-                for mk in bm.get("markets",[]):
-                    if mk.get("key")=="spreads" and mk.get("outcomes"):
+            for bm in bookmakers:
+                for mk in bm.get("markets", []):
+                    if mk.get("key") == "spreads" and mk.get("outcomes"):
                         return mk["outcomes"]
             return None
 
@@ -107,21 +109,23 @@ def import_odds_upcoming():
             away = (e.get("away_team") or "").strip().casefold()
             home = (e.get("home_team") or "").strip().casefold()
             gid = key.get((away, home))
-            if not gid: 
+            if not gid:
                 continue
-            outs = pick_spreads(e.get("bookmakers",[]))
-            if not outs: 
+            outs = pick_outcomes(e.get("bookmakers", []))
+            if not outs:
                 continue
             fav = min(outs, key=lambda o: o.get("point", 0))  # most negative = favorite
-            fav_name = fav.get("name"); pts = fav.get("point")
-            if fav_name is None or pts is None: 
+            fav_name, pts = fav.get("name"), fav.get("point")
+            if fav_name is None or pts is None:
                 continue
             db.session.execute(T("""
               UPDATE games SET favorite_team=:fav, spread_pts=:pts WHERE id=:gid
             """), {"fav": fav_name, "pts": Decimal(str(pts)), "gid": gid})
             updated += 1
+
         db.session.commit()
         print(f"Updated spreads for week {WEEK}/{SEASON}: {updated}")
+
 
 def _safe(s):
     return (s or "").strip().lower()
