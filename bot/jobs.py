@@ -25,43 +25,33 @@ ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
 
-def _pt(dtval, tz_name: str | None = None) -> str:
+PT = ZoneInfo("America/Los_Angeles")
+
+def _pt(dt_utc) -> str:
     """
-    Format a UTC time into local time (default: America/Los_Angeles).
-    Accepts a datetime or an ISO8601 string (e.g. '2025-10-17T00:15:00Z').
+    Format a UTC (or naive-UTC) datetime/string as Pacific Time.
     Example output: 'Thu 10/16 05:15 PM PT'
     """
-    if not dtval:
+    if not dt_utc:
         return "TBD"
 
-    # pick TZ: env var wins; otherwise America/Los_Angeles
-    tz_name = tz_name or os.getenv("DISPLAY_TZ", "America/Los_Angeles")
-    try:
-        local_tz = ZoneInfo(tz_name)
-    except Exception:
-        local_tz = ZoneInfo("America/Los_Angeles")
-
-    # parse/normalize to aware UTC
-    if isinstance(dtval, str):
-        # allow trailing 'Z'
-        s = dtval.replace("Z", "+00:00")
+    # Accept str or datetime
+    if isinstance(dt_utc, str):
+        # normalize 'Z' or naive
+        s = dt_utc.replace("Z", "+00:00")
         try:
             dt_utc = datetime.fromisoformat(s)
         except Exception:
-            return dtval  # fallback: show raw
-    elif isinstance(dtval, datetime):
-        dt_utc = dtval
-    else:
-        return str(dtval)
+            return dt_utc  # fallback: show raw
 
+    # Treat naive as UTC
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-    else:
-        dt_utc = dt_utc.astimezone(timezone.utc)
 
-    # convert to local and format
-    local = dt_utc.astimezone(local_tz)
-    return local.strftime("%a %m/%d %I:%M %p %Z")
+    local = dt_utc.astimezone(PT)
+    # If you really want “PST” vs “PDT”, keep %Z. If you want a generic “PT”, hardcode it.
+    return local.strftime("%a %m/%d %I:%M %p %Z").replace("PDT", "PT").replace("PST", "PT")
+
 
 # --- ESPN NFL scoreboard (read-only fetch) ---
 # Regular season = seasontype=2. Preseason(1), Postseason(3).
