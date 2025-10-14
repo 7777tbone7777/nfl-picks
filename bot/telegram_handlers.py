@@ -1,5 +1,8 @@
 # bot/telegram_handlers.py
 from __future__ import annotations
+# add these
+from bot.jobs import create_app, db, _spread_label, _pt
+from bot.models import Week
 
 import os
 import json
