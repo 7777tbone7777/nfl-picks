@@ -841,13 +841,23 @@ def _format_winners_and_totals(week: int, weekly_rows, season_rows):
     return weekly_line + "\n" + "\n".join(lines)
 
 def cron_send_upcoming_week() -> dict:
-    """
-    Detect the next week (first kickoff > now UTC) and broadcast using send_week_games().
-    """
-    from datetime import datetime
+    # --- Tuesday guard (PT) with ALLOW_ANYDAY override; minimal inline version ---
+    import os
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
     from sqlalchemy import text as T
     from models import db
     from flask_app import create_app
+
+    allow_anyday = os.getenv("ALLOW_ANYDAY", "").strip().lower() in {"1", "true", "yes", "on"}
+    now_pt = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Los_Angeles"))
+    if not allow_anyday and now_pt.weekday() != 1:  # Monday=0, Tuesday=1
+        try:
+            logger.info("sendweek_upcoming: skip (not Tuesday PT). now_pt=%s", now_pt.isoformat())
+        except NameError:
+            pass
+        return {"ok": False, "reason": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
 
     app = create_app()
     with app.app_context():
