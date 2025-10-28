@@ -2337,7 +2337,9 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _db.session.execute(
                 _text(
                     """
-            SELECT g.id, g.away_team, g.home_team
+            SELECT g.id, g.away_team, g.home_team,
+                   g.favorite_team AS favorite_team,
+                   g.spread_pts AS spread_pts
             FROM games g
             JOIN weeks w ON w.id = g.week_id
             WHERE w.season_year=:y AND w.week_number=:w
@@ -2415,21 +2417,23 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if r["selected_team"]:
                 pick_map[(r["participant_id"], r["game_id"])] = r["selected_team"]
 
-        # Build output
-        header = f"📊 Picks — Week {week} ({season})"
+        # Build output (Option A: vertical format with spreads)
+        header = f"📊 Week {week} Picks ({season})"
         lines_out = [header, ""]
         for g in games:
-            parts = []
+            # Game matchup
+            lines_out.append(f"{g['away_team']} @ {g['home_team']}")
+            # Spread info
+            lines_out.append(_spread_label(g))
+            # Each participant's pick on separate line with bullet
             for p in participants:
                 team = pick_map.get((p["id"], g["id"]), "—")
-                parts.append(f"{p['name']}: {team}")
-            lines_out.append(f"{g['away_team']} @ {g['home_team']} — " + ", ".join(parts))
+                lines_out.append(f"• {p['name']}: {team}")
+            # Blank line between games
+            lines_out.append("")
         body = "\n".join(lines_out)
 
-        # Always reply in invoking chat
-        await m.reply_text(body)
-
-        # Broadcast in 'all' mode: DM each participant with the full grid
+        # Send to DMs only (avoid duplicate messages)
         if is_all:
             sent = 0
             for p in participants:
@@ -2439,15 +2443,19 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         sent += 1
                     except Exception:
                         logger.exception("Failed sending /seepicks to %s", p["name"])
-            await m.reply_text(f"✅ Sent to {sent} participant(s).")
+            await m.reply_text(f"✅ Sent picks to {sent} participant(s) via DM.")
         else:
-            # Name mode: DM that person too if linked
+            # Name mode: DM that person if linked
             p = participants[0]
             if p["telegram_chat_id"]:
                 try:
                     _send_message(p["telegram_chat_id"], body)
+                    await m.reply_text(f"✅ Sent picks to {p['name']} via DM.")
                 except Exception:
                     logger.exception("Failed sending /seepicks to %s", p["name"])
+                    await m.reply_text(f"❌ Failed to send to {p['name']}.")
+            else:
+                await m.reply_text(f"❌ {p['name']} doesn't have Telegram linked.")
 
 
 def run_telegram_listener():
