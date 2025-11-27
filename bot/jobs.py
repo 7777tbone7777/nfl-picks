@@ -2273,13 +2273,14 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
-      /seepicks <week_number> all
-      /seepicks <week_number> <participant_name>
+      /seepicks <week_number> all [day]
+      /seepicks <week_number> <participant_name> [day]
 
     - If 'all', compiles a grid of everyone's picks for that week and broadcasts
       the grid to each participant (DM) and replies in the invoking chat.
     - If a participant name is provided, shows only that person's picks for the week
       (replies in chat and DM to that participant if linked).
+    - Optional [day]: Filter games by day of week (Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday)
     """
     m = update.effective_message
     chat_id = str(update.effective_chat.id)
@@ -2288,7 +2289,11 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Validate args
     if len(args) < 2:
         return await m.reply_text(
-            "Usage: /seepicks <week_number> <participant|all>\nExample: /seepicks 3 all"
+            "Usage: /seepicks <week_number> <participant|all> [day]\n"
+            "Examples:\n"
+            "  /seepicks 13 all\n"
+            "  /seepicks 13 all Thursday\n"
+            "  /seepicks 13 Kevin Sunday"
         )
 
     # Parse week
@@ -2297,7 +2302,36 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         return await m.reply_text("Week must be an integer, e.g. /seepicks 3 all")
 
-    target = " ".join(args[1:]).strip().strip('"').strip("'")  # allow spaces/quotes in names
+    # Parse target (participant name or "all") and optional day filter
+    # Day names map
+    DAY_MAP = {
+        "monday": 0, "mon": 0,
+        "tuesday": 1, "tue": 1, "tues": 1,
+        "wednesday": 2, "wed": 2,
+        "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+        "friday": 4, "fri": 4,
+        "saturday": 5, "sat": 5,
+        "sunday": 6, "sun": 6,
+    }
+
+    day_filter = None
+    target_weekday = None
+
+    # Check if last arg is a day name
+    if len(args) >= 3:
+        potential_day = args[-1].lower()
+        if potential_day in DAY_MAP:
+            day_filter = args[-1]  # Keep original case for display
+            target_weekday = DAY_MAP[potential_day]
+            # Target is everything between week and day
+            target = " ".join(args[1:-1]).strip().strip('"').strip("'")
+        else:
+            # No day filter, target is everything after week
+            target = " ".join(args[1:]).strip().strip('"').strip("'")
+    else:
+        # No day filter possible
+        target = " ".join(args[1:]).strip().strip('"').strip("'")
+
     is_all = target.lower() == "all"
 
     from flask_app import create_app
@@ -2339,7 +2373,8 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """
             SELECT g.id, g.away_team, g.home_team,
                    g.favorite_team AS favorite_team,
-                   g.spread_pts AS spread_pts
+                   g.spread_pts AS spread_pts,
+                   g.game_time
             FROM games g
             JOIN weeks w ON w.id = g.week_id
             WHERE w.season_year=:y AND w.week_number=:w
@@ -2353,6 +2388,22 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if not games:
             return await m.reply_text(f"No games found for Week {week} ({season}).")
+
+        # Filter games by day of week if day_filter is specified
+        if day_filter and target_weekday is not None:
+            filtered_games = []
+            for g in games:
+                if g["game_time"]:
+                    # Convert naive UTC to Pacific Time to check weekday
+                    game_dt = g["game_time"].replace(tzinfo=timezone.utc).astimezone(PT)
+                    if game_dt.weekday() == target_weekday:
+                        filtered_games.append(g)
+            games = filtered_games
+
+            if not games:
+                return await m.reply_text(
+                    f"No games found on {day_filter.title()} in Week {week} ({season})."
+                )
 
         # Participants scope
         if is_all:
@@ -2418,7 +2469,10 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pick_map[(r["participant_id"], r["game_id"])] = r["selected_team"]
 
         # Build output (Option A: vertical format with spreads)
-        header = f"📊 Week {week} Picks ({season})"
+        if day_filter:
+            header = f"📊 Week {week} - {day_filter.title()} Games Only ({season})"
+        else:
+            header = f"📊 Week {week} Picks ({season})"
         lines_out = [header, ""]
         for g in games:
             # Game matchup
