@@ -713,7 +713,7 @@ def _find_upcoming_week_row(season_year: int, now_naive_utc):
 def _compute_week_results(season_year: int, week: int):
     """
     Returns list of dicts: [{'participant_id':..., 'name':..., 'wins':int}, ...]
-    Counts a win when pick matches game winner (based on scores) for FINAL games.
+    Counts a win when pick matches ATS winner (from DB winner column) for FINAL games.
     """
     from sqlalchemy import text as _text
 
@@ -723,9 +723,7 @@ def _compute_week_results(season_year: int, week: int):
                 """
         WITH week_games AS (
           SELECT g.id AS game_id,
-                 CASE WHEN g.home_score > g.away_score THEN g.home_team
-                      WHEN g.away_score > g.home_score THEN g.away_team
-                      ELSE NULL END AS winner
+                 g.winner AS winner  -- Use ATS winner stored in DB
           FROM games g
           JOIN weeks w ON w.id = g.week_id
           WHERE w.season_year=:y AND w.week_number=:w AND g.status='final'
@@ -770,6 +768,7 @@ def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
     """
     Season totals starting from WEEK 2 (Week 1 treated as zero).
     Returns [{'participant_id', 'name', 'wins'}, ...] ordered by wins desc.
+    Uses ATS winner from DB winner column.
     """
     from sqlalchemy import text as _text
 
@@ -779,9 +778,7 @@ def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
                 """
         WITH season_games AS (
           SELECT g.id AS game_id,
-                 CASE WHEN g.home_score > g.away_score THEN g.home_team
-                      WHEN g.away_score > g.home_score THEN g.away_team
-                      ELSE NULL END AS winner
+                 g.winner AS winner  -- Use ATS winner stored in DB
           FROM games g
           JOIN weeks w ON w.id = g.week_id
           WHERE w.season_year=:y AND w.week_number >= 2 AND w.week_number <= :wk AND g.status='final'
@@ -1314,7 +1311,8 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
                 _text(
                     """
                 SELECT g.id, g.away_team, g.home_team,
-                       g.status, g.home_score, g.away_score, g.winner
+                       g.status, g.home_score, g.away_score, g.winner,
+                       g.favorite_team, g.spread_pts
                 FROM games g
                 JOIN weeks wk ON wk.id = g.week_id
                 WHERE wk.season_year = :y AND wk.week_number = :w
@@ -1332,7 +1330,8 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
                 _text(
                     """
                 SELECT g.id, g.away_team, g.home_team,
-                       g.status, g.home_score, g.away_score
+                       g.status, g.home_score, g.away_score,
+                       g.favorite_team, g.spread_pts
                 FROM games g
                 JOIN weeks wk ON wk.id = g.week_id
                 WHERE wk.season_year = :y AND wk.week_number = :w
@@ -1386,14 +1385,17 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         cur_away_score = r["away_score"]
         cur_winner = r.get("winner") if has_winner_col else None
 
-        # Determine winner from ESPN scores (if present)
+        # Determine ATS winner using spread (if scores present)
         new_winner = None
-        if (
-            isinstance(es_home_score, int)
-            and isinstance(es_away_score, int)
-            and es_home_score != es_away_score
-        ):
-            new_winner = db_home if es_home_score > es_away_score else db_away
+        if isinstance(es_home_score, int) and isinstance(es_away_score, int):
+            # Use ATS logic - get favorite/spread from DB row
+            db_favorite = r.get("favorite_team")
+            db_spread = r.get("spread_pts")
+            new_winner = _ats_winner(
+                db_home, db_away,
+                es_home_score, es_away_score,
+                db_favorite, db_spread
+            )
 
         # Build updates
         sets = []
@@ -1415,10 +1417,10 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         if ("home_score" in params) or ("away_score" in params):
             updated_scores += 1
 
-        # Winner (only if column exists, decisive score, and value actually changes)
-        if has_winner_col and new_winner and (cur_winner != new_winner):
+        # Winner (ATS) - update if column exists and value changed (None = push is valid)
+        if has_winner_col and cur_winner != new_winner:
             sets.append("winner = :winner")
-            params["winner"] = new_winner
+            params["winner"] = new_winner  # Can be None for push
             updated_winner += 1
 
         if sets:
@@ -2184,7 +2186,7 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not season:
             return await m.reply_text(f"Week {week} not found in table weeks.")
 
-            # Completed games in this week (explicit winner OR both scores set and not a tie)
+            # Completed games in this week (status = final)
         total_completed = (
             _db.session.execute(
                 _text(
@@ -2194,10 +2196,7 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             JOIN weeks w ON w.id = g.week_id
             WHERE w.season_year=:y
               AND w.week_number=:w
-              AND (
-                    g.winner IS NOT NULL
-                 OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score <> g.away_score)
-              )
+              AND g.status = 'final'
         """
                 ),
                 {"y": season, "w": week},
@@ -2216,20 +2215,12 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WITH wg AS (
               SELECT
                 g.id,
-                CASE
-                  WHEN g.winner IS NOT NULL THEN g.winner
-                  WHEN g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score <> g.away_score
-                       THEN CASE WHEN g.home_score > g.away_score THEN g.home_team ELSE g.away_team END
-                  ELSE NULL
-                END AS winner
+                g.winner AS winner  -- ATS winner stored in DB (NULL = push)
               FROM games g
               JOIN weeks w ON w.id = g.week_id
               WHERE w.season_year=:y
                 AND w.week_number=:w
-                AND (
-                     g.winner IS NOT NULL
-                  OR (g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score <> g.away_score)
-                )
+                AND g.status = 'final'
             )
             SELECT u.id,
                    u.name,
