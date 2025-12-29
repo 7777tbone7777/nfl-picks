@@ -627,7 +627,7 @@ def _ats_winner(home_team: str, away_team: str,
         return None
 
     if favorite_team and spread_pts is not None:
-        spr = float(spread_pts)
+        spr = abs(float(spread_pts))  # Use abs() since DB stores negative spreads
         fav = (favorite_team or "").strip().lower()
         h = (home_team or "").strip().lower()
         a = (away_team or "").strip().lower()
