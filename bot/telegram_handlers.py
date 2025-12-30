@@ -86,14 +86,12 @@ async def seasonboard_command(update, context):
         # 2) Load participant names
         names = dict(db.session.execute(T("SELECT id, name FROM participants")).fetchall())
 
-        # 3) Pull all FINAL picks for those weeks
+        # 3) Pull all FINAL picks for those weeks (using ATS winner from DB)
         rows = db.session.execute(
             T("""
               SELECT p.participant_id  AS pid,
                      w.week_number     AS wk,
-                     g.home_team, g.away_team,
-                     COALESCE(g.home_score,0) AS home_score,
-                     COALESCE(g.away_score,0) AS away_score,
+                     g.winner          AS ats_winner,
                      p.selected_team   AS pick
                 FROM picks p
                 JOIN games g  ON g.id = p.game_id
@@ -106,19 +104,14 @@ async def seasonboard_command(update, context):
             {"y": season_year},
         ).mappings().all()
 
-        # 4) Compute wins per participant per week
-        def _winner(home_team, away_team, hs, as_):
-            if hs > as_:  return home_team
-            if as_ > hs:  return away_team
-            return None  # tie (unlikely), no credit
-
+        # 4) Compute wins per participant per week (using ATS winner from DB)
         wins_by_pid = {}          # pid -> total wins
         wins_by_pid_week = {}     # pid -> {wk -> wins}
         for r in rows:
-            wt = _winner(r["home_team"], r["away_team"], int(r["home_score"]), int(r["away_score"]))
-            if not wt:
+            ats_winner = r["ats_winner"]
+            if not ats_winner:  # NULL means push - no winner
                 continue
-            if r["pick"] and r["pick"].strip().lower() == wt.strip().lower():
+            if r["pick"] and r["pick"].strip().lower() == ats_winner.strip().lower():
                 pid = int(r["pid"]); wk = int(r["wk"])
                 wins_by_pid[pid] = wins_by_pid.get(pid, 0) + 1
                 wk_map = wins_by_pid_week.setdefault(pid, {})
