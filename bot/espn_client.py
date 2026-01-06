@@ -85,6 +85,23 @@ async def fetch_week(
 
             start_utc = parse_iso_to_aware_utc(ev.get("date")) if ev.get("date") else None
 
+            # Extract spread/odds data
+            favorite_team: Optional[str] = None
+            spread_pts: Optional[float] = None
+            odds_list = comps.get("odds") or []
+            if odds_list:
+                o = odds_list[0]
+                spread_val = o.get("spread")
+                home_fav = (o.get("homeTeamOdds") or {}).get("favorite", False)
+                away_fav = (o.get("awayTeamOdds") or {}).get("favorite", False)
+
+                if home_fav:
+                    favorite_team = home_name
+                    spread_pts = abs(float(spread_val)) if spread_val is not None else None
+                elif away_fav:
+                    favorite_team = away_name
+                    spread_pts = abs(float(spread_val)) if spread_val is not None else None
+
             out.append(
                 {
                     "away_team": away_name,
@@ -95,6 +112,8 @@ async def fetch_week(
                     "winner": winner,
                     "start_utc": start_utc,
                     "raw_event_id": ev.get("id"),
+                    "favorite_team": favorite_team,
+                    "spread_pts": spread_pts,
                 }
             )
         except Exception:

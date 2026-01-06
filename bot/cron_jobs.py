@@ -170,12 +170,16 @@ def cron_import_upcoming_week() -> Dict[str, Any]:
             status = state_to_status.get(ev.get("state") or "", "scheduled")
             home = ev["home_team"]
             away = ev["away_team"]
+            favorite_team = ev.get("favorite_team")
+            spread_pts = ev.get("spread_pts")
 
             res = db.session.execute(
                 _text(
                     """
                 UPDATE games
-                SET game_time=:game_time, status=:status, home_score=:home_score, away_score=:away_score
+                SET game_time=:game_time, status=:status, home_score=:home_score, away_score=:away_score,
+                    favorite_team=COALESCE(:favorite_team, favorite_team),
+                    spread_pts=COALESCE(:spread_pts, spread_pts)
                 WHERE week_id=:week_id AND lower(home_team)=lower(:home) AND lower(away_team)=lower(:away)
             """
                 ),
@@ -184,6 +188,8 @@ def cron_import_upcoming_week() -> Dict[str, Any]:
                     "status": status,
                     "home_score": ev.get("home_score"),
                     "away_score": ev.get("away_score"),
+                    "favorite_team": favorite_team,
+                    "spread_pts": spread_pts,
                     "week_id": week_id,
                     "home": home,
                     "away": away,
@@ -193,8 +199,8 @@ def cron_import_upcoming_week() -> Dict[str, Any]:
                 db.session.execute(
                     _text(
                         """
-                    INSERT INTO games (week_id, home_team, away_team, game_time, status, home_score, away_score)
-                    VALUES (:week_id, :home, :away, :game_time, :status, :home_score, :away_score)
+                    INSERT INTO games (week_id, home_team, away_team, game_time, status, home_score, away_score, favorite_team, spread_pts)
+                    VALUES (:week_id, :home, :away, :game_time, :status, :home_score, :away_score, :favorite_team, :spread_pts)
                 """
                     ),
                     {
@@ -205,6 +211,8 @@ def cron_import_upcoming_week() -> Dict[str, Any]:
                         "status": status,
                         "home_score": ev.get("home_score"),
                         "away_score": ev.get("away_score"),
+                        "favorite_team": favorite_team,
+                        "spread_pts": spread_pts,
                     },
                 )
                 created += 1
