@@ -1,11 +1,25 @@
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .http_utils import get_json_with_retry
 from .time_utils import parse_iso_to_aware_utc
 
 log = logging.getLogger("espn_client")
 SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+
+
+def _get_espn_seasontype_and_week(week: int) -> Tuple[int, int]:
+    """
+    Determine ESPN seasontype and week number based on our internal week number.
+    - Weeks 1-18: Regular season (seasontype=2)
+    - Weeks 19+: Playoffs (seasontype=3), ESPN week = week - 18
+
+    Returns: (seasontype, espn_week)
+    """
+    if week <= 18:
+        return (2, week)  # Regular season
+    else:
+        return (3, week - 18)  # Playoffs: Wild Card=1, Divisional=2, Conf=3, Pro Bowl=4, Super Bowl=5
 
 
 async def fetch_week(
@@ -15,7 +29,9 @@ async def fetch_week(
     retries: int = 3,
     backoff_s: float = 1.5,
 ) -> List[Dict[str, Any]]:
-    params = {"week": week, "year": season_year, "seasontype": 2}
+    # Determine ESPN seasontype and week from our internal week number
+    seasontype, espn_week = _get_espn_seasontype_and_week(week)
+    params = {"week": espn_week, "year": season_year, "seasontype": seasontype}
     data = await get_json_with_retry(
         SCOREBOARD_URL,
         params=params,

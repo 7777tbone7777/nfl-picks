@@ -44,6 +44,58 @@ def _find_upcoming_week_row(season: int, now_naive_utc: datetime) -> Optional[di
     )
 
 
+def _get_next_week_to_import(season: int) -> Optional[int]:
+    """
+    Determine the next week to import when no upcoming week with games exists.
+    Returns the next week number, or None if season is complete (past Super Bowl).
+
+    Logic: Find the max week with games, if all are final, next week = max + 1
+    Max valid week is 23 (Super Bowl = playoff week 5).
+    """
+    MAX_WEEK = 23  # Week 23 = Super Bowl (playoff week 5)
+
+    # Get max week that has at least one game
+    row = db.session.execute(
+        _text(
+            """
+            SELECT MAX(w.week_number) as max_week
+            FROM weeks w
+            JOIN games g ON g.week_id = w.id
+            WHERE w.season_year = :s
+            """
+        ),
+        {"s": season},
+    ).first()
+
+    if not row or row[0] is None:
+        return 1  # No games at all, start with week 1
+
+    max_week = int(row[0])
+
+    # Check if all games in max_week are final
+    non_final = db.session.execute(
+        _text(
+            """
+            SELECT COUNT(*) FROM games g
+            JOIN weeks w ON g.week_id = w.id
+            WHERE w.season_year = :s AND w.week_number = :w AND g.status != 'final'
+            """
+        ),
+        {"s": season, "w": max_week},
+    ).scalar()
+
+    if non_final > 0:
+        # Still have games to finish in current max week
+        return max_week
+
+    # All games final, move to next week
+    next_week = max_week + 1
+    if next_week > MAX_WEEK:
+        return None  # Season complete
+
+    return next_week
+
+
 def cron_import_upcoming_week() -> Dict[str, Any]:
     cfg = load_config()
     app = create_app()
@@ -65,10 +117,15 @@ def cron_import_upcoming_week() -> Dict[str, Any]:
 
         now_naive = to_naive_utc(utc_now)
         upcoming = _find_upcoming_week_row(season, now_naive)
-        if not upcoming:
-            return {"status": "no_upcoming_week", "season_year": season}
-
-        week = int(upcoming["week_number"])
+        if upcoming:
+            week = int(upcoming["week_number"])
+        else:
+            # No upcoming week with games found - check if we need to import next week
+            # This handles the transition from regular season to playoffs
+            week = _get_next_week_to_import(season)
+            if week is None:
+                return {"status": "season_complete", "season_year": season}
+            log.info("No upcoming week found, importing next week: %s", week)
 
         import asyncio
 

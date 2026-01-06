@@ -1127,6 +1127,20 @@ def detect_current_context(timeout: float = 15.0):
     return year, int(st), week
 
 # --- ESPN scoreboard: fetch + (optional) spread parsing ----------------------
+def _get_espn_seasontype_and_week(week: int) -> tuple:
+    """
+    Determine ESPN seasontype and week number based on our internal week number.
+    - Weeks 1-18: Regular season (seasontype=2)
+    - Weeks 19+: Playoffs (seasontype=3), ESPN week = week - 18
+
+    Returns: (seasontype, espn_week)
+    """
+    if week <= 18:
+        return (2, week)  # Regular season
+    else:
+        return (3, week - 18)  # Playoffs: Wild Card=1, Divisional=2, Conf=3, Pro Bowl=4, Super Bowl=5
+
+
 def fetch_espn_scoreboard(week: int, season_year: int):
     """
     Returns a list of dicts for the given NFL week from ESPN:
@@ -1140,7 +1154,12 @@ def fetch_espn_scoreboard(week: int, season_year: int):
         "favorite_team": "Jacksonville Jaguars" | None,
         "spread_pts": 3.5 | None,
       }
+
+    Handles both regular season (weeks 1-18) and playoffs (weeks 19+).
     """
+    # Determine ESPN seasontype and week from our internal week number
+    seasontype, espn_week = _get_espn_seasontype_and_week(week)
+
     ua = {"User-Agent": "Mozilla/5.0 (nfl-picks bot)"}
     def _get(url: str):
         req = urllib.request.Request(url, headers=ua)
@@ -1149,10 +1168,10 @@ def fetch_espn_scoreboard(week: int, season_year: int):
 
     # Preferred (the one that worked in your test)
     urls = [
-        f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=2&year={season_year}&week={week}",
+        f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype={seasontype}&year={season_year}&week={espn_week}",
         # Legacy fallbacks (some weeks/years used to work here)
-        f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?seasontype=2&year={season_year}&week={week}",
-        f"https://www.espn.com/nfl/scoreboard/_/week/{week}/year/{season_year}/seasontype/2",
+        f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?seasontype={seasontype}&year={season_year}&week={espn_week}",
+        f"https://www.espn.com/nfl/scoreboard/_/week/{espn_week}/year/{season_year}/seasontype/{seasontype}",
     ]
 
     last_err = None
