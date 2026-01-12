@@ -564,13 +564,15 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            # Compute ATS winners per game id (None == push/unknown)
+            # Compute winners per game id using hybrid logic (None == push/unknown)
             winners = {}
             for g in games:
                 winners[int(g["id"])] = _ats_winner(
                     g["home_team"], g["away_team"],
                     g["home_score"], g["away_score"],
-                    g["favorite_team"], g["spread_pts"]
+                    g["favorite_team"], g["spread_pts"],
+                    week_number=week_number,
+                    season_year=season_year,  # Pass both for hybrid logic
                 )  
 
             # All picks with selections for the week

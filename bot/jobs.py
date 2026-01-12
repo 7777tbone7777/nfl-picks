@@ -587,6 +587,8 @@ def ats_winners_for_week(week_number: int, season_year: int | None = None):
                 g["home_team"], g["away_team"],
                 g["home_score"], g["away_score"],
                 g["favorite_team"], g["spread_pts"],
+                week_number=week_number,
+                season_year=season_year,  # Pass both for hybrid logic
             )
 
         # Count correct ATS picks (ignore PUSH/None)
@@ -617,15 +619,34 @@ def ats_winners_for_week(week_number: int, season_year: int | None = None):
 
 def _ats_winner(home_team: str, away_team: str,
                 home_score: int, away_score: int,
-                favorite_team: str | None, spread_pts: float | None,) -> str | None:
+                favorite_team: str | None, spread_pts: float | None,
+                week_number: int | None = None,
+                season_year: int | None = None) -> str | None:
     """
-    Returns the ATS winner team name, or None for a push/unknown.
+    Returns the winner team name, or None for a push/tie.
+
+    HYBRID LOGIC (2025 season only):
+    - W2-W6: Straight-up winners (ignore spread even if present)
+    - W7+: ATS (against the spread) winners
+
+    2026+ seasons: ATS for all weeks.
+
     favorite_team is the team name (home or away) that is favored by spread_pts.
     spread_pts > 0 means the favorite must win by > spread to cover.
     """
     if home_score is None or away_score is None:
         return None
 
+    # HYBRID: 2025 season W2-W6 use straight-up (ignore spread)
+    # Future seasons (2026+) always use ATS
+    if season_year == 2025 and week_number is not None and week_number <= 6:
+        if home_score > away_score:
+            return home_team
+        if away_score > home_score:
+            return away_team
+        return None  # tie
+
+    # All other cases: Use ATS if spread available
     if favorite_team and spread_pts is not None:
         spr = abs(float(spread_pts))  # Use abs() since DB stores negative spreads
         fav = (favorite_team or "").strip().lower()
@@ -1404,16 +1425,18 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         cur_away_score = r["away_score"]
         cur_winner = r.get("winner") if has_winner_col else None
 
-        # Determine ATS winner using spread (if scores present)
+        # Determine winner using hybrid logic (2025 W2-W6 straight-up, otherwise ATS)
         new_winner = None
         if isinstance(es_home_score, int) and isinstance(es_away_score, int):
-            # Use ATS logic - get favorite/spread from DB row
+            # Use hybrid logic - get favorite/spread from DB row
             db_favorite = r.get("favorite_team")
             db_spread = r.get("spread_pts")
             new_winner = _ats_winner(
                 db_home, db_away,
                 es_home_score, es_away_score,
-                db_favorite, db_spread
+                db_favorite, db_spread,
+                week_number=week,
+                season_year=season_year,  # Pass both for hybrid logic
             )
 
         # Build updates
