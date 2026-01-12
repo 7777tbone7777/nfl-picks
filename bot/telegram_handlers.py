@@ -44,18 +44,25 @@ ADMIN_IDS = {int(x) for x in (os.getenv("ADMIN_IDS") or "").split(",") if x.stri
 async def seasonboard_command(update, context):
     """
     Shows season-to-date scoreboard for weeks that have at least one FINAL game.
-    Usage: /seasonboard [<season_year>] or /seasonboard me
+    Usage:
+        /seasonboard           - Show scoreboard (to you only)
+        /seasonboard me        - Same as above
+        /seasonboard all       - Broadcast scoreboard to all participants
+        /seasonboard <year>    - Show specific season year
     """
     from sqlalchemy import text as T
-    from bot.jobs import create_app, db  # uses your existing app/db
+    from bot.jobs import create_app, db, _send_message
     user = update.effective_user
 
-    # Optional args: "me" is allowed but not used to filter; kept for parity with your screenshot.
     args = (context.args or [])
     season_year = None
+    broadcast_all = False
+
     for a in args:
         if a.isdigit():
             season_year = int(a)
+        elif a.lower() == "all":
+            broadcast_all = True
 
     app = create_app()
     with app.app_context():
@@ -83,8 +90,11 @@ async def seasonboard_command(update, context):
             await update.message.reply_text(f"No FINAL games yet for {season_year}.")
             return
 
-        # 2) Load participant names
-        names = dict(db.session.execute(T("SELECT id, name FROM participants")).fetchall())
+        # 2) Load participant names and chat IDs
+        participants = db.session.execute(
+            T("SELECT id, name, telegram_chat_id FROM participants")
+        ).mappings().all()
+        names = {p["id"]: p["name"] for p in participants}
 
         # 3) Pull all FINAL picks for those weeks (using ATS winner from DB)
         rows = db.session.execute(
@@ -135,7 +145,21 @@ async def seasonboard_command(update, context):
 
         body = "\n".join(lines)
         msg = f"{header}{sub}\n\nName         | {week_cols} | Total\n{body}"
-        await update.message.reply_text(msg)
+
+        # 6) Send to all participants or just reply
+        if broadcast_all:
+            sent_count = 0
+            for p in participants:
+                chat_id = p.get("telegram_chat_id")
+                if chat_id:
+                    try:
+                        _send_message(chat_id, msg)
+                        sent_count += 1
+                    except Exception as e:
+                        log.warning(f"Failed to send scoreboard to {p['name']}: {e}")
+            await update.message.reply_text(f"✅ Scoreboard sent to {sent_count} participant(s).")
+        else:
+            await update.message.reply_text(msg)
 
 
 def _is_admin(user) -> bool:
