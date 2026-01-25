@@ -853,6 +853,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         week = int(rest[0])
         season_year = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else None
 
+        from bot.jobs import create_app, db
         app = create_app()
         with app.app_context():
             if season_year is None:
@@ -950,6 +951,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         week = int(rest[0])
         season_year = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else None
 
+        from bot.jobs import create_app, db
         app = create_app()
         with app.app_context():
             if season_year is None:
