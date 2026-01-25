@@ -2932,6 +2932,381 @@ async def sendweek_command(update, context):
         await update.message.reply_text("✅ Done.")
 
 
+# =========================================================================
+# PROP BETS
+# =========================================================================
+
+async def handle_prop_pick(update: "Update", context: "ContextTypes.DEFAULT_TYPE"):
+    """
+    Callback handler for prop bet picks.
+    Callback data format: prop:PROP_ID:OPTION
+    """
+    from models import PropBet, PropPick
+
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    try:
+        _, prop_id_str, selected_option = query.data.split(":", 2)
+        prop_id = int(prop_id_str)
+    except Exception:
+        await query.edit_message_text("⚠️ Invalid prop selection payload.")
+        return
+
+    chat_id = str(update.effective_chat.id)
+
+    app = create_app()
+    with app.app_context():
+        participant = Participant.query.filter_by(telegram_chat_id=chat_id).first()
+        if not participant:
+            await query.edit_message_text("⚠️ Not linked yet. Send /start first.")
+            return
+
+        prop_bet = PropBet.query.get(prop_id)
+        if not prop_bet:
+            await query.edit_message_text("⚠️ Prop bet not found.")
+            return
+
+        # Upsert the pick
+        pick = PropPick.query.filter_by(
+            participant_id=participant.id, prop_bet_id=prop_id
+        ).first()
+        if not pick:
+            pick = PropPick(
+                participant_id=participant.id,
+                prop_bet_id=prop_id,
+                selected_option=selected_option,
+            )
+            db.session.add(pick)
+        else:
+            pick.selected_option = selected_option
+        db.session.commit()
+
+        # Update message to show selection
+        label = prop_bet.game_label or ""
+        await query.edit_message_text(
+            f"✅ {label}: {prop_bet.description}\nYou picked: {selected_option}"
+        )
+
+
+def send_props(week_number: int, season_year: int | None = None) -> dict:
+    """
+    Send all unsent props for the given week to all participants.
+    Marks props as sent=True after sending.
+    Returns summary dict.
+    """
+    from models import PropBet, PropPick
+
+    app = create_app()
+    with app.app_context():
+        # Resolve season if not provided
+        if season_year is None:
+            season_year = db.session.execute(
+                T("SELECT MAX(season_year) FROM weeks")
+            ).scalar()
+
+        # Get week_id
+        week_id = db.session.execute(
+            T("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
+            {"y": season_year, "w": week_number},
+        ).scalar()
+
+        if not week_id:
+            return {"ok": False, "error": "week_not_found", "week": week_number}
+
+        # Get unsent props
+        props = PropBet.query.filter_by(week_id=week_id, sent=False).order_by(
+            PropBet.game_label, PropBet.id
+        ).all()
+
+        if not props:
+            return {"ok": True, "sent_props": 0, "sent_messages": 0, "note": "no_unsent_props"}
+
+        # Get all participants with telegram chat
+        participants = db.session.execute(
+            T("SELECT id, name, telegram_chat_id FROM participants WHERE telegram_chat_id IS NOT NULL")
+        ).mappings().all()
+
+        sent_messages = 0
+        for prop in props:
+            # Build message and keyboard
+            label = prop.game_label or ""
+            text = f"🎯 {label} Prop Bet\n{prop.description}"
+            kb = {
+                "inline_keyboard": [
+                    [{"text": prop.option_a, "callback_data": f"prop:{prop.id}:{prop.option_a}"}],
+                    [{"text": prop.option_b, "callback_data": f"prop:{prop.id}:{prop.option_b}"}],
+                ]
+            }
+
+            for p in participants:
+                # Check if already picked
+                already_picked = PropPick.query.filter_by(
+                    participant_id=p["id"], prop_bet_id=prop.id
+                ).first()
+                if already_picked:
+                    continue  # Skip if already picked
+
+                try:
+                    _send_message(str(p["telegram_chat_id"]), text, reply_markup=kb)
+                    sent_messages += 1
+                except Exception as e:
+                    logger.warning(f"Failed to send prop {prop.id} to {p['name']}: {e}")
+
+            # Mark as sent
+            prop.sent = True
+
+        db.session.commit()
+
+        return {
+            "ok": True,
+            "week": week_number,
+            "season_year": season_year,
+            "sent_props": len(props),
+            "sent_messages": sent_messages,
+        }
+
+
+def import_props_from_csv(week_number: int, csv_data: str, season_year: int | None = None) -> dict:
+    """
+    Import prop bets from CSV data.
+    CSV format: game_label,description,option_a,option_b
+    Example: AFC,Total points over/under 45.5,OVER,UNDER
+    """
+    from models import PropBet
+
+    app = create_app()
+    with app.app_context():
+        # Resolve season if not provided
+        if season_year is None:
+            season_year = db.session.execute(
+                T("SELECT MAX(season_year) FROM weeks")
+            ).scalar()
+
+        # Get or create week_id
+        week_id = db.session.execute(
+            T("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
+            {"y": season_year, "w": week_number},
+        ).scalar()
+
+        if not week_id:
+            return {"ok": False, "error": "week_not_found", "week": week_number}
+
+        created = 0
+        errors = []
+
+        for line in csv_data.strip().split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            parts = [p.strip() for p in line.split(",", 3)]
+            if len(parts) < 4:
+                errors.append(f"Invalid line (need 4 fields): {line}")
+                continue
+
+            game_label, description, option_a, option_b = parts
+
+            prop = PropBet(
+                week_id=week_id,
+                game_label=game_label.upper() if game_label else None,
+                description=description,
+                option_a=option_a.upper(),
+                option_b=option_b.upper(),
+                sent=False,
+            )
+            db.session.add(prop)
+            created += 1
+
+        db.session.commit()
+
+        return {
+            "ok": True,
+            "week": week_number,
+            "season_year": season_year,
+            "created": created,
+            "errors": errors,
+        }
+
+
+def grade_prop(prop_id: int, result: str) -> dict:
+    """
+    Grade a single prop bet by setting its result.
+    """
+    from models import PropBet
+
+    app = create_app()
+    with app.app_context():
+        prop = PropBet.query.get(prop_id)
+        if not prop:
+            return {"ok": False, "error": "prop_not_found", "prop_id": prop_id}
+
+        result_upper = result.upper()
+        if result_upper not in [prop.option_a.upper(), prop.option_b.upper()]:
+            return {
+                "ok": False,
+                "error": "invalid_result",
+                "valid_options": [prop.option_a, prop.option_b],
+            }
+
+        prop.result = result_upper
+        db.session.commit()
+
+        return {"ok": True, "prop_id": prop_id, "result": result_upper}
+
+
+def prop_scores(week_number: int, season_year: int | None = None) -> dict:
+    """
+    Calculate prop bet scores for all participants.
+    """
+    from models import PropBet, PropPick
+
+    app = create_app()
+    with app.app_context():
+        # Resolve season if not provided
+        if season_year is None:
+            season_year = db.session.execute(
+                T("SELECT MAX(season_year) FROM weeks")
+            ).scalar()
+
+        # Get week_id
+        week_id = db.session.execute(
+            T("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
+            {"y": season_year, "w": week_number},
+        ).scalar()
+
+        if not week_id:
+            return {"ok": False, "error": "week_not_found", "week": week_number}
+
+        # Get all graded props for the week
+        graded_props = {
+            p.id: p.result.upper()
+            for p in PropBet.query.filter_by(week_id=week_id).all()
+            if p.result
+        }
+
+        if not graded_props:
+            return {"ok": True, "scores": {}, "note": "no_graded_props"}
+
+        # Get all picks and count correct ones
+        picks = (
+            db.session.execute(
+                T("""
+                    SELECT pp.participant_id, p.name, pp.prop_bet_id, pp.selected_option
+                    FROM prop_picks pp
+                    JOIN participants p ON p.id = pp.participant_id
+                    JOIN prop_bets pb ON pb.id = pp.prop_bet_id
+                    WHERE pb.week_id = :wid
+                """),
+                {"wid": week_id},
+            )
+            .mappings()
+            .all()
+        )
+
+        scores = {}
+        for pick in picks:
+            result = graded_props.get(pick["prop_bet_id"])
+            if result and pick["selected_option"].upper() == result:
+                name = pick["name"]
+                scores[name] = scores.get(name, 0) + 1
+
+        # Sort by score descending
+        sorted_scores = dict(sorted(scores.items(), key=lambda x: -x[1]))
+
+        return {
+            "ok": True,
+            "week": week_number,
+            "season_year": season_year,
+            "total_graded_props": len(graded_props),
+            "scores": sorted_scores,
+        }
+
+
+def clear_props(week_number: int, season_year: int | None = None) -> dict:
+    """
+    Delete all props (and their picks) for a week.
+    """
+    from models import PropBet
+
+    app = create_app()
+    with app.app_context():
+        # Resolve season if not provided
+        if season_year is None:
+            season_year = db.session.execute(
+                T("SELECT MAX(season_year) FROM weeks")
+            ).scalar()
+
+        # Get week_id
+        week_id = db.session.execute(
+            T("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
+            {"y": season_year, "w": week_number},
+        ).scalar()
+
+        if not week_id:
+            return {"ok": False, "error": "week_not_found", "week": week_number}
+
+        # Delete props (cascade will delete picks)
+        count = PropBet.query.filter_by(week_id=week_id).delete()
+        db.session.commit()
+
+        return {
+            "ok": True,
+            "week": week_number,
+            "season_year": season_year,
+            "deleted": count,
+        }
+
+
+def list_props(week_number: int, season_year: int | None = None) -> dict:
+    """
+    List all props for a week with their current status.
+    """
+    from models import PropBet
+
+    app = create_app()
+    with app.app_context():
+        # Resolve season if not provided
+        if season_year is None:
+            season_year = db.session.execute(
+                T("SELECT MAX(season_year) FROM weeks")
+            ).scalar()
+
+        # Get week_id
+        week_id = db.session.execute(
+            T("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
+            {"y": season_year, "w": week_number},
+        ).scalar()
+
+        if not week_id:
+            return {"ok": False, "error": "week_not_found", "week": week_number}
+
+        props = PropBet.query.filter_by(week_id=week_id).order_by(
+            PropBet.game_label, PropBet.id
+        ).all()
+
+        prop_list = []
+        for p in props:
+            prop_list.append({
+                "id": p.id,
+                "game_label": p.game_label,
+                "description": p.description,
+                "option_a": p.option_a,
+                "option_b": p.option_b,
+                "result": p.result,
+                "sent": p.sent,
+            })
+
+        return {
+            "ok": True,
+            "week": week_number,
+            "season_year": season_year,
+            "props": prop_list,
+        }
+
+
 if __name__ == "__main__":
     import json
     import sys

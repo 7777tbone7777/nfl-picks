@@ -39,7 +39,9 @@ def build_application() -> Application:
 
     # ---- Register handlers (specific commands FIRST) ----
     application.add_handler(CommandHandler("start", in_app_context(th.start)))
-    application.add_handler(CallbackQueryHandler(th.handle_pick))
+    # Pattern-based callback handlers for picks and props
+    application.add_handler(CallbackQueryHandler(th.handle_pick, pattern="^pick:"))
+    application.add_handler(CallbackQueryHandler(th.handle_prop_pick, pattern="^prop:"))
 
     application.add_handler(CommandHandler("sendweek", in_app_context(th.sendweek_command)))
     application.add_handler(CommandHandler("syncscores", in_app_context(th.syncscores_command)))
@@ -51,8 +53,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("admin", in_app_context(th.admin_command)))
     application.add_handler(CommandHandler("remindweek", in_app_context(th.remindweek_command)))
 
-    # Our local command (defined in telegram_handlers.py)
+    # Our local commands (defined in telegram_handlers.py)
     application.add_handler(CommandHandler("mypicks", in_app_context(th.mypicks)))
+    application.add_handler(CommandHandler("myprops", in_app_context(th.myprops)))
 
     return application
 

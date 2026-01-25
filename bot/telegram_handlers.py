@@ -19,6 +19,7 @@ from telegram.ext import ContextTypes
 # Re-export command handlers that live in jobs.py
 from bot.jobs import (
     handle_pick,
+    handle_prop_pick,
     start,
     sendweek_command,
     syncscores_command,
@@ -27,6 +28,13 @@ from bot.jobs import (
     whoisleft_command,
     seepicks_command,
     remindweek_command,
+    # Prop bet functions
+    send_props,
+    import_props_from_csv,
+    grade_prop,
+    prop_scores,
+    clear_props,
+    list_props,
 )
 
 # DB access for /mypicks
@@ -761,9 +769,85 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("announce-winners:\n" + json.dumps(res, default=str, indent=2))
         return
 
+    # ---- PROP BETS ----
+
+    # /admin sendprops <week>
+    if sub == "sendprops":
+        if not rest or not rest[0].isdigit():
+            await update.message.reply_text("Usage: /admin sendprops <week_number> [season_year]")
+            return
+        week = int(rest[0])
+        season_year = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else None
+        res = send_props(week, season_year)
+        await update.message.reply_text(f"sendprops:\n{json.dumps(res, default=str, indent=2)}")
+        return
+
+    # /admin listprops <week>
+    if sub == "listprops":
+        if not rest or not rest[0].isdigit():
+            await update.message.reply_text("Usage: /admin listprops <week_number> [season_year]")
+            return
+        week = int(rest[0])
+        season_year = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else None
+        res = list_props(week, season_year)
+        if res.get("ok") and res.get("props"):
+            lines = []
+            for p in res["props"]:
+                status = f"✅ {p['result']}" if p["result"] else ("📤" if p["sent"] else "📝")
+                lines.append(f"{p['id']:>3} | {p['game_label'] or '':<3} | {status} | {p['description'][:40]}")
+            await update.message.reply_text(
+                f"Props for Week {week}:\n" + "\n".join(lines)
+            )
+        else:
+            await update.message.reply_text(f"listprops:\n{json.dumps(res, default=str, indent=2)}")
+        return
+
+    # /admin gradeprop <prop_id> <result>
+    if sub == "gradeprop":
+        if len(rest) < 2:
+            await update.message.reply_text("Usage: /admin gradeprop <prop_id> <result>")
+            return
+        try:
+            prop_id = int(rest[0])
+        except ValueError:
+            await update.message.reply_text("prop_id must be an integer.")
+            return
+        result = rest[1]
+        res = grade_prop(prop_id, result)
+        await update.message.reply_text(f"gradeprop:\n{json.dumps(res, default=str, indent=2)}")
+        return
+
+    # /admin propscores <week>
+    if sub == "propscores":
+        if not rest or not rest[0].isdigit():
+            await update.message.reply_text("Usage: /admin propscores <week_number> [season_year]")
+            return
+        week = int(rest[0])
+        season_year = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else None
+        res = prop_scores(week, season_year)
+        if res.get("ok") and res.get("scores"):
+            lines = [f"{name}: {score}" for name, score in res["scores"].items()]
+            await update.message.reply_text(
+                f"🎯 Prop Scores - Week {week}\n" + "\n".join(lines)
+            )
+        else:
+            await update.message.reply_text(f"propscores:\n{json.dumps(res, default=str, indent=2)}")
+        return
+
+    # /admin clearprops <week>
+    if sub == "clearprops":
+        if not rest or not rest[0].isdigit():
+            await update.message.reply_text("Usage: /admin clearprops <week_number> [season_year]")
+            return
+        week = int(rest[0])
+        season_year = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else None
+        res = clear_props(week, season_year)
+        await update.message.reply_text(f"clearprops:\n{json.dumps(res, default=str, indent=2)}")
+        return
+
     # ---- default usage ----
     await update.message.reply_text(
-        "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners>"
+        "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners|sendprops|listprops|gradeprop|propscores|clearprops>"
     )
 
 # ---------- helpers for /mypicks ----------
@@ -897,3 +981,100 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
+
+# ---------- /myprops (prop bets) ----------
+
+async def myprops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /myprops — show the requesting user's prop bet picks for the current week.
+    """
+    msg = update.effective_message or update.message
+    chat_id = str(update.effective_chat.id)
+
+    try:
+        app = create_app()
+        with app.app_context():
+            # Find the participant
+            participant = db.session.execute(
+                T("SELECT id, name FROM participants WHERE telegram_chat_id = :c"),
+                {"c": chat_id},
+            ).mappings().first()
+
+            if not participant:
+                await msg.reply_text("You're not linked yet. Send /start first.")
+                return
+
+            # Get current season/week
+            season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
+            # Find the latest week with props
+            week_number = db.session.execute(
+                T("""
+                    SELECT DISTINCT w.week_number
+                    FROM weeks w
+                    JOIN prop_bets pb ON pb.week_id = w.id
+                    WHERE w.season_year = :y
+                    ORDER BY w.week_number DESC
+                    LIMIT 1
+                """),
+                {"y": season_year},
+            ).scalar()
+
+            if not week_number:
+                await msg.reply_text("No prop bets available yet.")
+                return
+
+            # Get all props and picks for this week
+            rows = db.session.execute(
+                T("""
+                    SELECT pb.id, pb.game_label, pb.description, pb.option_a, pb.option_b, pb.result,
+                           pp.selected_option
+                    FROM prop_bets pb
+                    JOIN weeks w ON w.id = pb.week_id
+                    LEFT JOIN prop_picks pp ON pp.prop_bet_id = pb.id AND pp.participant_id = :pid
+                    WHERE w.season_year = :y AND w.week_number = :w
+                    ORDER BY pb.game_label, pb.id
+                """),
+                {"pid": participant["id"], "y": season_year, "w": week_number},
+            ).mappings().all()
+
+            if not rows:
+                await msg.reply_text(f"No props found for Week {week_number}.")
+                return
+
+            # Format output
+            lines = [f"🎯 Your Props - Week {week_number}\n"]
+            picked_count = 0
+            correct_count = 0
+
+            for r in rows:
+                label = r["game_label"] or ""
+                pick = r["selected_option"]
+                result = r["result"]
+
+                if pick:
+                    picked_count += 1
+                    if result:
+                        if pick.upper() == result.upper():
+                            status = "✅"
+                            correct_count += 1
+                        else:
+                            status = "❌"
+                    else:
+                        status = "📝"
+                    lines.append(f"{status} {label}: {r['description'][:35]}... → {pick}")
+                else:
+                    lines.append(f"⬜ {label}: {r['description'][:35]}...")
+
+            lines.append(f"\nPicked: {picked_count}/{len(rows)}")
+            if correct_count > 0:
+                lines.append(f"Correct: {correct_count}")
+
+            await msg.reply_text("\n".join(lines))
+
+    except Exception as e:
+        log.exception("myprops: crashed: %s", e)
+        if msg:
+            try:
+                await msg.reply_text("❌ Sorry, /myprops failed. Check logs.")
+            except Exception:
+                pass

@@ -118,6 +118,75 @@ class Pick(db.Model):
         return f"<Pick p={self.participant_id} g={self.game_id} team={self.selected_team}>"
 
 
+class PropBet(db.Model):
+    """
+    A prop bet for a specific week (e.g., conference championships).
+    Each prop has two options (e.g., OVER/UNDER, YES/NO, team-specific).
+    """
+
+    __tablename__ = "prop_bets"
+
+    id = db.Column(db.Integer, primary_key=True)
+    week_id = db.Column(
+        db.Integer,
+        db.ForeignKey("weeks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    game_label = db.Column(db.String(16))  # "AFC" or "NFC"
+    description = db.Column(db.String(256), nullable=False)
+    option_a = db.Column(db.String(32), nullable=False)  # "OVER", "YES", "RAMS"
+    option_b = db.Column(db.String(32), nullable=False)  # "UNDER", "NO", "SEA"
+    result = db.Column(db.String(32))  # Winning option when graded (NULL until graded)
+    sent = db.Column(db.Boolean, default=False)  # Track if sent to participants
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    week = db.relationship("Week", lazy=True)
+    picks = db.relationship(
+        "PropPick",
+        backref="prop_bet",
+        lazy=True,
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    def __repr__(self) -> str:
+        return f"<PropBet {self.id} {self.game_label}: {self.description[:30]}>"
+
+
+class PropPick(db.Model):
+    """
+    A participant's selection for a prop bet.
+    """
+
+    __tablename__ = "prop_picks"
+
+    id = db.Column(db.Integer, primary_key=True)
+    participant_id = db.Column(
+        db.Integer,
+        db.ForeignKey("participants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    prop_bet_id = db.Column(
+        db.Integer,
+        db.ForeignKey("prop_bets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    selected_option = db.Column(db.String(32), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint("participant_id", "prop_bet_id", name="uq_prop_participant"),
+    )
+
+    participant = db.relationship("Participant", lazy=True)
+
+    def __repr__(self) -> str:
+        return f"<PropPick p={self.participant_id} prop={self.prop_bet_id} opt={self.selected_option}>"
+
+
 class Reminder(db.Model):
     """
     Lightweight log so jobs.py can track that a reminder/launch message was sent.
