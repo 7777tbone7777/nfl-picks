@@ -845,9 +845,173 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"clearprops:\n{json.dumps(res, default=str, indent=2)}")
         return
 
+    # /admin shareprops <week> - broadcast everyone's picks to all participants
+    if sub == "shareprops":
+        if not rest or not rest[0].isdigit():
+            await update.message.reply_text("Usage: /admin shareprops <week_number> [season_year]")
+            return
+        week = int(rest[0])
+        season_year = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else None
+
+        app = create_app()
+        with app.app_context():
+            if season_year is None:
+                season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
+
+            week_id = db.session.execute(
+                T("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
+                {"y": season_year, "w": week},
+            ).scalar()
+
+            if not week_id:
+                await update.message.reply_text(f"Week {week} not found.")
+                return
+
+            # Get all props for the week
+            props = db.session.execute(
+                T("""
+                    SELECT id, game_label, description, option_a, option_b
+                    FROM prop_bets
+                    WHERE week_id = :wid
+                    ORDER BY game_label, id
+                """),
+                {"wid": week_id},
+            ).mappings().all()
+
+            if not props:
+                await update.message.reply_text(f"No props found for Week {week}.")
+                return
+
+            # Get all participants
+            participants = db.session.execute(
+                T("SELECT id, name, telegram_chat_id FROM participants WHERE telegram_chat_id IS NOT NULL")
+            ).mappings().all()
+
+            # Get all picks
+            picks = db.session.execute(
+                T("""
+                    SELECT pp.prop_bet_id, pp.participant_id, pp.selected_option, p.name
+                    FROM prop_picks pp
+                    JOIN participants p ON p.id = pp.participant_id
+                    JOIN prop_bets pb ON pb.id = pp.prop_bet_id
+                    WHERE pb.week_id = :wid
+                """),
+                {"wid": week_id},
+            ).mappings().all()
+
+            # Build picks lookup: {prop_id: {participant_name: selected_option}}
+            picks_by_prop = {}
+            for pick in picks:
+                prop_id = pick["prop_bet_id"]
+                if prop_id not in picks_by_prop:
+                    picks_by_prop[prop_id] = {}
+                picks_by_prop[prop_id][pick["name"]] = pick["selected_option"]
+
+            # Build message grouped by game (AFC/NFC)
+            participant_names = sorted([p["name"] for p in participants])
+
+            afc_lines = ["🏈 AFC PROPS"]
+            nfc_lines = ["🏈 NFC PROPS"]
+
+            for prop in props:
+                prop_picks = picks_by_prop.get(prop["id"], {})
+                # Show who picked what
+                pick_summary = []
+                for name in participant_names:
+                    pick = prop_picks.get(name, "—")
+                    pick_summary.append(f"{name}: {pick}")
+
+                line = f"\n{prop['description']}\n" + " | ".join(pick_summary)
+
+                if prop["game_label"] == "AFC":
+                    afc_lines.append(line)
+                else:
+                    nfc_lines.append(line)
+
+            msg = "\n".join(afc_lines) + "\n\n" + "\n".join(nfc_lines)
+
+            # Send to all participants
+            sent = 0
+            for p in participants:
+                try:
+                    _send_message(str(p["telegram_chat_id"]), msg)
+                    sent += 1
+                except Exception as e:
+                    log.warning(f"Failed to send prop picks to {p['name']}: {e}")
+
+            await update.message.reply_text(f"✅ Shared prop picks with {sent} participant(s).")
+        return
+
+    # /admin whoisleftprops <week> - who hasn't made all their prop picks
+    if sub == "whoisleftprops":
+        if not rest or not rest[0].isdigit():
+            await update.message.reply_text("Usage: /admin whoisleftprops <week_number> [season_year]")
+            return
+        week = int(rest[0])
+        season_year = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else None
+
+        app = create_app()
+        with app.app_context():
+            if season_year is None:
+                season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
+
+            week_id = db.session.execute(
+                T("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
+                {"y": season_year, "w": week},
+            ).scalar()
+
+            if not week_id:
+                await update.message.reply_text(f"Week {week} not found.")
+                return
+
+            # Count total props for the week
+            total_props = db.session.execute(
+                T("SELECT COUNT(*) FROM prop_bets WHERE week_id = :wid"),
+                {"wid": week_id},
+            ).scalar() or 0
+
+            if total_props == 0:
+                await update.message.reply_text(f"No props found for Week {week}.")
+                return
+
+            # Get participants and their pick counts
+            rows = db.session.execute(
+                T("""
+                    SELECT p.id, p.name,
+                           COUNT(pp.id) AS picks_made
+                    FROM participants p
+                    LEFT JOIN prop_picks pp ON pp.participant_id = p.id
+                        AND pp.prop_bet_id IN (SELECT id FROM prop_bets WHERE week_id = :wid)
+                    WHERE p.telegram_chat_id IS NOT NULL
+                    GROUP BY p.id, p.name
+                    ORDER BY p.name
+                """),
+                {"wid": week_id},
+            ).mappings().all()
+
+            missing = []
+            complete = []
+            for r in rows:
+                picks_made = r["picks_made"] or 0
+                if picks_made < total_props:
+                    missing.append(f"{r['name']}: {picks_made}/{total_props}")
+                else:
+                    complete.append(r["name"])
+
+            lines = [f"🎯 Prop Picks Status - Week {week}\nTotal props: {total_props}\n"]
+            if missing:
+                lines.append("❌ Incomplete:")
+                lines.extend([f"  {m}" for m in missing])
+            if complete:
+                lines.append("\n✅ Complete:")
+                lines.extend([f"  {c}" for c in complete])
+
+            await update.message.reply_text("\n".join(lines))
+        return
+
     # ---- default usage ----
     await update.message.reply_text(
-        "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners|sendprops|listprops|gradeprop|propscores|clearprops>"
+        "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners|sendprops|listprops|gradeprop|propscores|clearprops|shareprops|whoisleftprops>"
     )
 
 # ---------- helpers for /mypicks ----------
