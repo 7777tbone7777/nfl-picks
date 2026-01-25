@@ -15,36 +15,36 @@ from bot.jobs import import_props_from_csv
 # Week 21 Conference Championship Props
 # Format: game_label,description,option_a,option_b
 WEEK_21_PROPS = """
-AFC,Total points OVER/UNDER 47.5,OVER,UNDER
-AFC,First team to score,BILLS,CHIEFS
-AFC,Josh Allen 2+ passing TDs,YES,NO
-AFC,Patrick Mahomes 250+ passing yards,YES,NO
-AFC,Travis Kelce 50+ receiving yards,YES,NO
-AFC,Will there be a defensive/special teams TD?,YES,NO
-AFC,Winning margin OVER/UNDER 6.5,OVER,UNDER
-AFC,Longest TD OVER/UNDER 35.5 yards,OVER,UNDER
-AFC,Total sacks OVER/UNDER 4.5,OVER,UNDER
-AFC,Will the game go to overtime?,YES,NO
-AFC,James Cook 60+ rushing yards,YES,NO
-AFC,Isiah Pacheco anytime TD scorer,YES,NO
-AFC,First half OVER/UNDER 23.5,OVER,UNDER
-AFC,4th quarter will be highest scoring quarter,YES,NO
-AFC,Both teams score 20+ points,YES,NO
-NFC,Total points OVER/UNDER 49.5,OVER,UNDER
-NFC,First team to score,COMMANDERS,EAGLES
-NFC,Jalen Hurts 2+ TDs (passing+rushing),YES,NO
-NFC,Jayden Daniels 250+ passing yards,YES,NO
-NFC,Saquon Barkley 100+ rushing yards,YES,NO
-NFC,A.J. Brown 75+ receiving yards,YES,NO
-NFC,Will there be a turnover in the first half?,YES,NO
-NFC,Winning margin OVER/UNDER 7.5,OVER,UNDER
-NFC,Terry McLaurin 50+ receiving yards,YES,NO
-NFC,Total TDs OVER/UNDER 5.5,OVER,UNDER
-NFC,Either team scores 30+ points,YES,NO
-NFC,First half OVER/UNDER 24.5,OVER,UNDER
-NFC,Both QBs throw for 200+ yards,YES,NO
-NFC,Will there be a successful 2-point conversion?,YES,NO
-NFC,Game decided by 3 points or less,YES,NO
+AFC,Jarrett Stidham (DEN): Passing Yards (Line: 215.5),OVER,UNDER
+AFC,Drake Maye (NE): Total Passing TDs (Line: 1.5),OVER,UNDER
+AFC,RJ Harvey (DEN): Rushing + Receiving Yards (Line: 65.5),OVER,UNDER
+AFC,Stefon Diggs (NE): Total Receiving Yards (Line: 60.5),OVER,UNDER
+AFC,Hunter Henry (NE): Total Receptions (Line: 3.5),OVER,UNDER
+AFC,Courtland Sutton (DEN): Total Receptions (Line: 4.5),OVER,UNDER
+AFC,Robert Spillane (NE): Total Tackles (Line: 7.5),OVER,UNDER
+AFC,Longest Field Goal Made: Longer than 47.5 yards?,YES,NO
+AFC,Broncos Defense: Total Team Sacks (Line: 2.5),OVER,UNDER
+AFC,Defensive/Special Teams TD: Will there be one?,YES,NO
+AFC,TreVeyon Henderson (NE): Anytime Touchdown,YES,NO
+AFC,First Score of Game: Will it be a Touchdown?,YES,NO
+AFC,Total Interceptions: Over/Under 1.5 (Both Teams),OVER,UNDER
+AFC,Largest Lead of Game: Over/Under 10.5 Points,OVER,UNDER
+AFC,Shortest TD Scored: Under 1.5 Yards (Goal line plunge)?,YES,NO
+NFC,Matthew Stafford (LAR): Passing Yards (Line: 265.5),OVER,UNDER
+NFC,Sam Darnold (SEA): Passing Yards (Line: 235.5),OVER,UNDER
+NFC,Kyren Williams (LAR): Total Rushing Yards (Line: 75.5),OVER,UNDER
+NFC,Kenneth Walker III (SEA): Rushing + Receiving Yards (Line: 85.5),OVER,UNDER
+NFC,Puka Nacua (LAR): Total Receptions (Line: 6.5),OVER,UNDER
+NFC,Jaxon Smith-Njigba (SEA): Total Receptions (Line: 5.5),OVER,UNDER
+NFC,Sam Darnold (SEA): Will he score a Rushing TD?,YES,NO
+NFC,Total 4th Down Conversions: Over/Under 1.5,OVER,UNDER
+NFC,Will the Game go to Overtime?,YES,NO
+NFC,Total Made Field Goals (Both Teams): (Line: 3.5),OVER,UNDER
+NFC,Cooper Kupp (LAR): Longest Reception Over 22.5 Yards?,YES,NO
+NFC,Team with Most Penalties: Rams or Seahawks?,RAMS,SEA
+NFC,Total Sacks (Both Teams): Over/Under 5.5,OVER,UNDER
+NFC,Opening Kickoff: Will it be a Touchback?,YES,NO
+NFC,Final Play of Game: Will the QB take a knee?,YES,NO
 """
 
 
