@@ -200,8 +200,8 @@ def parse_player_name(description: str) -> Optional[str]:
 
 def parse_line(description: str) -> Optional[float]:
     """Extract the line/threshold from prop description."""
-    # Pattern: "Line: 215.5" or "Over/Under 1.5" or "> 47.5"
-    match = re.search(r"(?:Line:\s*|Over/Under\s*|>\s*|Under\s*)(\d+\.?\d*)", description)
+    # Pattern: "Line: 215.5" or "Over/Under 1.5" or "> 47.5" or "Over 22.5"
+    match = re.search(r"(?:Line:\s*|Over/Under\s*|Over\s+|Under\s+|>\s*)(\d+\.?\d*)", description)
     if match:
         return float(match.group(1))
     return None
@@ -414,7 +414,7 @@ def grade_prop(prop: dict, afc_game: GameData, nfc_game: GameData, verbose: bool
             return option_a if is_td else option_b
 
     # === TOTAL INTERCEPTIONS ===
-    if "Total Interceptions" in desc and "Line:" in desc:
+    if "Total Interceptions" in desc:
         line = parse_line(desc)
         if line is not None:
             total_ints = 0
@@ -430,7 +430,7 @@ def grade_prop(prop: dict, afc_game: GameData, nfc_game: GameData, verbose: bool
             return option_a if total_ints > line else option_b
 
     # === LARGEST LEAD ===
-    if "Largest Lead" in desc and "Line:" in desc:
+    if "Largest Lead" in desc:
         line = parse_line(desc)
         if line is not None:
             max_lead = 0
@@ -460,7 +460,7 @@ def grade_prop(prop: dict, afc_game: GameData, nfc_game: GameData, verbose: bool
         return option_a if shortest < 1.5 else option_b  # YES if < 1.5, NO otherwise
 
     # === 4TH DOWN CONVERSIONS ===
-    if "4th Down Conversions" in desc and "Line:" in desc:
+    if "4th Down Conversions" in desc or "4th down" in desc.lower():
         line = parse_line(desc)
         if line is not None:
             total = 0
@@ -528,7 +528,7 @@ def grade_prop(prop: dict, afc_game: GameData, nfc_game: GameData, verbose: bool
             pass
 
     # === TOTAL SACKS (both teams) ===
-    if "Total Sacks" in desc and "Both Teams" in desc and "Line:" in desc:
+    if "Total Sacks" in desc and "Both Teams" in desc:
         line = parse_line(desc)
         if line is not None:
             total_sacks = 0
