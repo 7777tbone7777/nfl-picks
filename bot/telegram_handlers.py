@@ -817,6 +817,73 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"gradeprop:\n{json.dumps(res, default=str, indent=2)}")
         return
 
+    # /admin gradeallprops <week> <result1,result2,result3,...>
+    # Results are applied in order to props sorted by ID
+    if sub == "gradeallprops":
+        if len(rest) < 2:
+            await update.message.reply_text(
+                "Usage: /admin gradeallprops <week> <result1,result2,...>\n"
+                "Example: /admin gradeallprops 21 OVER,UNDER,YES,NO,OVER,..."
+            )
+            return
+        if not rest[0].isdigit():
+            await update.message.reply_text("Week must be a number.")
+            return
+        week = int(rest[0])
+        results_str = " ".join(rest[1:])  # Join in case spaces were used
+        results = [r.strip().upper() for r in results_str.replace(" ", ",").split(",") if r.strip()]
+
+        from bot.jobs import create_app, db
+        from sqlalchemy import text as T
+
+        app = create_app()
+        with app.app_context():
+            season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
+
+            week_id = db.session.execute(
+                T("SELECT id FROM weeks WHERE season_year=:y AND week_number=:w"),
+                {"y": season_year, "w": week},
+            ).scalar()
+
+            if not week_id:
+                await update.message.reply_text(f"Week {week} not found.")
+                return
+
+            # Get props in order
+            props = db.session.execute(
+                T("SELECT id, description, option_a, option_b FROM prop_bets WHERE week_id=:wid ORDER BY id"),
+                {"wid": week_id},
+            ).mappings().all()
+
+            if len(results) != len(props):
+                await update.message.reply_text(
+                    f"Mismatch: {len(results)} results provided but {len(props)} props exist.\n"
+                    f"Use /admin listprops {week} to see all props."
+                )
+                return
+
+            graded = 0
+            errors = []
+            for i, prop in enumerate(props):
+                result = results[i]
+                valid = [prop["option_a"].upper(), prop["option_b"].upper()]
+                if result not in valid:
+                    errors.append(f"#{prop['id']}: '{result}' not in {valid}")
+                    continue
+                db.session.execute(
+                    T("UPDATE prop_bets SET result=:r WHERE id=:id"),
+                    {"r": result, "id": prop["id"]},
+                )
+                graded += 1
+
+            db.session.commit()
+
+            msg = f"✅ Graded {graded}/{len(props)} props for Week {week}."
+            if errors:
+                msg += f"\n\n❌ Errors:\n" + "\n".join(errors)
+            await update.message.reply_text(msg)
+        return
+
     # /admin propscores <week>
     if sub == "propscores":
         if not rest or not rest[0].isdigit():
