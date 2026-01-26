@@ -44,35 +44,60 @@ def fetch_json(url: str) -> dict:
 
 def find_games_for_week(week: int, season_year: int = 2025) -> list[dict]:
     """Find ESPN game IDs for a given week."""
-    # Try regular season first, then postseason
-    for season_type in [2, 3]:  # 2=regular, 3=postseason
+
+    def parse_events(events):
+        result = []
+        for e in events:
+            try:
+                comps = e["competitions"][0]["competitors"]
+                home = next((c for c in comps if c["homeAway"] == "home"), comps[0])
+                away = next((c for c in comps if c["homeAway"] == "away"), comps[1])
+                result.append({
+                    "id": e["id"],
+                    "name": e["name"],
+                    "status": e["status"]["type"]["name"],
+                    "home": home["team"]["displayName"],
+                    "away": away["team"]["displayName"],
+                    "home_abbrev": home["team"]["abbreviation"],
+                    "away_abbrev": away["team"]["abbreviation"],
+                })
+            except Exception:
+                continue
+        return result
+
+    # First, try current scoreboard (no week filter) - shows recent/current games
+    try:
+        data = fetch_json(ESPN_SCOREBOARD)
+        events = data.get("events", [])
+        if events:
+            print(f"   Found {len(events)} games on current scoreboard")
+            return parse_events(events)
+    except Exception as e:
+        print(f"   Warning: Current scoreboard failed: {e}")
+
+    # Try postseason weeks 1-4 (Wild Card, Divisional, Conference, Super Bowl)
+    for espn_week in [3, 2, 4, 1]:  # Conference=3, Divisional=2, etc.
+        url = f"{ESPN_SCOREBOARD}?seasontype=3&week={espn_week}&year={season_year}"
+        try:
+            data = fetch_json(url)
+            events = data.get("events", [])
+            if events:
+                print(f"   Found {len(events)} games at postseason week {espn_week}")
+                return parse_events(events)
+        except Exception as e:
+            print(f"   Warning: Postseason week {espn_week} failed: {e}")
+
+    # Fallback: try regular season week
+    for season_type in [2, 3]:
         url = f"{ESPN_SCOREBOARD}?seasontype={season_type}&week={week}&year={season_year}"
         try:
             data = fetch_json(url)
             events = data.get("events", [])
             if events:
-                return [
-                    {
-                        "id": e["id"],
-                        "name": e["name"],
-                        "status": e["status"]["type"]["name"],
-                        "home": e["competitions"][0]["competitors"][0]["team"]["displayName"]
-                            if e["competitions"][0]["competitors"][0]["homeAway"] == "home"
-                            else e["competitions"][0]["competitors"][1]["team"]["displayName"],
-                        "away": e["competitions"][0]["competitors"][1]["team"]["displayName"]
-                            if e["competitions"][0]["competitors"][1]["homeAway"] == "away"
-                            else e["competitions"][0]["competitors"][0]["team"]["displayName"],
-                        "home_abbrev": e["competitions"][0]["competitors"][0]["team"]["abbreviation"]
-                            if e["competitions"][0]["competitors"][0]["homeAway"] == "home"
-                            else e["competitions"][0]["competitors"][1]["team"]["abbreviation"],
-                        "away_abbrev": e["competitions"][0]["competitors"][1]["team"]["abbreviation"]
-                            if e["competitions"][0]["competitors"][1]["homeAway"] == "away"
-                            else e["competitions"][0]["competitors"][0]["team"]["abbreviation"],
-                    }
-                    for e in events
-                ]
-        except Exception as e:
-            print(f"Warning: Failed to fetch week {week} seasontype {season_type}: {e}")
+                return parse_events(events)
+        except Exception:
+            pass
+
     return []
 
 
