@@ -901,6 +901,51 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"propscores:\n{json.dumps(res, default=str, indent=2)}")
         return
 
+    # /admin sendpropscores <week> - broadcast prop scores to all participants
+    if sub == "sendpropscores":
+        if not rest or not rest[0].isdigit():
+            await update.message.reply_text("Usage: /admin sendpropscores <week_number> [season_year]")
+            return
+        week = int(rest[0])
+        season_year = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else None
+
+        res = prop_scores(week, season_year)
+        if not res.get("ok") or not res.get("scores"):
+            await update.message.reply_text(f"No scores to send: {res.get('error', res.get('note', 'unknown'))}")
+            return
+
+        scores = res["scores"]
+        total_props = res.get("total_props", 30)
+
+        # Build leaderboard message
+        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        lines = [f"🏈 Prop Bet Scores - Week {week} 🏈", ""]
+        for i, (name, score) in enumerate(sorted_scores, 1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+            lines.append(f"{medal} {name}: {score}/{total_props}")
+
+        message = "\n".join(lines)
+
+        # Send to all participants with telegram_chat_id
+        from bot.jobs import create_app, db
+        from sqlalchemy import text as T
+        app = create_app()
+        with app.app_context():
+            participants = db.session.execute(
+                T("SELECT name, telegram_chat_id FROM participants WHERE telegram_chat_id IS NOT NULL")
+            ).mappings().all()
+
+            sent_count = 0
+            for p in participants:
+                try:
+                    await context.bot.send_message(chat_id=p["telegram_chat_id"], text=message)
+                    sent_count += 1
+                except Exception as e:
+                    logging.warning(f"Failed to send prop scores to {p['name']}: {e}")
+
+            await update.message.reply_text(f"Sent prop scores to {sent_count} participants.")
+        return
+
     # /admin clearprops <week>
     if sub == "clearprops":
         if not rest or not rest[0].isdigit():
@@ -1082,7 +1127,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- default usage ----
     await update.message.reply_text(
-        "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners|sendprops|listprops|gradeprop|propscores|clearprops|shareprops|whoisleftprops>"
+        "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners|sendprops|listprops|gradeprop|propscores|sendpropscores|clearprops|shareprops|whoisleftprops>"
     )
 
 # ---------- helpers for /mypicks ----------
