@@ -136,6 +136,12 @@ See `fix_superbowl.py` for example of:
 - Creating multiple prop bets
 - Sending game + props to all participants
 
+## Offseason Mode
+The `OFFSEASON` env var on Heroku disables all 4 Scheduler jobs (import-week-upcoming, announce-winners, sendweek_upcoming, import-odds-upcoming) without deleting them. Jobs still run on schedule but exit immediately.
+
+- **Enable (after season ends):** `heroku config:set OFFSEASON=true -a nfl-picks-2025`
+- **Disable (before Week 1 in September):** `heroku config:remove OFFSEASON -a nfl-picks-2025`
+
 ## One-Off Scripts
 | Script | Purpose |
 |--------|---------|

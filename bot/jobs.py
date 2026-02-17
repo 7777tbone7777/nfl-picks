@@ -3311,6 +3311,11 @@ if __name__ == "__main__":
     import json
     import sys
 
+    # Skip all scheduled jobs during the offseason
+    if os.getenv("OFFSEASON", "").strip().lower() in {"1", "true", "yes", "on"}:
+        print(json.dumps({"status": "skipped", "reason": "offseason"}))
+        sys.exit(0)
+
     cmd = sys.argv[1] if len(sys.argv) >= 2 else None
 
     if cmd == "cron":
