@@ -200,7 +200,9 @@ def import_odds_upcoming() -> dict:
                 pts = -abs(Decimal(str(pts_raw)))
 
                 db.session.execute(
-                    T("UPDATE games SET favorite_team=:fav, spread_pts=:pts WHERE id=:gid"),
+                    T("""UPDATE games SET favorite_team=:fav, spread_pts=:pts
+                          WHERE id=:gid
+                            AND NOT EXISTS (SELECT 1 FROM picks p WHERE p.game_id = games.id)"""),
                     {"fav": fav_name, "pts": pts, "gid": gid},
                 )
                 updated += 1
@@ -483,8 +485,18 @@ def import_week_from_espn(season_year: int, week: int) -> dict:
                         status        = COALESCE(:status, status),
                         home_score    = COALESCE(:home_score, home_score),
                         away_score    = COALESCE(:away_score, away_score),
-                        favorite_team = COALESCE(:favorite_team, favorite_team),
-                        spread_pts    = COALESCE(:spread_pts, spread_pts)
+                        -- Freeze the line once anyone has picked this game.
+                        -- Scoring reads games.spread_pts at grade time, so
+                        -- moving it after picks are in re-bets everyone at a
+                        -- line they never saw. Scores/status keep syncing.
+                        favorite_team = CASE
+                            WHEN EXISTS (SELECT 1 FROM picks p WHERE p.game_id = games.id)
+                            THEN favorite_team
+                            ELSE COALESCE(:favorite_team, favorite_team) END,
+                        spread_pts    = CASE
+                            WHEN EXISTS (SELECT 1 FROM picks p WHERE p.game_id = games.id)
+                            THEN spread_pts
+                            ELSE COALESCE(:spread_pts, spread_pts) END
                     WHERE week_id=:week_id
                       AND lower(home_team)=lower(:home)
                       AND lower(away_team)=lower(:away)
