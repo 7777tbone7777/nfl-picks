@@ -393,6 +393,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /admin sendweek upcoming
     /admin import upcoming
     /admin winners
+    /admin broadcast <message>        (also: broadcast dry|me <message>)
     """
     user = update.effective_user
     # ---- admin check ----
@@ -403,7 +404,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not update.message or not update.message.text:
         await update.message.reply_text(
-            "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners>"
+            "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners|broadcast>"
         )
         return
 
@@ -944,6 +945,68 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logging.warning(f"Failed to send prop scores to {p['name']}: {e}")
 
             await update.message.reply_text(f"Sent prop scores to {sent_count} participants.")
+        return
+
+    # /admin broadcast <message> - send a free-text message to all participants
+    if sub == "broadcast":
+        # Pull the raw remainder rather than " ".join(rest) so newlines and
+        # runs of spaces in the admin's message survive intact.
+        parts_raw = (update.message.text or "").split(None, 2)
+        body = parts_raw[2] if len(parts_raw) >= 3 else ""
+
+        mode = "all"
+        low = body.lower()
+        if low.startswith("dry "):
+            mode, body = "dry", body[4:]
+        elif low.startswith("me "):
+            mode, body = "me", body[3:]
+
+        body = body.strip()
+        if not body:
+            await update.message.reply_text(
+                "Usage: /admin broadcast <message>\n"
+                "       /admin broadcast dry <message>   (preview, sends nothing)\n"
+                "       /admin broadcast me <message>    (send only to you)"
+            )
+            return
+
+        from sqlalchemy import text as T
+
+        from bot.jobs import create_app, db
+
+        app = create_app()
+        with app.app_context():
+            participants = db.session.execute(
+                T("SELECT name, telegram_chat_id FROM participants "
+                  "WHERE telegram_chat_id IS NOT NULL ORDER BY name")
+            ).mappings().all()
+
+        if mode == "dry":
+            names = ", ".join(p["name"] for p in participants) or "(nobody)"
+            await update.message.reply_text(
+                f"DRY RUN — would send to {len(participants)}: {names}\n"
+                f"{'-' * 24}\n{body}"
+            )
+            return
+
+        if mode == "me":
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=body)
+            await update.message.reply_text("Sent to you only.")
+            return
+
+        sent, failed = 0, []
+        for p in participants:
+            try:
+                await context.bot.send_message(chat_id=p["telegram_chat_id"], text=body)
+                sent += 1
+            except Exception as e:
+                failed.append(p["name"])
+                logging.warning("broadcast failed for %s: %s", p["name"], e)
+
+        note = f"Broadcast sent to {sent}/{len(participants)} participants."
+        if failed:
+            note += f"\nFailed: {', '.join(failed)}"
+        await update.message.reply_text(note)
         return
 
     # /admin clearprops <week>
