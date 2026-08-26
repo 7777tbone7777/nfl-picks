@@ -1317,29 +1317,50 @@ def fetch_espn_scoreboard(week: int, season_year: int):
                 except Exception:
                     spread_pts = None
 
-            if fav_name:
-                # fav_name can be abbreviation or name; try to match by suffix/prefix
-                cand = [home_team, away_team]
-                # Loose match: if token appears in full name (JAX -> Jacksonville Jaguars)
-                fav_low = fav_name.lower()
-                mtch = [t for t in cand if fav_low in t.lower() or t.lower().startswith(fav_low)]
-                favorite_team = (mtch[0] if mtch else fav_name)
+            # Preferred: ESPN states the favorite outright as a boolean.
+            if (o.get("homeTeamOdds") or {}).get("favorite"):
+                favorite_team = home_team
+            elif (o.get("awayTeamOdds") or {}).get("favorite"):
+                favorite_team = away_team
 
-            # Fallback: parse details like "PIT -5.5" / "JAX -2.5"
+            # Exact abbreviation -> full name map from THIS event's competitors.
+            # Substring matching was wrong for any abbreviation that is not a
+            # literal substring of the name ("lar" is not in "los angeles rams",
+            # likewise LAC/KC/TB/GB/NE/SF/NYG/NYJ/LV/NO), which silently left
+            # favorite_team NULL and dropped those games back to straight-up
+            # scoring in _ats_winner.
+            abbr_map = {}
+            for _c in (home_c, away_c):
+                _a = ((_c.get("team") or {}).get("abbreviation") or "").strip().lower()
+                if _a:
+                    abbr_map[_a] = _team_fullname(_c)
+
+            if favorite_team is None and fav_name:
+                fav_low = str(fav_name).strip().lower()
+                favorite_team = abbr_map.get(fav_low)
+                if favorite_team is None:
+                    favorite_team = next(
+                        (t for t in (home_team, away_team) if fav_low == t.lower()),
+                        None,
+                    )
+
+            # Fallback: parse details like "PIT -5.5" / "LAR -3.5"
             if (favorite_team is None or spread_pts is None) and details:
                 m = re.search(r"([A-Za-z]{2,4})\s*([+-]?\d+(?:\.\d+)?)", details)
                 if m:
                     abbr = m.group(1).lower()
-                    try:
-                        spread_pts = float(m.group(2))
-                    except Exception:
-                        pass
-                    # Pick the team whose name contains that abbr (rough heuristic)
-                    picks = [home_team, away_team]
-                    favorite_team = next(
-                        (t for t in picks if abbr in t.lower() or t.lower().startswith(abbr)),
-                        favorite_team
-                    )
+                    if spread_pts is None:
+                        try:
+                            spread_pts = float(m.group(2))
+                        except Exception:
+                            pass
+                    if favorite_team is None:
+                        favorite_team = abbr_map.get(abbr)
+
+            # "EVEN"/pick'em lines carry no favorite; leave both NULL so
+            # _ats_winner falls back to straight-up rather than inventing a side.
+            if favorite_team is None:
+                spread_pts = None
 
         out.append({
             "home_team": home_team,
