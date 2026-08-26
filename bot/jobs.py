@@ -1031,6 +1031,46 @@ def cron_announce_weekly_winners() -> dict:
         }
 
 
+def _resolve_import_target() -> tuple | None:
+    """
+    Decide which (season_year, internal_week) the upcoming-week import should target.
+
+    ESPN's live scoreboard is the source of truth so the season rolls over on its
+    own each September. This used to be pinned to MAX(season_year) in `weeks`,
+    which meant a finished season never advanced: once the Super Bowl (week 23)
+    went final, the import walked to week 24, asked ESPN for a postseason week
+    that does not exist, got zero events, and silently did nothing forever.
+
+    Returns None only if ESPN is unreachable AND the DB has no seasons at all.
+    """
+    year = None
+    try:
+        year, season_type, espn_week = detect_current_context()
+    except Exception:
+        logger.exception("detect_current_context failed; falling back to DB for season")
+
+    if year is not None:
+        if season_type == 1:
+            # Preseason: the next thing we actually run a pool for is regular W1.
+            return int(year), 1
+        if season_type == 3:
+            # Postseason maps onto our internal weeks 19..23.
+            return int(year), 18 + int(espn_week)
+        return int(year), int(espn_week)
+
+    season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
+    if not season:
+        return None
+    max_week = (
+        db.session.execute(
+            _text("SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y"),
+            {"y": season},
+        ).scalar()
+        or 0
+    )
+    return int(season), min(int(max_week) + 1, 23)
+
+
 def cron_import_upcoming_week() -> dict:
     """
     On Tuesday (America/Los_Angeles), import the NEXT upcoming week (first_kick > now)
@@ -1061,9 +1101,10 @@ def cron_import_upcoming_week() -> dict:
             return {"status": "skipped_non_tuesday", "now_pt": now_pt.isoformat()}
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        season = db.session.execute(_text("SELECT MAX(season_year) FROM weeks")).scalar()
-        if not season:
-            return {"error": "no season_year in weeks"}
+        target = _resolve_import_target()
+        if not target:
+            return {"error": "could not resolve season/week"}
+        season, espn_week = target
 
         # Find the next week with kickoff in the future
         rows = (
@@ -1085,21 +1126,10 @@ def cron_import_upcoming_week() -> dict:
         )
 
         upcoming = next((r for r in rows if r["first_kick"] and r["first_kick"] > now), None)
-        # If no week has future kickoff (or week exists but has 0 games), try to infer by +1
+        # No week has a future kickoff (or the row exists with 0 games) -> trust
+        # ESPN's current context rather than walking max_week + 1 off the end.
         if not upcoming:
-            # fall back to max week in season + 1
-            max_week = (
-                db.session.execute(
-                    _text(
-                        """
-                SELECT COALESCE(MAX(week_number), 0) FROM weeks WHERE season_year=:y
-            """
-                    ),
-                    {"y": season},
-                ).scalar()
-                or 0
-            )
-            target_week = max_week + 1
+            target_week = espn_week
         else:
             target_week = int(upcoming["week_number"])
 
@@ -1138,7 +1168,8 @@ def detect_current_context(timeout: float = 15.0):
     Hit ESPN's no-parameter scoreboard and return (year, season_type_int, week_number).
     season_type_int: 1=pre, 2=reg, 3=post
     """
-    with httpx.Client(timeout=timeout, headers={"User-Agent": "nfl-picks-bot/1.0"}) as client:
+    # No custom User-Agent -- ESPN 403s "nfl-picks-bot/1.0" (see fetch_espn_scoreboard).
+    with httpx.Client(timeout=timeout) as client:
         j = client.get(ESPN_SCOREBOARD_URL).json()
     year = int(j["season"]["year"])
     st = j["season"]["type"]
@@ -1181,31 +1212,48 @@ def fetch_espn_scoreboard(week: int, season_year: int):
     # Determine ESPN seasontype and week from our internal week number
     seasontype, espn_week = _get_espn_seasontype_and_week(week)
 
-    ua = {"User-Agent": "Mozilla/5.0 (nfl-picks bot)"}
+    # Send NO custom User-Agent. ESPN's WAF allowlists stock client UAs
+    # (Python-urllib/*, python-httpx/*, curl/*) and 403s custom ones -- the old
+    # "Mozilla/5.0 (nfl-picks bot)" was being rejected outright, which is what
+    # pushed this loop onto the HTML fallback URL below.
     def _get(url: str):
-        req = urllib.request.Request(url, headers=ua)
+        req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=20) as r:
-            return json.load(r)
+            raw = r.read()
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "json" not in ctype:
+            raise RuntimeError(
+                f"expected JSON, got Content-Type={ctype!r} "
+                f"(HTTP {r.status}, {len(raw)} bytes): {raw[:120]!r}"
+            )
+        return json.loads(raw)
 
-    # Preferred (the one that worked in your test)
+    # Both are JSON endpoints. The old third entry pointed at www.espn.com,
+    # an HTML page that could never parse -- it only ever served to overwrite
+    # last_err and hide why the real API calls failed.
     urls = [
         f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype={seasontype}&year={season_year}&week={espn_week}",
-        # Legacy fallbacks (some weeks/years used to work here)
         f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?seasontype={seasontype}&year={season_year}&week={espn_week}",
-        f"https://www.espn.com/nfl/scoreboard/_/week/{espn_week}/year/{season_year}/seasontype/{seasontype}",
     ]
 
-    last_err = None
+    errors = []
     data = None
     for url in urls:
         try:
             data = _get(url)
             break
         except Exception as e:
-            last_err = e
+            body = ""
+            if hasattr(e, "read"):
+                try:
+                    body = f" body={e.read()[:200]!r}"
+                except Exception:
+                    pass
+            errors.append(f"{url} -> {type(e).__name__}: {e}{body}")
 
     if data is None:
-        raise RuntimeError(f"ESPN fetch failed for week {week} {season_year}: {last_err}")
+        detail = " | ".join(errors) if errors else "no attempts made"
+        raise RuntimeError(f"ESPN fetch failed for week {week} {season_year}: {detail}")
 
     events = data.get("events", []) or []
     out = []
@@ -3311,12 +3359,26 @@ if __name__ == "__main__":
     import json
     import sys
 
-    # Skip all scheduled jobs during the offseason
-    if os.getenv("OFFSEASON", "").strip().lower() in {"1", "true", "yes", "on"}:
-        print(json.dumps({"status": "skipped", "reason": "offseason"}))
-        sys.exit(0)
-
     cmd = sys.argv[1] if len(sys.argv) >= 2 else None
+
+    # Skip SCHEDULED jobs during the offseason. Manual one-offs (import-week,
+    # sendweek, announce-winners-now) must still run -- bootstrapping a new
+    # season is precisely the thing you do while OFFSEASON is still set.
+    SCHEDULED_CMDS = {
+        "cron",
+        "sendweek_upcoming",
+        "import-week-upcoming",
+        "import-odds-upcoming",
+        "announce-winners",
+    }
+    if cmd in SCHEDULED_CMDS and os.getenv("OFFSEASON", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        print(json.dumps({"status": "skipped", "reason": "offseason", "cmd": cmd}))
+        sys.exit(0)
 
     if cmd == "cron":
         # Sync the CURRENT week (auto-detected) from ESPN to DB
