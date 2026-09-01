@@ -951,9 +951,42 @@ def cron_announce_weekly_winners() -> dict:
             if not last_completed:
                 logger.info("cron_announce_weekly_winners: no completed week yet")
                 return {"status": "noop", "reason": "no completed week"}
-            week_to_announce = max(2, last_completed)
+            week_to_announce = last_completed
         else:
-            week_to_announce = max(2, int(upcoming["week_number"]) - 1)
+            week_to_announce = int(upcoming["week_number"]) - 1
+
+        # The old max(2, ...) floor dated from 2025, when the pool started at
+        # Week 2. It made Week 1 impossible to announce and, worse, turned the
+        # Tuesday before Week 1 (upcoming=1 -> 1-1=0 -> floored to 2) into a
+        # broadcast of an all-zero "Week 2" that also claimed the dedupe slot
+        # for the real Week 2.
+        if week_to_announce < 1:
+            logger.info("cron_announce_weekly_winners: nothing played yet")
+            return {"status": "noop", "reason": "no prior week"}
+
+        # Never announce a week that has not actually been played.
+        final_games = db.session.execute(
+            _text("""
+                SELECT COUNT(*)
+                FROM games g
+                JOIN weeks w ON w.id = g.week_id
+                WHERE w.season_year = :y
+                  AND w.week_number = :w
+                  AND lower(COALESCE(g.status, '')) = 'final'
+            """),
+            {"y": season, "w": week_to_announce},
+        ).scalar() or 0
+        if final_games == 0:
+            logger.info(
+                "cron_announce_weekly_winners: W%s has no final games; skipping",
+                week_to_announce,
+            )
+            return {
+                "status": "noop",
+                "reason": "no final games",
+                "season_year": season,
+                "week": week_to_announce,
+            }
 
         # Dedupe table (separate from sendweek)
         db.session.execute(
