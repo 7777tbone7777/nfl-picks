@@ -2420,14 +2420,16 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
-      /seepicks <week_number> all [day]
-      /seepicks <week_number> <participant_name> [day]
+      /seepicks <week_number> all [day|locked]
+      /seepicks <week_number> <participant_name> [day|locked]
 
     - If 'all', compiles a grid of everyone's picks for that week and broadcasts
       the grid to each participant (DM) and replies in the invoking chat.
     - If a participant name is provided, shows only that person's picks for the week
       (replies in chat and DM to that participant if linked).
     - Optional [day]: Filter games by day of week (Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday)
+    - Optional [locked]: Only games whose kickoff has already passed, so sharing
+      picks never reveals a game that is still open
     """
     m = update.effective_message
     chat_id = str(update.effective_chat.id)
@@ -2436,9 +2438,10 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Validate args
     if len(args) < 2:
         return await m.reply_text(
-            "Usage: /seepicks <week_number> <participant|all> [day]\n"
+            "Usage: /seepicks <week_number> <participant|all> [day|locked]\n"
             "Examples:\n"
             "  /seepicks 13 all\n"
+            "  /seepicks 13 all locked\n"
             "  /seepicks 13 all Thursday\n"
             "  /seepicks 13 Kevin Sunday"
         )
@@ -2463,14 +2466,22 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     day_filter = None
     target_weekday = None
+    locked_only = False
 
-    # Check if last arg is a day name
+    # Check if last arg is a day name or the "locked" keyword
     if len(args) >= 3:
         potential_day = args[-1].lower()
         if potential_day in DAY_MAP:
             day_filter = args[-1]  # Keep original case for display
             target_weekday = DAY_MAP[potential_day]
             # Target is everything between week and day
+            target = " ".join(args[1:-1]).strip().strip('"').strip("'")
+        elif potential_day == "locked":
+            # Only games that have already kicked off. A day filter alone still
+            # exposes later games on the same day: Sunday has 10:00, 13:25 and
+            # 17:20 PT slots, so sharing "Sunday" in the morning reveals picks
+            # for games nobody has played yet.
+            locked_only = True
             target = " ".join(args[1:-1]).strip().strip('"').strip("'")
         else:
             # No day filter, target is everything after week
@@ -2535,6 +2546,15 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if not games:
             return await m.reply_text(f"No games found for Week {week} ({season}).")
+
+        # Restrict to games that have already started, if requested
+        if locked_only:
+            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            games = [g for g in games if g["game_time"] and g["game_time"] <= now_naive]
+            if not games:
+                return await m.reply_text(
+                    f"No games have kicked off yet in Week {week} ({season})."
+                )
 
         # Filter games by day of week if day_filter is specified
         if day_filter and target_weekday is not None:
