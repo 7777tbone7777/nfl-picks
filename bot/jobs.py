@@ -2420,8 +2420,8 @@ async def getscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Usage:
-      /seepicks <week_number> all [day|locked]
-      /seepicks <week_number> <participant_name> [day|locked]
+      /seepicks <week_number> all [day] [locked] [preview]
+      /seepicks <week_number> <participant_name> [day] [locked] [preview]
 
     - If 'all', compiles a grid of everyone's picks for that week and broadcasts
       the grid to each participant (DM) and replies in the invoking chat.
@@ -2430,6 +2430,8 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - Optional [day]: Filter games by day of week (Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday)
     - Optional [locked]: Only games whose kickoff has already passed, so sharing
       picks never reveals a game that is still open
+    - Optional [preview]: Reply to the caller only; send nothing to participants.
+      Modifiers combine in any order, e.g. "all locked preview".
     """
     m = update.effective_message
     chat_id = str(update.effective_chat.id)
@@ -2442,6 +2444,7 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Examples:\n"
             "  /seepicks 13 all\n"
             "  /seepicks 13 all locked\n"
+            "  /seepicks 13 all locked preview\n"
             "  /seepicks 13 all Thursday\n"
             "  /seepicks 13 Kevin Sunday"
         )
@@ -2467,28 +2470,31 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     day_filter = None
     target_weekday = None
     locked_only = False
+    preview_only = False
 
-    # Check if last arg is a day name or the "locked" keyword
-    if len(args) >= 3:
-        potential_day = args[-1].lower()
-        if potential_day in DAY_MAP:
-            day_filter = args[-1]  # Keep original case for display
-            target_weekday = DAY_MAP[potential_day]
-            # Target is everything between week and day
-            target = " ".join(args[1:-1]).strip().strip('"').strip("'")
-        elif potential_day == "locked":
-            # Only games that have already kicked off. A day filter alone still
-            # exposes later games on the same day: Sunday has 10:00, 13:25 and
-            # 17:20 PT slots, so sharing "Sunday" in the morning reveals picks
-            # for games nobody has played yet.
+    # Consume trailing modifier keywords in any order, leaving at least one
+    # token for the target. Recognized: a day name, "locked", "preview".
+    #
+    #   locked  -> only games whose kickoff has passed. A day filter alone
+    #              still exposes later games on the same day: Sunday runs
+    #              10:00, 13:25 and 17:20 PT slots, so sharing "Sunday" in
+    #              the morning reveals games nobody has played yet.
+    #   preview -> reply to the caller only, send nothing to anyone else.
+    tokens = list(args[1:])
+    while len(tokens) >= 2:
+        last = tokens[-1].lower()
+        if last in DAY_MAP and day_filter is None:
+            day_filter = tokens[-1]  # Keep original case for display
+            target_weekday = DAY_MAP[last]
+        elif last == "locked" and not locked_only:
             locked_only = True
-            target = " ".join(args[1:-1]).strip().strip('"').strip("'")
+        elif last == "preview" and not preview_only:
+            preview_only = True
         else:
-            # No day filter, target is everything after week
-            target = " ".join(args[1:]).strip().strip('"').strip("'")
-    else:
-        # No day filter possible
-        target = " ".join(args[1:]).strip().strip('"').strip("'")
+            break
+        tokens = tokens[:-1]
+
+    target = " ".join(tokens).strip().strip('"').strip("'")
 
     is_all = target.lower() == "all"
 
@@ -2636,8 +2642,12 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pick_map[(r["participant_id"], r["game_id"])] = r["selected_team"]
 
         # Build output (Option A: vertical format with spreads)
-        if day_filter:
+        if day_filter and locked_only:
+            header = f"📊 Week {week} - {day_filter.title()} Games, Started Only ({season})"
+        elif day_filter:
             header = f"📊 Week {week} - {day_filter.title()} Games Only ({season})"
+        elif locked_only:
+            header = f"📊 Week {week} - Started Games Only ({season})"
         else:
             header = f"📊 Week {week} Picks ({season})"
         lines_out = [header, ""]
@@ -2653,6 +2663,11 @@ async def seepicks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Blank line between games
             lines_out.append("")
         body = "\n".join(lines_out)
+
+        # Preview: show the caller the exact grid without sending it to anyone.
+        if preview_only:
+            await m.reply_text(f"👁 PREVIEW - not sent to anyone\n\n{body}")
+            return
 
         # Send to DMs only (avoid duplicate messages)
         if is_all:
