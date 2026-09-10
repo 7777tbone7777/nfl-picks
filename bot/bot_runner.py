@@ -5,6 +5,7 @@ from bot.telegram_handlers import seasonboard_command
 import logging
 import os
 
+from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -34,11 +35,13 @@ def build_application() -> Application:
         ApplicationBuilder()
         .token(token)
         .rate_limiter(AIORateLimiter())
+        .post_init(_publish_command_menu)
         .build()
     )
 
     # ---- Register handlers (specific commands FIRST) ----
     application.add_handler(CommandHandler("start", in_app_context(th.start)))
+    application.add_handler(CommandHandler("help", in_app_context(th.help_command)))
     # Pattern-based callback handlers for picks and props
     application.add_handler(CallbackQueryHandler(th.handle_pick, pattern="^pick:"))
     application.add_handler(CallbackQueryHandler(th.handle_prop_pick, pattern="^prop:"))
@@ -57,7 +60,58 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("mypicks", in_app_context(th.mypicks)))
     application.add_handler(CommandHandler("myprops", in_app_context(th.myprops)))
 
+    _warn_on_command_drift(application)
+
     return application
+
+
+def _warn_on_command_drift(application: Application) -> None:
+    """Log when bot/commands.py and the registered handlers disagree."""
+    from bot.commands import check_drift
+
+    registered = set()
+    for group in application.handlers.values():
+        for h in group:
+            if isinstance(h, CommandHandler):
+                registered.update(h.commands)
+
+    log = logging.getLogger(__name__)
+    for problem in check_drift(registered):
+        log.warning("command drift: %s", problem)
+
+
+async def _publish_command_menu(application: Application) -> None:
+    """Populate the Telegram command menu.
+
+    Participants see only the commands they can run. Admins get the full list
+    through a per-chat scope. Publishing on startup means the menu tracks
+    deploys instead of needing a manual BotFather update.
+    """
+    from bot.commands import telegram_admin_commands, telegram_user_commands
+
+    log = logging.getLogger(__name__)
+    try:
+        await application.bot.set_my_commands(
+            [BotCommand(n, d) for n, d in telegram_user_commands()],
+            scope=BotCommandScopeDefault(),
+        )
+        admin_menu = [BotCommand(n, d) for n, d in telegram_admin_commands()]
+        for admin_id in sorted(th.ADMIN_IDS):
+            try:
+                await application.bot.set_my_commands(
+                    admin_menu, scope=BotCommandScopeChat(chat_id=admin_id)
+                )
+            except Exception:
+                log.exception("Failed publishing admin menu to chat %s", admin_id)
+        log.info(
+            "Published command menu: %s public, %s admin, %s admin chat(s)",
+            len(telegram_user_commands()),
+            len(admin_menu),
+            len(th.ADMIN_IDS),
+        )
+    except Exception:
+        # A menu failure must never stop the bot from polling.
+        log.exception("Failed publishing the command menu")
 
 
 def main() -> None:

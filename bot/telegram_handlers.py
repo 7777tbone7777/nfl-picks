@@ -3,6 +3,12 @@
 from __future__ import annotations
 # add these
 
+from bot.commands import (
+    admin_usage_line,
+    render_admin_help,
+    render_command_help,
+    render_help,
+)
 from bot.jobs import create_app, db, _send_message, _pt, _spread_label, send_week_games
 from sqlalchemy import text as T
 
@@ -403,15 +409,18 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not update.message or not update.message.text:
-        await update.message.reply_text(
-            "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners|broadcast>"
-        )
+        await update.message.reply_text(admin_usage_line())
         return
 
     # ---- parse ----
     parts = update.message.text.strip().split()
     sub = parts[1].lower() if len(parts) >= 2 else ""
     rest = parts[2:] if len(parts) >= 3 else []
+
+    # ---- help ----
+    if sub in {"help", "?"}:
+        await update.message.reply_text(render_admin_help(rest[0] if rest else None))
+        return
 
     # ---- participants ----
     if sub == "participants":
@@ -1190,7 +1199,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- default usage ----
     await update.message.reply_text(
-        "Usage: /admin <participants|remove|deletepicks|gameids|setspread|sendweek upcoming|import upcoming|winners|sendprops|listprops|gradeprop|propscores|sendpropscores|clearprops|shareprops|whoisleftprops>"
+        admin_usage_line()
     )
 
 # ---------- helpers for /mypicks ----------
@@ -1421,3 +1430,22 @@ async def myprops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await msg.reply_text("❌ Sorry, /myprops failed. Check logs.")
             except Exception:
                 pass
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/help [command] - list commands, or show usage for one."""
+    m = update.effective_message
+    is_admin = _is_admin(update.effective_user)
+    args = context.args or []
+
+    if not args:
+        await m.reply_text(render_help(is_admin))
+        return
+
+    body = render_command_help(args[0], is_admin)
+    if body is None:
+        await m.reply_text(
+            f"No command named '{args[0]}'. Run /help for the list."
+        )
+        return
+    await m.reply_text(body)
