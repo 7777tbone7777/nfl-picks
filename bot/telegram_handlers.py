@@ -1228,7 +1228,11 @@ def _fetch_picks_sync(telegram_user_id: Optional[int]) -> List[Dict[str, Any]]:
 
     telegram_chat_id = str(telegram_user_id)
 
-    with db.engine.connect() as conn:  # type: ignore[attr-defined]
+    # Build an app context here rather than relying on the one bot_runner
+    # pushes at import. This runs in an asyncio.to_thread worker, and every
+    # other DB handler in this file (myprops, seasonboard) creates its own.
+    app = create_app()
+    with app.app_context(), db.engine.connect() as conn:  # type: ignore[attr-defined]
         # 1) Find participant by telegram_chat_id
         part_row = conn.execute(
             text(
@@ -1329,7 +1333,11 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("mypicks: crashed: %s", e)
         if msg:
             try:
-                await msg.reply_text("❌ Sorry, /mypicks failed. Check logs.")
+                # Name the error in the reply. "Check logs" meant opening the
+                # Heroku dashboard to learn anything at all.
+                await msg.reply_text(
+                    f"❌ /mypicks failed: {type(e).__name__}: {str(e)[:300]}"
+                )
             except Exception:
                 pass
 
