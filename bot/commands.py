@@ -48,10 +48,11 @@ COMMANDS: List[Command] = [
                "detail for one of them.",
     ),
     Command(
-        "mypicks", "[week]", "Show your picks for the current season",
+        "mypicks", "[week] [year]", "Show your picks",
         scope=USER, group="Your picks",
-        detail="Shows the current season only, grouped by week. Add a week "
-               "number to narrow it, for example /mypicks 1.",
+        detail="Defaults to the current season, grouped by week. Add a week "
+               "number, a year, or both in either order: /mypicks 1, "
+               "/mypicks 2025, /mypicks 1 2025.",
     ),
     Command(
         "myprops", "", "Show your prop bet picks",

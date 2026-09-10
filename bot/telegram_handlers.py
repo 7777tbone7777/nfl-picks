@@ -1243,7 +1243,9 @@ def _format_user_picks(picks: List[Dict[str, Any]]) -> str:
 
 
 def _fetch_picks_sync(
-    telegram_user_id: Optional[int], week: Optional[int] = None
+    telegram_user_id: Optional[int],
+    week: Optional[int] = None,
+    season: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Blocking DB work — executed via asyncio.to_thread() from the async handler.
@@ -1294,7 +1296,10 @@ def _fetch_picks_sync(
                 JOIN games g ON g.id = p.game_id
                 JOIN weeks w ON w.id = g.week_id
                 WHERE p.participant_id = :pid
-                  AND w.season_year = (SELECT MAX(season_year) FROM weeks)
+                  AND w.season_year = COALESCE(
+                        CAST(:season AS INTEGER),
+                        (SELECT MAX(season_year) FROM weeks)
+                      )
                   AND (
                         CAST(:week AS INTEGER) IS NULL
                         OR w.week_number = CAST(:week AS INTEGER)
@@ -1302,7 +1307,7 @@ def _fetch_picks_sync(
                 ORDER BY w.week_number ASC, g.game_time ASC
                 """
             ),
-            {"pid": participant_id, "week": week},
+            {"pid": participant_id, "week": week, "season": season},
         ).fetchall()
 
         picks: List[Dict[str, Any]] = []
@@ -1320,7 +1325,10 @@ def _fetch_picks_sync(
 
 
 async def _load_user_picks(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, week: Optional[int] = None
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    week: Optional[int] = None,
+    season: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Preferred path: use an injected service at application.bot_data['svc'].get_user_picks(user_id).
@@ -1337,7 +1345,7 @@ async def _load_user_picks(
         return await result if hasattr(result, "__await__") else result
 
     # Fallback to direct DB, offloaded to a thread
-    return await asyncio.to_thread(_fetch_picks_sync, user_id, week)
+    return await asyncio.to_thread(_fetch_picks_sync, user_id, week, season)
 
 
 # ---------- /mypicks (lives here) ----------
@@ -1357,20 +1365,40 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             getattr(update.effective_chat, "id", None),
         )
 
-        # Optional week filter: /mypicks 1
+        # Optional filters: /mypicks <week> <year>, in either order.
+        # Weeks run 1-23 and seasons are four digits, so the two never collide.
         week = None
-        args = context.args or []
-        if args:
+        season = None
+        for arg in context.args or []:
             try:
-                week = int(args[0])
+                value = int(arg)
             except ValueError:
                 if msg:
                     await msg.reply_text(
-                        "Week must be a number, for example /mypicks 1"
+                        "Use numbers, for example /mypicks 1 or /mypicks 1 2025"
                     )
                 return
+            if value >= 1000:
+                season = value
+            else:
+                week = value
 
-        picks = await _load_user_picks(update, context, week)
+        picks = await _load_user_picks(update, context, week, season)
+
+        if not picks:
+            where = []
+            if week is not None:
+                where.append(f"Week {week}")
+            if season is not None:
+                where.append(str(season))
+            if msg:
+                await msg.reply_text(
+                    f"No picks found for {', '.join(where)}."
+                    if where
+                    else "You have no saved picks yet."
+                )
+            return
+
         out_text = _format_user_picks(picks)
 
         if msg:
