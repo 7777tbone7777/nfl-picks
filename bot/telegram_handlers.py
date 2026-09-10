@@ -1204,21 +1204,47 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- helpers for /mypicks ----------
 
+def _chunk_message(body: str, limit: int = 3800) -> List[str]:
+    """Split on line boundaries to stay under Telegram's 4096-character cap."""
+    chunks: List[str] = []
+    current: List[str] = []
+    size = 0
+    for line in body.split("\n"):
+        if size + len(line) + 1 > limit and current:
+            chunks.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [body]
+
+
 def _format_user_picks(picks: List[Dict[str, Any]]) -> str:
-    """Format a user's picks into a readable message."""
+    """Format a user's picks, grouped by week."""
     if not picks:
         return "You have no saved picks yet."
-    lines = []
+
+    season = picks[0].get("season_year")
+    lines = [f"🏈 Your picks — {season} season", ""]
+    current_week = None
     for p in picks:
         week_no = p.get("week_number", "?")
+        if week_no != current_week:
+            if current_week is not None:
+                lines.append("")
+            lines.append(f"— Week {week_no} —")
+            current_week = week_no
         away = p.get("away_team", "?")
         home = p.get("home_team", "?")
         choice = p.get("selected_team", "?")
-        lines.append(f"• Week {week_no} — {away} @ {home} → {choice}")
+        lines.append(f"• {away} @ {home} → {choice}")
     return "\n".join(lines)
 
 
-def _fetch_picks_sync(telegram_user_id: Optional[int]) -> List[Dict[str, Any]]:
+def _fetch_picks_sync(
+    telegram_user_id: Optional[int], week: Optional[int] = None
+) -> List[Dict[str, Any]]:
     """
     Blocking DB work — executed via asyncio.to_thread() from the async handler.
     Returns dicts with: week_number, away_team, home_team, selected_team.
@@ -1251,10 +1277,15 @@ def _fetch_picks_sync(telegram_user_id: Optional[int]) -> List[Dict[str, Any]]:
         participant_id = part_row[0]
 
         # 2) Join picks → games → weeks
+        # Restrict to the current season. Without this the query returned every
+        # pick ever made -- roughly 250 rows after the 2025 season -- and the
+        # formatted message blew past Telegram's 4096-character limit, which
+        # surfaced as "BadRequest: Message is too long".
         rows = conn.execute(
             text(
                 """
                 SELECT
+                  w.season_year,
                   w.week_number,
                   g.away_team,
                   g.home_team,
@@ -1263,27 +1294,33 @@ def _fetch_picks_sync(telegram_user_id: Optional[int]) -> List[Dict[str, Any]]:
                 JOIN games g ON g.id = p.game_id
                 JOIN weeks w ON w.id = g.week_id
                 WHERE p.participant_id = :pid
-                ORDER BY w.season_year DESC, w.week_number ASC, g.game_time ASC
+                  AND w.season_year = (SELECT MAX(season_year) FROM weeks)
+                  AND (
+                        CAST(:week AS INTEGER) IS NULL
+                        OR w.week_number = CAST(:week AS INTEGER)
+                      )
+                ORDER BY w.week_number ASC, g.game_time ASC
                 """
             ),
-            {"pid": participant_id},
+            {"pid": participant_id, "week": week},
         ).fetchall()
 
         picks: List[Dict[str, Any]] = []
         for r in rows:
             picks.append(
                 {
-                    "week_number": r[0],
-                    "away_team": r[1],
-                    "home_team": r[2],
-                    "selected_team": r[3],
+                    "season_year": r[0],
+                    "week_number": r[1],
+                    "away_team": r[2],
+                    "home_team": r[3],
+                    "selected_team": r[4],
                 }
             )
         return picks
 
 
 async def _load_user_picks(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE, week: Optional[int] = None
 ) -> List[Dict[str, Any]]:
     """
     Preferred path: use an injected service at application.bot_data['svc'].get_user_picks(user_id).
@@ -1300,7 +1337,7 @@ async def _load_user_picks(
         return await result if hasattr(result, "__await__") else result
 
     # Fallback to direct DB, offloaded to a thread
-    return await asyncio.to_thread(_fetch_picks_sync, user_id)
+    return await asyncio.to_thread(_fetch_picks_sync, user_id, week)
 
 
 # ---------- /mypicks (lives here) ----------
@@ -1320,14 +1357,27 @@ async def mypicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             getattr(update.effective_chat, "id", None),
         )
 
-        if msg:
-            await msg.reply_text("✅ /mypicks handler reached. Fetching your picks...")
+        # Optional week filter: /mypicks 1
+        week = None
+        args = context.args or []
+        if args:
+            try:
+                week = int(args[0])
+            except ValueError:
+                if msg:
+                    await msg.reply_text(
+                        "Week must be a number, for example /mypicks 1"
+                    )
+                return
 
-        picks = await _load_user_picks(update, context)
+        picks = await _load_user_picks(update, context, week)
         out_text = _format_user_picks(picks)
 
         if msg:
-            await msg.reply_text(out_text, disable_web_page_preview=True)
+            # Send in pieces rather than letting Telegram reject the whole
+            # message once a season's worth of picks accumulates.
+            for chunk in _chunk_message(out_text):
+                await msg.reply_text(chunk, disable_web_page_preview=True)
 
     except Exception as e:  # pragma: no cover
         log.exception("mypicks: crashed: %s", e)
