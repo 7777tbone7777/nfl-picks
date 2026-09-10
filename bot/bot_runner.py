@@ -119,6 +119,12 @@ def main() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # httpx logs every request URL at INFO, and the Telegram API URL embeds the
+    # bot token: .../bot<TOKEN>/getUpdates. At one poll per 10 seconds that
+    # writes the token to the log thousands of times a day and buries every
+    # other line. Warnings and errors still come through.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     app = build_application()
     logging.getLogger(__name__).info("Starting bot polling…")
     app.run_polling(close_loop=False)
