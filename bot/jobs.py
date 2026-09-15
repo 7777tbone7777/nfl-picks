@@ -799,9 +799,13 @@ def _compute_week_results(season_year: int, week: int):
 
 def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
     """
-    Season totals starting from WEEK 2 (Week 1 treated as zero).
+    Season totals across every completed week.
     Returns [{'participant_id', 'name', 'wins'}, ...] ordered by wins desc.
     Uses ATS winner from DB winner column.
+
+    This counted from Week 2 because the 2025 pool did not start until later
+    in the season. In 2026 the pool starts at Week 1, so that floor reported
+    every participant at zero until Week 2 finished.
     """
     from sqlalchemy import text as _text
 
@@ -814,7 +818,7 @@ def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
                  g.winner AS winner  -- Use ATS winner stored in DB
           FROM games g
           JOIN weeks w ON w.id = g.week_id
-          WHERE w.season_year=:y AND w.week_number >= 2 AND w.week_number <= :wk AND g.status='final'
+          WHERE w.season_year=:y AND w.week_number >= 1 AND w.week_number <= :wk AND g.status='final'
         ),
         per_participant AS (
           SELECT p.id AS participant_id,
@@ -1175,6 +1179,21 @@ def cron_import_upcoming_week() -> dict:
         # ESPN's current context rather than walking max_week + 1 off the end.
         if not upcoming:
             target_week = espn_week
+            # ESPN does not roll its scoreboard to the next week until partway
+            # through Tuesday. On 2026-09-15 at 08:30 PT it still reported week
+            # 1, so this re-imported a week that was already complete and the
+            # 09:30 sender found no upcoming games. Never target a week whose
+            # games have all gone final.
+            last_done = _find_last_completed_week_number(season)
+            if last_done is not None and target_week <= last_done:
+                target_week = last_done + 1
+                logger.info(
+                    "cron_import_upcoming_week: ESPN still on W%s but W%s is "
+                    "complete; advancing to W%s",
+                    espn_week, last_done, target_week,
+                )
+            if target_week > 23:
+                return {"status": "season_complete", "season_year": season}
         else:
             target_week = int(upcoming["week_number"])
 
@@ -3568,7 +3587,7 @@ if __name__ == "__main__":
             now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
             upcoming = _find_upcoming_week_row(season, now_utc_naive)
             if upcoming:
-                week_to_announce = max(2, int(upcoming["week_number"]) - 1)
+                week_to_announce = int(upcoming["week_number"]) - 1
             else:
                 last_week = (
                     db.session.execute(
@@ -3579,7 +3598,9 @@ if __name__ == "__main__":
                     ).scalar()
                     or 0
                 )
-                week_to_announce = max(2, last_week)
+                week_to_announce = last_week
+            if week_to_announce < 1:
+                raise SystemExit("No completed week to announce yet.")
 
             # Ensure dedupe table, then try to claim this week
             db.session.execute(
