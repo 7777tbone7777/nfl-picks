@@ -1518,6 +1518,7 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         )
 
     linkable = 0  # how many DB games had a corresponding ESPN event
+    change_lines = []  # one readable line per game actually updated
     changed = 0  # how many DB rows we actually modified this run
     updated_scores = 0
     updated_status = 0
@@ -1603,6 +1604,23 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
             db.session.execute(_text(sql), params)
             changed += 1
 
+            STATUS_LABEL = {
+                "final": "final",
+                "in_progress": "in progress",
+                "scheduled": "scheduled",
+            }
+            a_txt = es_away_score if es_away_score is not None else "-"
+            h_txt = es_home_score if es_home_score is not None else "-"
+            note = []
+            if "status" in params:
+                note.append(STATUS_LABEL.get(es_status, str(es_status)))
+            if "winner" in params:
+                note.append(f"ATS {new_winner}" if new_winner else "ATS push")
+            line = f"{db_away} {a_txt} @ {db_home} {h_txt}"
+            if note:
+                line += " - " + ", ".join(note)
+            change_lines.append(line)
+
     # Commit once at the end for performance
     if changed:
         db.session.commit()
@@ -1614,12 +1632,31 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         e = es_map[(a, h)]
         unmatched_espn.append(f"{e.get('away_team','?')} @ {e.get('home_team','?')}")
 
+    # How the week stands after syncing, for a plain-language reply.
+    status_counts = {"final": 0, "in_progress": 0, "scheduled": 0}
+    for st, cnt in db.session.execute(
+        _text(
+            """
+            SELECT COALESCE(g.status, 'scheduled') AS st, COUNT(*)
+            FROM games g
+            JOIN weeks w ON w.id = g.week_id
+            WHERE w.season_year = :y AND w.week_number = :w
+            GROUP BY 1
+            """
+        ),
+        {"y": season_year, "w": week},
+    ).all():
+        status_counts[st] = status_counts.get(st, 0) + int(cnt)
+
     return {
         "season_year": season_year,
         "week": week,
         "total_games": len(rows),
-        "linkable": linkable,  # NEW: how many DB games were matchable by names
-        "matched": changed,  # kept semantics: rows actually changed this run
+        "linkable": linkable,  # how many DB games were matchable by names
+        "changed": changed,  # rows actually changed this run
+        "matched": changed,  # deprecated alias; "matched" reads as the opposite
+        "change_lines": change_lines,
+        "status_counts": status_counts,
         "updated_scores": updated_scores,
         "updated_winner": updated_winner if has_winner_col else 0,
         "updated_status": updated_status,
@@ -2014,12 +2051,38 @@ async def syncscores_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         summary = sync_week_scores_from_espn(week, season_year)
 
-    # Compact summary
-    lines = [
-        f"🔄 Synced ESPN → DB for Week {summary['week']} ({summary['season_year']})",
-        f"Games in DB: {summary['total_games']}  |  No change: {summary['matched']}",
-        f"Updated → scores: {summary['updated_scores']}  winner: {summary['updated_winner']}  status: {summary['updated_status']}",
-    ]
+    # Plain-language summary. The old version labelled summary['matched'] as
+    # "No change", but that key counts rows that DID change, so it reported the
+    # exact opposite of what happened.
+    sc = summary.get("status_counts") or {}
+    total = summary["total_games"]
+    linkable = summary.get("linkable", 0)
+    changed = summary.get("changed", summary.get("matched", 0))
+
+    lines = [f"🔄 Week {summary['week']} ({summary['season_year']}) synced from ESPN", ""]
+
+    match_note = (
+        f"{total} games, all matched on ESPN"
+        if linkable == total
+        else f"{total} games, {linkable} matched on ESPN"
+    )
+    lines.append(match_note)
+    lines.append(
+        f"Final {sc.get('final', 0)}  |  "
+        f"In progress {sc.get('in_progress', 0)}  |  "
+        f"Not started {sc.get('scheduled', 0)}"
+    )
+    lines.append("")
+
+    if changed == 0:
+        lines.append("Nothing changed. The database already matched ESPN.")
+    else:
+        lines.append(f"Updated {changed} game(s):")
+        for line in (summary.get("change_lines") or [])[:12]:
+            lines.append(f"• {line}")
+        extra = len(summary.get("change_lines") or []) - 12
+        if extra > 0:
+            lines.append(f"• …and {extra} more")
     if summary["missing_in_espn"]:
         samp = ", ".join(summary["missing_in_espn"][:3])
         lines.append(
