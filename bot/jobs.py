@@ -1593,10 +1593,13 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
         if ("home_score" in params) or ("away_score" in params):
             updated_scores += 1
 
-        # Winner (ATS) - update if column exists and value changed (None = push is valid)
-        if has_winner_col and cur_winner != new_winner:
+        # Winner (ATS) - only once the game is final. Computing it from a live
+        # score stored a provisional result that could still flip, and it
+        # surfaced in the sync reply as "in progress, ATS <team>".
+        eff_status = es_status or cur_status
+        if has_winner_col and eff_status == "final" and cur_winner != new_winner:
             sets.append("winner = :winner")
-            params["winner"] = new_winner  # Can be None for push
+            params["winner"] = new_winner  # None means push
             updated_winner += 1
 
         if sets:
@@ -1614,8 +1617,21 @@ def sync_week_scores_from_espn(week: int, season_year: int) -> dict:
             note = []
             if "status" in params:
                 note.append(STATUS_LABEL.get(es_status, str(es_status)))
-            if "winner" in params:
-                note.append(f"ATS {new_winner}" if new_winner else "ATS push")
+            # Report the result on every final game, not only when the winner
+            # column happened to change on this run.
+            if eff_status == "final":
+                db_favorite = r.get("favorite_team")
+                db_spread = r.get("spread_pts")
+                if db_favorite and db_spread is not None:
+                    note.append(f"ATS: {new_winner}" if new_winner else "ATS: push")
+                else:
+                    # No line stored, so _ats_winner fell back to straight-up.
+                    # Say so rather than labelling it ATS.
+                    note.append(
+                        f"NO SPREAD, straight-up: {new_winner}"
+                        if new_winner
+                        else "NO SPREAD, tie"
+                    )
             line = f"{db_away} {a_txt} @ {db_home} {h_txt}"
             if note:
                 line += " - " + ", ".join(note)
