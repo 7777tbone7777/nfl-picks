@@ -146,6 +146,86 @@ async def seasonboard_command(update, context):
             wins_by_pid.setdefault(pid, 0)
             wins_by_pid_week.setdefault(pid, {})
 
+        # 4b) Weekly pot. Everyone in the pool owes the buy-in every week,
+        # whether or not they submitted picks. Only weeks where every game is
+        # final are settled; a week still in progress has no winner yet.
+        BUY_IN_CENTS = 2000
+
+        settled_weeks = {
+            int(r[0])
+            for r in db.session.execute(
+                T("""
+                    SELECT w.week_number
+                      FROM weeks w
+                      JOIN games g ON g.week_id = w.id
+                     WHERE w.season_year = :y
+                  GROUP BY w.week_number
+                    HAVING COUNT(*) FILTER (
+                             WHERE LOWER(COALESCE(g.status,'')) <> 'final'
+                           ) = 0
+                """),
+                {"y": season_year},
+            ).all()
+        }
+
+        week_start = {
+            int(r[0]): r[1]
+            for r in db.session.execute(
+                T("""
+                    SELECT w.week_number, MIN(g.game_time)
+                      FROM weeks w
+                      JOIN games g ON g.week_id = w.id
+                     WHERE w.season_year = :y
+                  GROUP BY w.week_number
+                """),
+                {"y": season_year},
+            ).all()
+        }
+
+        joined_at = {
+            int(r[0]): r[1]
+            for r in db.session.execute(
+                T("SELECT id, created_at FROM participants")
+            ).all()
+        }
+
+        net_cents = {pid: 0 for pid in names}
+        for wk in sorted(settled_weeks):
+            start = week_start.get(wk)
+            # A participant owes for a week only if they had joined by kickoff,
+            # so someone who signs up in week 8 does not owe for weeks 1-7.
+            in_pot = [
+                pid
+                for pid in names
+                if start is None
+                or joined_at.get(pid) is None
+                or joined_at[pid] <= start
+            ]
+            if not in_pot:
+                continue
+
+            pot = BUY_IN_CENTS * len(in_pot)
+            best = max(wins_by_pid_week.get(pid, {}).get(wk, 0) for pid in in_pot)
+            winners = [
+                pid for pid in in_pot if wins_by_pid_week.get(pid, {}).get(wk, 0) == best
+            ]
+
+            # Integer cents, with any remainder handed out one cent at a time so
+            # a three-way split still sums back to the pot exactly.
+            share, remainder = divmod(pot, len(winners))
+            for i, pid in enumerate(sorted(winners)):
+                net_cents[pid] += share + (1 if i < remainder else 0)
+            for pid in in_pot:
+                net_cents[pid] -= BUY_IN_CENTS
+
+        def _money(cents: int) -> str:
+            sign = "+" if cents > 0 else ("-" if cents < 0 else "")
+            a = abs(cents)
+            whole, rem = divmod(a, 100)
+            return f"{sign}${whole}" if rem == 0 else f"{sign}${whole}.{rem:02d}"
+
+        unsettled = sorted(w for w in weeks if w not in settled_weeks)
+
         # 5) Render the board as a fixed-width grid.
         #
         # Telegram uses a proportional font for plain text, so padding with
@@ -176,10 +256,12 @@ async def seasonboard_command(update, context):
 
         widths = {w: week_width(w) for w in shown_weeks}
         total_w = max([len("Tot")] + [len(str(t)) for _, t in ordered])
+        net_w = max([len("Net")] + [len(_money(net_cents.get(pid, 0))) for pid, _ in ordered])
 
         head = "Name".ljust(name_w)
         head += "  " + " ".join(f"W{w}".rjust(widths[w]) for w in shown_weeks)
         head += "  " + "Tot".rjust(total_w)
+        head += "  " + "Net".rjust(net_w)
 
         grid = [head, "-" * len(head)]
         for pid, total in ordered:
@@ -188,9 +270,19 @@ async def seasonboard_command(update, context):
                 str(wins_by_pid_week[pid].get(w, 0)).rjust(widths[w]) for w in shown_weeks
             )
             row += "  " + str(total).rjust(total_w)
+            row += "  " + _money(net_cents.get(pid, 0)).rjust(net_w)
             grid.append(row)
 
-        note = f"\nShowing last {len(shown_weeks)} weeks of {len(weeks)}." if trimmed > 0 else ""
+        notes = []
+        if trimmed > 0:
+            notes.append(f"Showing last {len(shown_weeks)} weeks of {len(weeks)}.")
+        if unsettled:
+            wk_list = ", ".join(f"W{w}" for w in unsettled)
+            notes.append(f"Not settled yet: {wk_list} (games still to finish).")
+        if settled_weeks:
+            notes.append(f"Net is $20/week per player, winner takes the pot.")
+        note = ("\n" + "\n".join(notes)) if notes else ""
+
         msg = (
             "🏆 Season-to-date Scoreboard\n"
             f"Season {season_year} — completed games only\n\n"

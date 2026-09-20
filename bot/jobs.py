@@ -856,7 +856,21 @@ def _compute_season_totals(season_year: int, up_to_week_inclusive: int):
     ]
 
 
-def _format_winners_and_totals(week: int, weekly_rows, season_rows):
+BUY_IN_CENTS = 2000  # $20 per player per week
+
+
+def _money(cents: int) -> str:
+    sign = "+" if cents > 0 else ("-" if cents < 0 else "")
+    a = abs(cents)
+    whole, rem = divmod(a, 100)
+    return f"{sign}${whole}" if rem == 0 else f"{sign}${whole}.{rem:02d}"
+
+
+def _format_winners_and_totals(week: int, weekly_rows, season_rows, players_in_pot=None):
+    """players_in_pot: how many people paid into this week's pot.
+
+    Defaults to the number of rows in season_rows, which is the whole pool.
+    """
     # Weekly winners (could be tie)
     if not weekly_rows:
         weekly_line = f"Week {week} Winner: (no final games / no picks)"
@@ -865,6 +879,21 @@ def _format_winners_and_totals(week: int, weekly_rows, season_rows):
         winners = [r for r in weekly_rows if r["wins"] == top]
         names = ", ".join(f"{w['name']} ({w['wins']})" for w in winners)
         weekly_line = f"🏆 Week {week} Winner(s): {names}"
+
+        # Payout: everyone pays the buy-in, winners split the pot.
+        n_players = players_in_pot or len(season_rows) or len(winners)
+        if n_players:
+            pot = BUY_IN_CENTS * n_players
+            share, remainder = divmod(pot, len(winners))
+            if len(winners) == 1:
+                net = share - BUY_IN_CENTS
+                weekly_line += f"\n💰 {winners[0]['name']} wins {_money(net)}"
+            else:
+                parts = []
+                for i, w in enumerate(sorted(winners, key=lambda r: r["name"])):
+                    net = share + (1 if i < remainder else 0) - BUY_IN_CENTS
+                    parts.append(f"{w['name']} {_money(net)}")
+                weekly_line += "\n💰 Pot split: " + ", ".join(parts)
 
     # Season table (compact)
     lines = ["\n📊 Season Standings (through Week " + str(week) + "):"]
