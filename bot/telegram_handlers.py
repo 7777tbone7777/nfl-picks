@@ -146,19 +146,56 @@ async def seasonboard_command(update, context):
             wins_by_pid.setdefault(pid, 0)
             wins_by_pid_week.setdefault(pid, {})
 
-        # 5) Render a compact board
-        header = "🏆 Season-to-date Scoreboard\n"
-        sub = f"Season {season_year} — completed games only"
-        week_cols = " ".join([f"W{w:>2}" if w >= 10 else f"W{w}" for w in weeks])
+        # 5) Render the board as a fixed-width grid.
+        #
+        # Telegram uses a proportional font for plain text, so padding with
+        # spaces does not line columns up. Wrapping the table in <pre> forces
+        # monospace, which is what makes the grid hold together. Week values
+        # were also unpadded, so "11 2" and "8 4" started at different offsets.
+        from html import escape
 
-        lines = []
-        # Sort by total desc, then name asc for stability
-        for pid, total in sorted(wins_by_pid.items(), key=lambda kv: (-kv[1], names.get(kv[0], ""))):
-            per_week = [str(wins_by_pid_week[pid].get(w, 0)) for w in weeks]
-            lines.append(f"{names.get(pid, pid):<12} | {' '.join(per_week)} | Total {total}")
+        ordered = sorted(
+            wins_by_pid.items(), key=lambda kv: (-kv[1], names.get(kv[0], ""))
+        )
 
-        body = "\n".join(lines)
-        msg = f"{header}{sub}\n\nName         | {week_cols} | Total\n{body}"
+        # Keep the line narrow enough for a phone. Late in the season the full
+        # run of weeks is too wide, so show the most recent ones.
+        MAX_WEEK_COLS = 10
+        shown_weeks = weeks[-MAX_WEEK_COLS:]
+        trimmed = len(weeks) - len(shown_weeks)
+
+        name_w = max([len("Name")] + [len(str(names.get(pid, pid))) for pid, _ in ordered])
+        name_w = min(name_w, 14)
+
+        def week_width(w):
+            widest = max(
+                [len(f"W{w}")]
+                + [len(str(wins_by_pid_week[pid].get(w, 0))) for pid, _ in ordered]
+            )
+            return max(widest, 2)
+
+        widths = {w: week_width(w) for w in shown_weeks}
+        total_w = max([len("Tot")] + [len(str(t)) for _, t in ordered])
+
+        head = "Name".ljust(name_w)
+        head += "  " + " ".join(f"W{w}".rjust(widths[w]) for w in shown_weeks)
+        head += "  " + "Tot".rjust(total_w)
+
+        grid = [head, "-" * len(head)]
+        for pid, total in ordered:
+            row = str(names.get(pid, pid))[:name_w].ljust(name_w)
+            row += "  " + " ".join(
+                str(wins_by_pid_week[pid].get(w, 0)).rjust(widths[w]) for w in shown_weeks
+            )
+            row += "  " + str(total).rjust(total_w)
+            grid.append(row)
+
+        note = f"\nShowing last {len(shown_weeks)} weeks of {len(weeks)}." if trimmed > 0 else ""
+        msg = (
+            "🏆 Season-to-date Scoreboard\n"
+            f"Season {season_year} — completed games only\n\n"
+            "<pre>" + escape("\n".join(grid)) + "</pre>" + note
+        )
 
         # 6) Send to all participants or just reply
         if broadcast_all:
@@ -167,13 +204,13 @@ async def seasonboard_command(update, context):
                 chat_id = p.get("telegram_chat_id")
                 if chat_id:
                     try:
-                        _send_message(chat_id, msg)
+                        _send_message(chat_id, msg, parse_mode="HTML")
                         sent_count += 1
                     except Exception as e:
                         log.warning(f"Failed to send scoreboard to {p['name']}: {e}")
             await update.message.reply_text(f"✅ Scoreboard sent to {sent_count} participant(s).")
         else:
-            await update.message.reply_text(msg)
+            await update.message.reply_text(msg, parse_mode="HTML")
 
 
 def _is_admin(user) -> bool:
