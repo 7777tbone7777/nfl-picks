@@ -551,6 +551,89 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(render_admin_help(rest[0] if rest else None))
         return
 
+    # ---- setpick ----
+    if sub == "setpick":
+        if len(rest) < 3:
+            await update.message.reply_text(
+                "Usage: /admin setpick <name> <game_id> <team>\n"
+                "Example: /admin setpick Joel 991 Dallas\n"
+                "Find game IDs with /admin gameids <week>."
+            )
+            return
+
+        who = rest[0]
+        try:
+            gid = int(rest[1])
+        except ValueError:
+            await update.message.reply_text("game_id must be a number.")
+            return
+        team_arg = " ".join(rest[2:]).strip()
+
+        from bot.jobs import create_app as _ca
+
+        app = _ca()
+        with app.app_context():
+            person = db.session.execute(
+                T("SELECT id, name FROM participants WHERE lower(name)=lower(:n)"),
+                {"n": who},
+            ).mappings().first()
+            if not person:
+                await update.message.reply_text(f"Participant '{who}' not found.")
+                return
+
+            game = db.session.execute(
+                T("""
+                    SELECT g.id, g.away_team, g.home_team, g.game_time, w.week_number
+                      FROM games g JOIN weeks w ON w.id = g.week_id
+                     WHERE g.id = :gid
+                """),
+                {"gid": gid},
+            ).mappings().first()
+            if not game:
+                await update.message.reply_text(f"Game {gid} not found.")
+                return
+
+            # Match the argument against this game's two teams so selected_team
+            # is stored exactly as the grader compares it.
+            t = team_arg.lower()
+            if t in game["home_team"].lower():
+                chosen = game["home_team"]
+            elif t in game["away_team"].lower():
+                chosen = game["away_team"]
+            else:
+                await update.message.reply_text(
+                    f"'{team_arg}' does not match either team in game {gid}:\n"
+                    f"{game['away_team']} @ {game['home_team']}"
+                )
+                return
+
+            # Deliberately allows a pick after kickoff. That is the whole point
+            # of an override: a participant texts a pick they could not enter.
+            db.session.execute(
+                T("""
+                    INSERT INTO picks (participant_id, game_id, selected_team, created_at)
+                    VALUES (:pid, :gid, :team, NOW())
+                    ON CONFLICT (participant_id, game_id)
+                    DO UPDATE SET selected_team = EXCLUDED.selected_team
+                """),
+                {"pid": person["id"], "gid": gid, "team": chosen},
+            )
+            db.session.commit()
+
+            late = ""
+            if game["game_time"] is not None:
+                from datetime import datetime, timezone
+
+                if game["game_time"] <= datetime.now(timezone.utc).replace(tzinfo=None):
+                    late = "\n⚠️ This game has already started."
+
+            await update.message.reply_text(
+                f"✅ {person['name']} → {chosen}\n"
+                f"Week {game['week_number']}: {game['away_team']} @ {game['home_team']}"
+                f"{late}"
+            )
+        return
+
     # ---- participants ----
     if sub == "participants":
         from bot.jobs import create_app, db

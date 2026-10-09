@@ -1910,7 +1910,26 @@ async def handle_pick(update: "Update", context: "ContextTypes.DEFAULT_TYPE"):
             await query.edit_message_text("⚠️ Not linked yet. Send /start first.")
             return
 
+        game = Game.query.get(game_id)
+        if game is None:
+            await query.edit_message_text("⚠️ That game no longer exists.")
+            return
+
         pick = Pick.query.filter_by(participant_id=participant.id, game_id=game_id).first()
+
+        # Lock at kickoff. Inline keyboards stay live in the chat forever, so
+        # without this anyone could scroll back and tap a different team during
+        # a game, or after it finished knowing the result.
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        if game.game_time is not None and game.game_time <= now_naive:
+            held = pick.selected_team if pick else None
+            standing = f"Your pick stays: {held}" if held else "You had no pick for this game."
+            await query.edit_message_text(
+                f"⏰ Too late — {game.away_team} @ {game.home_team} has already started.\n"
+                f"{standing}"
+            )
+            return
+
         if not pick:
             pick = Pick(participant_id=participant.id, game_id=game_id, selected_team=team)
             db.session.add(pick)

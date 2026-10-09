@@ -128,6 +128,11 @@ ADMIN_COMMANDS: List[Command] = [
             detail="Newlines are preserved. 'dry' shows the message and recipient "
                    "list without sending. 'me' sends to you alone. A message whose "
                    "first word is literally 'dry' or 'me' is read as that mode."),
+    Command("setpick", "<name> <game_id> <team>", "Record a pick on someone's behalf",
+            group="Participants",
+            detail="For a pick a participant sent you another way. Works after "
+                   "kickoff, unlike the buttons, which lock when a game starts. "
+                   "Find game IDs with /admin gameids <week>."),
     Command("gameids", "<week> [season]", "List game IDs for a week", group="Games"),
     Command("setspread", "<game_id> <team> <points|clear>",
             "Set or clear a game's spread", group="Games",
