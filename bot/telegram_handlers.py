@@ -569,7 +569,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         team_arg = " ".join(rest[2:]).strip()
 
-        from bot.jobs import create_app as _ca
+        from bot.jobs import create_app as _ca, db
+        from sqlalchemy import text as T
 
         app = _ca()
         with app.app_context():
@@ -645,7 +646,11 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # admin_command imports these locally further down, which makes the
+        # module-level names unbound here, so import them in this block too.
         from datetime import datetime, timezone
+        from bot.jobs import create_app, db
+        from sqlalchemy import text as T
 
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         app = create_app()
