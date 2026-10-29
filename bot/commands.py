@@ -134,6 +134,11 @@ ADMIN_COMMANDS: List[Command] = [
                    "kickoff, unlike the buttons, which lock when a game starts. "
                    "Find game IDs with /admin gameids <week>."),
     Command("gameids", "<week> [season]", "List game IDs for a week", group="Games"),
+    Command("sendgame", "<team> [dry]", "Remind people who haven't picked one game",
+            group="Games",
+            detail="Finds that team's next game that hasn't kicked off and sends "
+                   "it to everyone without a pick on it. 'dry' lists who would "
+                   "get it without sending."),
     Command("setspread", "<game_id> <team> <points|clear>",
             "Set or clear a game's spread", group="Games",
             detail="Writes directly and bypasses the rule that freezes a line "

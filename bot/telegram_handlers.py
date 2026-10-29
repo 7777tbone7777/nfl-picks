@@ -634,6 +634,93 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # ---- sendgame ----
+    if sub == "sendgame":
+        dry = bool(rest) and rest[-1].lower() == "dry"
+        team_arg = " ".join(rest[:-1] if dry else rest).strip()
+        if not team_arg:
+            await update.message.reply_text(
+                "Usage: /admin sendgame <team> [dry]\n"
+                "Example: /admin sendgame Dallas"
+            )
+            return
+
+        from datetime import datetime, timezone
+
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        app = create_app()
+        with app.app_context():
+            # Soonest game for that team that hasn't kicked off. Started games
+            # are skipped because the buttons reject picks after kickoff.
+            game = db.session.execute(
+                T("""
+                    SELECT g.id, g.away_team, g.home_team, g.game_time,
+                           g.favorite_team, g.spread_pts, w.week_number
+                      FROM games g JOIN weeks w ON w.id = g.week_id
+                     WHERE w.season_year = (SELECT MAX(season_year) FROM weeks)
+                       AND g.game_time > :now
+                       AND (g.home_team ILIKE :t OR g.away_team ILIKE :t)
+                     ORDER BY g.game_time
+                     LIMIT 1
+                """),
+                {"now": now_naive, "t": f"%{team_arg}%"},
+            ).mappings().first()
+            if not game:
+                await update.message.reply_text(
+                    f"No upcoming game found for '{team_arg}' that hasn't kicked off."
+                )
+                return
+
+            people = db.session.execute(
+                T("""
+                    SELECT pt.name, pt.telegram_chat_id
+                      FROM participants pt
+                 LEFT JOIN picks p ON p.participant_id = pt.id AND p.game_id = :gid
+                     WHERE pt.telegram_chat_id IS NOT NULL
+                       AND (p.id IS NULL OR p.selected_team IS NULL)
+                     ORDER BY pt.name
+                """),
+                {"gid": game["id"]},
+            ).mappings().all()
+
+        matchup = f"{game['away_team']} @ {game['home_team']}"
+        if not people:
+            await update.message.reply_text(f"Everyone has picked {matchup}.")
+            return
+
+        if dry:
+            names = ", ".join(p["name"] for p in people)
+            await update.message.reply_text(
+                f"DRY RUN: {matchup} (Week {game['week_number']})\n"
+                f"Would send to {len(people)}: {names}"
+            )
+            return
+
+        text_msg = (
+            "⏰ Reminder: you haven't picked this game yet\n\n"
+            f"{matchup}\n{_pt(game['game_time'])}\n{_spread_label(game)}"
+        )
+        kb = {
+            "inline_keyboard": [
+                [{"text": game["away_team"], "callback_data": f"pick:{game['id']}:{game['away_team']}"}],
+                [{"text": game["home_team"], "callback_data": f"pick:{game['id']}:{game['home_team']}"}],
+            ]
+        }
+        sent, failed = [], []
+        for p in people:
+            try:
+                _send_message(str(p["telegram_chat_id"]), text_msg, reply_markup=kb)
+                sent.append(p["name"])
+            except Exception as e:
+                log.warning("[sendgame] failed to send to %s: %s", p["name"], e)
+                failed.append(p["name"])
+
+        reply = f"✅ {matchup}: sent to {', '.join(sent) or 'nobody'}"
+        if failed:
+            reply += f"\n⚠️ Failed: {', '.join(failed)}"
+        await update.message.reply_text(reply)
+        return
+
     # ---- participants ----
     if sub == "participants":
         from bot.jobs import create_app, db
