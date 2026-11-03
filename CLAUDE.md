@@ -13,12 +13,13 @@ Telegram bot for managing NFL picks competitions with ATS (against the spread) s
 - `bot/bot_runner.py` - Telegram bot polling entry point
 - `wsgi.py` - Gunicorn/Flask entry for web endpoints
 - `Procfile` - Heroku process definitions
+- `python -m bot.jobs <cmd>` - Heroku Scheduler jobs (`cron`, `sendweek_upcoming`, `import-week-upcoming`, `import-odds-upcoming`, `announce-winners`)
 
 ## Database Models (`models.py`)
 | Model | Purpose |
 |-------|---------|
 | `Week` | NFL week with picks_deadline, season_year |
-| `Game` | Games with espn_game_id, scores, favorite_team, spread_pts |
+| `Game` | Games with espn_game_id, scores. `favorite_team` and `spread_pts` exist in the database but not on the model; code reads and writes them with raw SQL |
 | `Participant` | Users linked via telegram_chat_id |
 | `Pick` | User's selected_team per game |
 | `PropBet` | Prop bets (OVER/UNDER, YES/NO) per week |
@@ -30,22 +31,33 @@ Telegram bot for managing NFL picks competitions with ATS (against the spread) s
 |------|---------|
 | `bot/jobs.py` | Core logic: ESPN integration, game sending, ATS scoring, odds import |
 | `bot/telegram_handlers.py` | All command handlers including admin commands |
+| `bot/commands.py` | Command registry: drives `/help`, the Telegram menu, and drift warnings. Add new commands here too |
 | `grade_props_auto.py` | Auto-grader for props using ESPN player stats |
-| `espn_client.py` | ESPN API client for scores/schedules |
+| `bot/espn_client.py` | ESPN API client for scores/schedules |
 
 ## Telegram Commands
 
 ### User Commands
 - `/start` - Link Telegram account to participant
-- `/mypicks` - View your picks for current season
+- `/help [command]` - List commands or show usage
+- `/mypicks [week] [year]` - View your picks
 - `/myprops` - View your prop bet picks
 - `/seasonboard [all]` - Season-to-date ATS scoreboard
 
+### Admin top-level commands
+- `/sendweek <week> [dry|me|name]` - Send unpicked games
+- `/seepicks <week> <participant|all> [day] [locked] [preview]` - Share picks
+- `/whoisleft <week>` - Who has picks outstanding
+- `/remindweek <week> [name]` - Remind participants to pick
+- `/deletepicks "<name>" <week>` - Delete a participant's picks
+- `/syncscores <week> [season]` - Pull scores from ESPN
+- `/getscores <week> [all]` - Show scores
+
 ### Admin Commands (`/admin <subcommand>`)
 **Game Management:**
-- `sendweek <week> [dry|me|name]` - Send unpicked games
-- `syncscores` - Sync scores from ESPN
-- `gameids <week>` - List game IDs for a week
+- `sendweek upcoming` - Send the upcoming week's games
+- `gameids <week> [season]` - List game IDs for a week
+- `sendgame <team> [dry]` - Remind people who haven't picked one game
 - `setspread <game_id> <team> <pts|clear>` - Set/clear spreads
 - `import upcoming` - Import upcoming week from ESPN
 - `winners` - Announce weekly winners
@@ -54,6 +66,8 @@ Telegram bot for managing NFL picks competitions with ATS (against the spread) s
 - `participants` - List all participants
 - `remove <id|name>` - Remove participant and their picks
 - `deletepicks <name> <week> [season] [dry]` - Delete picks
+- `setpick <name> <game_id> <team>` - Record a pick on someone's behalf
+- `broadcast [dry|me] <message>` - Message all participants
 
 **Prop Bets:**
 - `sendprops <week>` - Send prop bets to all participants
@@ -70,7 +84,7 @@ Telegram bot for managing NFL picks competitions with ATS (against the spread) s
 - `winnersats <week> [season] [debug]` - Calculate ATS winners
 
 ## External APIs
-- **ESPN**: Scores, schedules, player stats (`espn_client.py`)
+- **ESPN**: Scores, schedules, player stats (`bot/espn_client.py`)
 - **The Odds API**: Spread lines (`import_odds_upcoming()` in jobs.py)
 
 ## Environment Variables
