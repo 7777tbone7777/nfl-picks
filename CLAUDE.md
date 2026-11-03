@@ -82,6 +82,7 @@ Telegram bot for managing NFL picks competitions with ATS (against the spread) s
 
 **ATS Scoring:**
 - `winnersats <week> [season] [debug]` - Calculate ATS winners
+- `analytics [season] [all]` - Season awards and player tendencies (`bot/analytics.py`). Previews to the caller; `all` sends to everyone
 
 ## External APIs
 - **ESPN**: Scores, schedules, player stats (`bot/espn_client.py`)

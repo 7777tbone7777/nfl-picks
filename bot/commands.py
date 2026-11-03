@@ -149,6 +149,10 @@ ADMIN_COMMANDS: List[Command] = [
     Command("winnersats", "<week> [season] [debug]",
             "Calculate against-the-spread winners", group="Scoring",
             detail="Also accepts /admin winners-ats."),
+    Command("analytics", "[season] [all]", "Season awards and each player's tendencies",
+            group="Scoring",
+            detail="Previews to you by default. Add 'all' to send it to every "
+                   "participant. Season defaults to the latest one."),
     Command("sendprops", "<week> [season]", "Send prop bets to participants",
             group="Props"),
     Command("listprops", "<week> [season]", "List props with IDs and status",

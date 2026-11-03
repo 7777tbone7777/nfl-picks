@@ -1322,6 +1322,51 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(note)
         return
 
+    if sub == "analytics":
+        season_year = next((int(a) for a in rest if a.isdigit()), None)
+        send_all = any(a.lower() == "all" for a in rest)
+
+        from sqlalchemy import text as T
+
+        from bot.analytics import load_season, render
+        from bot.jobs import create_app, db
+
+        app = create_app()
+        with app.app_context():
+            if season_year is None:
+                season_year = db.session.execute(T("SELECT MAX(season_year) FROM weeks")).scalar()
+            body = render(load_season(season_year), season_year)
+            participants = db.session.execute(
+                T("SELECT name, telegram_chat_id FROM participants "
+                  "WHERE telegram_chat_id IS NOT NULL ORDER BY name")
+            ).mappings().all()
+
+        chunks = _chunk_message(body)
+        if not send_all:
+            await update.message.reply_text(
+                f"PREVIEW: only you see this. Run /admin analytics {season_year} all "
+                f"to send it to {len(participants)} participants."
+            )
+            for c in chunks:
+                await update.message.reply_text(c)
+            return
+
+        sent, failed = 0, []
+        for p in participants:
+            try:
+                for c in chunks:
+                    await context.bot.send_message(chat_id=p["telegram_chat_id"], text=c)
+                sent += 1
+            except Exception as e:
+                failed.append(p["name"])
+                logging.warning("analytics send failed for %s: %s", p["name"], e)
+
+        note = f"Analytics sent to {sent}/{len(participants)} participants."
+        if failed:
+            note += f"\nFailed: {', '.join(failed)}"
+        await update.message.reply_text(note)
+        return
+
     # /admin clearprops <week>
     if sub == "clearprops":
         if not rest or not rest[0].isdigit():
